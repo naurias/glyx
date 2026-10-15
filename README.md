@@ -2,7 +2,7 @@
 
 Local-first password manager for Linux, Windows, and Android. CLI, WebUI, and desktop app on one Rust core. No accounts, no telemetry, your vault stays yours.
 
-> Status: early scaffold (M-1). The CLI currently prints its version only. This README is a living user guide and will grow with each milestone.
+> Status: M0 foundation. `vault init` and `doctor` work; item CRUD arrives in M1. This README is a living user guide and grows with each milestone.
 
 ## What glyx will do
 
@@ -54,22 +54,19 @@ nix build .#default        # CLI package
 nix build .#glyx-desktop   # desktop package (real Tauri binary lands in M3)
 ```
 
-## Quickstart (planned CLI, M1)
-
-These commands are the target UX and do not all exist yet:
+## Quickstart
 
 ```sh
-glyx vault init ~/vaults/main.glyx --preset balanced
-glyx unlock
-glyx ls
-glyx show github --json
-glyx add login github --username you --password "?"
-glyx totp github
-glyx lock
-glyx doctor
+# Create a vault (generates the keyfile when missing)
+glyx vault init ~/vaults/main.glyx --preset balanced --keyfile ~/keys/main.key --cipher xchacha
+
+# Check vault health
+glyx doctor ~/vaults/main.glyx
+glyx doctor ~/vaults/main.glyx --rebuild-index
+glyx doctor ~/vaults/main.glyx --with-unlock --keyfile ~/keys/main.key --json
 ```
 
-Today only `glyx` (prints version) works. `glyx doctor` will arrive in M1 to check vault health, merge state, and leftover exports.
+Passwords come from a hidden prompt, or from `--password-env VAR` for scripts. Item commands (`ls`, `show`, `add`, `totp`, `ssh`) arrive in M1; `glyx doctor` already checks format version, keyslots, envelope headers, index sync state, and (with `--with-unlock`) full decryption of items and blobs.
 
 ## Vault creation and crypto (planned, M1)
 
@@ -120,17 +117,23 @@ No network listener leaves your machine in v1 except the planned opt-in relay.
 
 ```
 flake.nix        Nix shells, packages, apps
-crates/          Rust core (glyx-core, glyx-crypto, glyx-store,
-                 glyx-sync, glyx-agent, glyx-autofill,
-                 glyx-daemon, glyx-cli)
+crates/
+  glyx-core      Item/HLC/DeviceId/SecretString types, VAULT.toml spec
+  glyx-crypto    Argon2id KDF, XChaCha/AES-GCM, keyslots, BLAKE3
+  glyx-store     Vault init/open, envelopes, blobs, SQLite index
+  glyx-sync      Header ordering and conflict classifier (merge in M2)
+  glyx-agent     Export ledger traits (engine in M5)
+  glyx-autofill  Provider traits (OS bridges in M4)
+  glyx-daemon    Lock-state machine (networking in M3)
+  glyx-cli       `glyx vault init`, `glyx doctor`
 apps/            webui, desktop, android, extension (fill in M3+)
 local/           Agent and developer docs (gitignored, local only)
 ```
 
 ## Roadmap
 
-Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 workspace spec, M1 core plus CLI, M2 sync merge, M3 daemon plus WebUI plus desktop, M4 autofill, M5 file agent plus SSH, M6 Android plus notes, M7 hardening and installers.
+Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done: format spec, crypto, store, minimal CLI), M1 core plus CLI, M2 sync merge, M3 daemon plus WebUI plus desktop, M4 autofill, M5 file agent plus SSH, M6 Android plus notes, M7 hardening and installers.
 
 ## License
 
-GPL-3.0-or-later. See LICENSE when added (planned M0).
+GPL-3.0-or-later, see `LICENSE`.
