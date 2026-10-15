@@ -2,7 +2,7 @@
 
 Local-first password manager for Linux, Windows, and Android. CLI, WebUI, and desktop app on one Rust core. No accounts, no telemetry, your vault stays yours.
 
-> Status: M0 foundation. `vault init` and `doctor` work; item CRUD arrives in M1. This README is a living user guide and grows with each milestone.
+> Status: M1 item management works end to end. Sync merge arrives in M2. This README is a living user guide and grows with each milestone.
 
 ## What glyx will do
 
@@ -60,13 +60,50 @@ nix build .#glyx-desktop   # desktop package (real Tauri binary lands in M3)
 # Create a vault (generates the keyfile when missing)
 glyx vault init ~/vaults/main.glyx --preset balanced --keyfile ~/keys/main.key --cipher xchacha
 
+# Work with items (pass --vault once or set GLYX_VAULT)
+export GLYX_VAULT=~/vaults/main.glyx
+glyx --keyfile ~/keys/main.key add login --name github --field username=you --generate password
+glyx --keyfile ~/keys/main.key ls
+glyx --keyfile ~/keys/main.key show github
+glyx --keyfile ~/keys/main.key show github --reveal
+glyx --keyfile ~/keys/main.key totp github
+glyx --keyfile ~/keys/main.key edit github --field url=https://github.com
+glyx --keyfile ~/keys/main.key rm old-site
+
+# Stay unlocked for a while instead of typing the password each time
+glyx --keyfile ~/keys/main.key unlock --ttl 30
+glyx ls
+glyx lock
+
+# Rotate credentials or cipher (old password required)
+glyx --keyfile ~/keys/main.key vault rekey --new-keyfile ~/keys/main2.key
+glyx --keyfile ~/keys/main2.key vault rekey --cipher aesgcm
+
 # Check vault health
-glyx doctor ~/vaults/main.glyx
-glyx doctor ~/vaults/main.glyx --rebuild-index
-glyx doctor ~/vaults/main.glyx --with-unlock --keyfile ~/keys/main.key --json
+glyx doctor --with-unlock --json
 ```
 
-Passwords come from a hidden prompt, or from `--password-env VAR` for scripts. Item commands (`ls`, `show`, `add`, `totp`, `ssh`) arrive in M1; `glyx doctor` already checks format version, keyslots, envelope headers, index sync state, and (with `--with-unlock`) full decryption of items and blobs.
+Passwords come from a hidden prompt, or from `--password-env VAR` for scripts. The vault is taken from `--vault` or `GLYX_VAULT`; `--no-session` forces a fresh prompt every time. Every command also accepts `--json`; `--reveal` shows secrets in human output (JSON always includes values). Deletes are tombstones, kept for sync safety. For an interactive walkthrough use `add --interactive`.
+
+## Sessions and convenience passphrase
+
+`unlock` remembers the vault for a while so scripts and daily use skip the password:
+
+```sh
+glyx --keyfile ~/keys/main.key unlock --ttl 30
+glyx ls
+glyx lock
+glyx --keyfile ~/keys/main.key unlock --with-pin   # short passphrase instead
+```
+
+Set defaults in `~/.config/glyx/config.toml` (or `GLYX_CONFIG`):
+
+```toml
+mode = "session"
+session_ttl_min = 15
+```
+
+Threat model, stated plainly: a session file holds the data key under `0600` in your runtime dir (up to 8h max), like `ssh-agent` holds keys in RAM. Anyone who can read your files can read an active session. The default stays one-shot (no session files unless you run `unlock`), and `lock` wipes them.
 
 ## Vault creation and crypto (planned, M1)
 
@@ -132,7 +169,7 @@ local/           Agent and developer docs (gitignored, local only)
 
 ## Roadmap
 
-Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done: format spec, crypto, store, minimal CLI), M1 core plus CLI, M2 sync merge, M3 daemon plus WebUI plus desktop, M4 autofill, M5 file agent plus SSH, M6 Android plus notes, M7 hardening and installers.
+Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge, M3 daemon plus WebUI plus desktop, M4 autofill, M5 file agent plus SSH, M6 Android plus notes, M7 hardening and installers.
 
 ## License
 
