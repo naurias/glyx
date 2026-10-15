@@ -27,3 +27,18 @@ pub fn generate_password(len: usize) -> Result<String, CryptoError> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_shape() {
+        let pw = generate_password(24).expect("generates");
+        assert_eq!(pw.len(), 24);
+        assert!(pw
+            .bytes()
+            .all(|b| PASSWORD_ALPHABET.as_bytes().contains(&b)));
+        assert!(generate_password(0).is_err());
+    }
+}
