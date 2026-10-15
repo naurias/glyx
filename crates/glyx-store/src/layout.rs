@@ -1,0 +1,8 @@
+pub const VAULT_TOML: &str = "VAULT.toml";
+pub const KEYSLOTS_DIR: &str = "keyslots";
+pub const ITEMS_DIR: &str = "items";
+pub const BLOBS_DIR: &str = "blobs";
+pub const HISTORY_DIR: &str = "history";
+pub const INDEX_DB: &str = "glyx.db";
+pub const LOCK_FILE: &str = "glyx.db.lock";
+pub const INDEX_SCHEMA_VERSION: i64 = 1;
