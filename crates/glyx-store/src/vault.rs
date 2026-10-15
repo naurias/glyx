@@ -206,6 +206,7 @@ pub struct UnlockedVault {
     config: glyx_core::VaultConfig,
     key: Zeroizing<[u8; 32]>,
     conn: Connection,
+    node: glyx_core::DeviceId,
     _session: fs::File,
 }
 
@@ -218,11 +219,28 @@ impl UnlockedVault {
     pub fn vault_path(&self) -> PathBuf {
         self.path.clone()
     }
+    #[must_use]
+    pub fn device_node(&self) -> glyx_core::DeviceId {
+        self.node
+    }
     pub fn put_item(&mut self, item: &glyx_core::Item) -> Result<(), StoreError> {
         item.validate()?;
         let env = Envelope::seal(item, &self.key, self.cipher())?;
+        let target = self.path.join(layout::ITEMS_DIR).join(env.filename());
+        if target.exists() {
+            let old = fs::read(&target)?;
+            let dir = self
+                .path
+                .join(layout::HISTORY_DIR)
+                .join(item.id.as_simple().to_string());
+            fs::create_dir_all(&dir)?;
+            atomic_write(
+                &dir.join(format!("{}-{}.json", item.hlc.wall_ms, item.hlc.seq)),
+                &old,
+            )?;
+        }
         atomic_write(
-            &self.path.join(layout::ITEMS_DIR).join(env.filename()),
+            &target,
             serde_json::to_string_pretty(&env)
                 .map_err(|e| StoreError::Corrupt(e.to_string()))?
                 .as_bytes(),
@@ -242,8 +260,59 @@ impl UnlockedVault {
             .map_err(|e| StoreError::Corrupt(e.to_string()))?;
         Ok(Some(env.open(&self.key)?))
     }
-    pub fn list(&self) -> Result<Vec<IndexRow>, StoreError> {
-        index::list(&self.conn)
+    pub fn list(&self, include_deleted: bool) -> Result<Vec<IndexRow>, StoreError> {
+        index::list(&self.conn, include_deleted)
+    }
+    pub fn next_hlc(&mut self) -> Result<glyx_core::Hlc, StoreError> {
+        let last_ms: i64 = self.meta_get("hlc_ms")?.unwrap_or(0);
+        let last_seq: i64 = self.meta_get("hlc_seq")?.unwrap_or(0);
+        let now = glyx_core::ids::wall_ms_now().cast_signed();
+        let (wall, seq) = if now <= last_ms {
+            (last_ms, last_seq.saturating_add(1))
+        } else {
+            (now, 0)
+        };
+        self.meta_set("hlc_ms", wall)?;
+        self.meta_set("hlc_seq", seq)?;
+        Ok(glyx_core::Hlc {
+            wall_ms: u64::try_from(wall).unwrap_or(0),
+            seq: u16::try_from(seq).unwrap_or(u16::MAX),
+            node: self.node,
+        })
+    }
+    pub fn delete_item(&mut self, id: &Uuid) -> Result<bool, StoreError> {
+        let Some(mut item) = self.get_item(id)? else {
+            return Ok(false);
+        };
+        if item.deleted {
+            return Ok(true);
+        }
+        item.deleted = true;
+        item.hlc = self.next_hlc()?;
+        item.rev = item.rev.saturating_add(1);
+        item.updated_by = self.node;
+        self.put_item(&item)?;
+        Ok(true)
+    }
+    fn meta_get(&self, key: &str) -> Result<Option<i64>, StoreError> {
+        let v: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+            .optional()
+            .map_err(StoreError::from)?;
+        v.map(|s| {
+            s.parse::<i64>()
+                .map_err(|_| StoreError::Corrupt(format!("bad meta {key}")))
+        })
+        .transpose()
+    }
+    fn meta_set(&self, key: &str, value: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value.to_string()],
+        )?;
+        Ok(())
     }
     pub fn put_blob(&self, data: &[u8]) -> Result<String, StoreError> {
         let (addr, bytes) = blob::seal(data, &self.key, self.cipher(), b"glyx-blob-v1")?;
@@ -264,6 +333,132 @@ impl UnlockedVault {
         )?;
         blob::open(&bytes, &self.key, b"glyx-blob-v1")
     }
+    pub fn write_plain_session(&self, ttl_min: u64) -> Result<(), StoreError> {
+        crate::session::write_plain_ticket(self.config.vault_id, &self.key, ttl_min)
+    }
+    pub fn seal_pin_session(&self, pin: &[u8], ttl_min: u64) -> Result<(), StoreError> {
+        crate::session::seal_pin_ticket(self.config.vault_id, &self.key, pin, ttl_min)
+    }
+    pub fn add_slot(&self, password: &[u8], keyfile: &[u8; 32]) -> Result<Uuid, StoreError> {
+        self.add_slot_with_params(password, keyfile, self.config.cipher_suite.params)
+    }
+    pub fn add_slot_with_params(
+        &self,
+        password: &[u8],
+        keyfile: &[u8; 32],
+        params: glyx_core::KdfParams,
+    ) -> Result<Uuid, StoreError> {
+        let slot = glyx_crypto::Keyslot::seal(password, keyfile, &self.key, params)?;
+        let id = slot.id;
+        atomic_write(
+            &self.path.join(layout::KEYSLOTS_DIR).join(slot.filename()),
+            serde_json::to_string_pretty(&slot)
+                .map_err(|e| StoreError::Corrupt(e.to_string()))?
+                .as_bytes(),
+        )?;
+        Ok(id)
+    }
+    pub fn list_slots(&self) -> Result<Vec<(Uuid, glyx_core::KdfParams)>, StoreError> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(self.path.join(layout::KEYSLOTS_DIR))?.flatten() {
+            if !has_extension(&entry.path(), "json") {
+                continue;
+            }
+            let slot: glyx_crypto::Keyslot = serde_json::from_slice(&fs::read(entry.path())?)
+                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            out.push((slot.id, slot.params));
+        }
+        Ok(out)
+    }
+    pub fn retire_slot(&self, id: &Uuid) -> Result<(), StoreError> {
+        let slots = self.list_slots()?;
+        if slots.len() <= 1 {
+            return Err(StoreError::Corrupt("cannot retire the last keyslot".into()));
+        }
+        if !slots.iter().any(|(s, _)| s == id) {
+            return Err(StoreError::Corrupt("keyslot not found".into()));
+        }
+        fs::remove_file(
+            self.path
+                .join(layout::KEYSLOTS_DIR)
+                .join(format!("slot-{}.json", id.as_simple())),
+        )?;
+        Ok(())
+    }
+    fn scan_headers_unlocked(&self) -> Result<Vec<EnvelopeHeader>, StoreError> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(self.path.join(layout::ITEMS_DIR))?.flatten() {
+            if !is_envelope_file(&entry.path()) {
+                continue;
+            }
+            let bytes = fs::read(entry.path())?;
+            let env: Envelope =
+                serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            out.push(env.header());
+        }
+        Ok(out)
+    }
+    pub fn reencrypt(&mut self, cipher: glyx_core::Cipher) -> Result<usize, StoreError> {
+        let mut addr_map = std::collections::HashMap::new();
+        for entry in fs::read_dir(self.path.join(layout::BLOBS_DIR))?.flatten() {
+            if !has_extension(&entry.path(), "enc") {
+                continue;
+            }
+            let old_addr = entry
+                .path()
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let bytes = fs::read(entry.path())?;
+            let data = blob::open(&bytes, &self.key, b"glyx-blob-v1")?;
+            let (new_addr, sealed) = blob::seal(&data, &self.key, cipher, b"glyx-blob-v1")?;
+            if new_addr != old_addr {
+                atomic_write(
+                    &self
+                        .path
+                        .join(layout::BLOBS_DIR)
+                        .join(format!("{new_addr}.enc")),
+                    &sealed,
+                )?;
+                fs::remove_file(entry.path())?;
+                addr_map.insert(old_addr, new_addr);
+            }
+        }
+        let mut n = 0;
+        let headers = self.scan_headers_unlocked()?;
+        for header in headers {
+            let Some(mut item) = self.get_item(&header.id)? else {
+                continue;
+            };
+            let mut touched = false;
+            for field in item.fields.values_mut() {
+                if let Some(new_addr) = addr_map.get(field.value.expose()) {
+                    field.value = glyx_core::SecretString::new(new_addr.clone());
+                    touched = true;
+                }
+            }
+            if touched {
+                item.hlc = self.next_hlc()?;
+                item.rev = item.rev.saturating_add(1);
+                item.updated_by = self.node;
+            }
+            let env = Envelope::seal(&item, &self.key, cipher)?;
+            atomic_write(
+                &self.path.join(layout::ITEMS_DIR).join(env.filename()),
+                serde_json::to_string_pretty(&env)
+                    .map_err(|e| StoreError::Corrupt(e.to_string()))?
+                    .as_bytes(),
+            )?;
+            index::upsert(&self.conn, &item)?;
+            n += 1;
+        }
+        self.config.cipher_suite.cipher = cipher;
+        atomic_write(
+            &self.path.join(layout::VAULT_TOML),
+            self.config.to_toml()?.as_bytes(),
+        )?;
+        Ok(n)
+    }
 }
 
 impl std::fmt::Debug for UnlockedVault {
@@ -273,6 +468,19 @@ impl std::fmt::Debug for UnlockedVault {
             .field("vault_id", &self.config.vault_id)
             .finish_non_exhaustive()
     }
+}
+
+fn has_extension(path: &Path, ext: &str) -> bool {
+    path.extension().is_some_and(|e| e == ext)
+}
+
+fn is_envelope_file(path: &Path) -> bool {
+    if !has_extension(path, "json") {
+        return false;
+    }
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|stem| stem.rsplit('.').next() == Some("envelope"))
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
@@ -360,7 +568,7 @@ mod tests {
             let back = unlocked.get_item(&item.id).expect("get").expect("found");
             assert_eq!(back.name, "example");
             assert_eq!(back.fields["password"].value.expose(), "s3cret");
-            assert_eq!(unlocked.list().expect("list").len(), 1);
+            assert_eq!(unlocked.list(false).expect("list").len(), 1);
             let addr = unlocked.put_blob(b"attachment").expect("put blob");
             assert_eq!(&*unlocked.get_blob(&addr).expect("get blob"), b"attachment");
             drop(unlocked);
@@ -368,5 +576,131 @@ mod tests {
             assert_eq!(reopened.scan_headers().expect("scan").len(), 1);
             assert_eq!(reopened.rebuild_index().expect("rebuild"), 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod m1_tests {
+    use super::*;
+
+    fn mobile_suite() -> glyx_core::CipherSuiteConfig {
+        glyx_core::CipherSuiteConfig {
+            kdf: glyx_core::KdfId::Argon2id,
+            cipher: glyx_core::Cipher::Xchacha20poly1305,
+            params: glyx_core::KdfParams::mobile(),
+        }
+    }
+
+    fn login_item(node: glyx_core::DeviceId, hlc: glyx_core::Hlc) -> glyx_core::Item {
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "password".to_owned(),
+            glyx_core::Field {
+                value: glyx_core::SecretString::new("pw".to_owned()),
+                field_hlc: hlc,
+            },
+        );
+        glyx_core::Item {
+            id: Uuid::now_v7(),
+            item_type: glyx_core::ItemType::Login,
+            name: "web".to_owned(),
+            folder: String::new(),
+            tags: Vec::new(),
+            fields,
+            hlc,
+            rev: 1,
+            deleted: false,
+            updated_by: node,
+        }
+    }
+
+    #[test]
+    fn tombstone_and_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.glyx");
+        let kf = [1u8; 32];
+        Vault::init(&path, mobile_suite(), b"pw", &kf).expect("init");
+        let vault = Vault::open(&path).expect("open");
+        let mut uv = vault.unlock(b"pw", &kf).expect("unlock");
+        let hlc = uv.next_hlc().expect("tick");
+        let item = login_item(uv.device_node(), hlc);
+        let id = item.id;
+        uv.put_item(&item).expect("put");
+        let hlc2 = uv.next_hlc().expect("tick");
+        assert!(hlc2 > hlc);
+        let mut v2 = uv.get_item(&id).expect("get").expect("found");
+        v2.name = "renamed".to_owned();
+        v2.hlc = uv.next_hlc().expect("tick");
+        v2.rev = 2;
+        uv.put_item(&v2).expect("overwrite");
+        let hist = path
+            .join(layout::HISTORY_DIR)
+            .join(id.as_simple().to_string());
+        assert!(fs::read_dir(&hist).expect("history").count() >= 1);
+        assert!(uv.delete_item(&id).expect("delete"));
+        assert!(uv.get_item(&id).expect("get").expect("found").deleted);
+        assert!(uv.list(false).expect("list").is_empty());
+        assert_eq!(uv.list(true).expect("all").len(), 1);
+        assert!(!uv.delete_item(&Uuid::now_v7()).expect("missing"));
+    }
+
+    #[test]
+    fn hlc_persists_across_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("h.glyx");
+        let kf = [2u8; 32];
+        Vault::init(&path, mobile_suite(), b"pw", &kf).expect("init");
+        let first = {
+            let vault = Vault::open(&path).expect("open");
+            let mut uv = vault.unlock(b"pw", &kf).expect("unlock");
+            uv.next_hlc().expect("tick")
+        };
+        let vault = Vault::open(&path).expect("open");
+        let mut uv = vault.unlock(b"pw", &kf).expect("unlock");
+        assert!(uv.next_hlc().expect("tick") > first);
+    }
+
+    #[test]
+    fn slot_rotation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.glyx");
+        Vault::init(&path, mobile_suite(), b"pw", &[3u8; 32]).expect("init");
+        let vault = Vault::open(&path).expect("open");
+        let uv = vault.unlock(b"pw", &[3u8; 32]).expect("unlock");
+        let id = uv.add_slot(b"new", &[4u8; 32]).expect("add");
+        assert!(vault.verify_slot(&id, b"new", &[4u8; 32]).expect("verify"));
+        assert!(!vault
+            .verify_slot(&id, b"wrong", &[4u8; 32])
+            .expect("reject"));
+        assert_eq!(uv.list_slots().expect("slots").len(), 2);
+        let first = uv.list_slots().expect("slots")[0].0;
+        uv.retire_slot(&first).expect("retire");
+        assert!(uv.retire_slot(&id).is_err());
+    }
+
+    #[test]
+    fn reencrypt_switch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("r.glyx");
+        let kf = [5u8; 32];
+        Vault::init(&path, mobile_suite(), b"pw", &kf).expect("init");
+        let vault = Vault::open(&path).expect("open");
+        let mut uv = vault.unlock(b"pw", &kf).expect("unlock");
+        let hlc = uv.next_hlc().expect("tick");
+        uv.put_item(&login_item(uv.device_node(), hlc))
+            .expect("put");
+        uv.put_blob(b"data").expect("blob");
+        let n = uv
+            .reencrypt(glyx_core::Cipher::Aes256gcm)
+            .expect("reencrypt");
+        assert_eq!(n, 1);
+        drop(uv);
+        let vault = Vault::open(&path).expect("reopen");
+        assert_eq!(
+            vault.config().cipher_suite.cipher,
+            glyx_core::Cipher::Aes256gcm
+        );
+        let uv = vault.unlock(b"pw", &kf).expect("unlock");
+        assert_eq!(uv.list(false).expect("list").len(), 1);
     }
 }
