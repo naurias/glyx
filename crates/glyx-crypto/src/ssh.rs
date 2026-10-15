@@ -43,3 +43,16 @@ pub fn generate(kind: &str, comment: &str) -> Result<SshPair, CryptoError> {
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ed25519_roundtrip() {
+        let pair = generate("ed25519", "test").expect("generates");
+        assert!(pair.openssh_private.contains("OPENSSH PRIVATE KEY"));
+        let parsed = ssh_key::PublicKey::from_openssh(&pair.openssh_public).expect("parses");
+        assert_eq!(parsed.algorithm(), Algorithm::Ed25519);
+        assert!(generate("dsa", "").is_err());
+    }
+}

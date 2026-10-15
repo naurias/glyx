@@ -93,3 +93,48 @@ pub fn verify_code(params: &TotpParams, code: &str) -> Result<bool, CryptoError>
     Ok(false)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rfc_params() -> TotpParams {
+        TotpParams {
+            seed: b"12345678901234567890".to_vec(),
+            step: 30,
+            digits: 8,
+        }
+    }
+
+    #[test]
+    fn rfc6238_vector() {
+        assert_eq!(generate_at(&rfc_params(), 59).expect("code"), "94287082");
+        assert_eq!(
+            generate_at(&rfc_params(), 1_111_111_109).expect("code"),
+            "07081804"
+        );
+    }
+
+    #[test]
+    fn otpauth_parsing() {
+        let p = params_from_uri(
+            "otpauth://totp/x?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&period=30&digits=6",
+        )
+        .expect("parses");
+        assert_eq!(p.seed.len(), 20);
+        assert_eq!(p.step, 30);
+        assert_eq!(p.digits, 6);
+        assert!(params_from_uri("otpauth://totp/x?period=30").is_err());
+    }
+
+    #[test]
+    fn verify_roundtrip() {
+        let p = TotpParams {
+            seed: b"12345678901234567890".to_vec(),
+            step: 30,
+            digits: 6,
+        };
+        let code = generate_code(&p).expect("code");
+        assert!(verify_code(&p, &code).expect("verifies"));
+        assert!(!verify_code(&p, "000000").expect("rejects") || code == "000000");
+    }
+}
