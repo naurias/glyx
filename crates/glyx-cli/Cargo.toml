@@ -8,7 +8,15 @@ license.workspace = true
 name = "glyx"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 clap.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rpassword.workspace = true
 glyx-core = { path = "../glyx-core" }
+glyx-crypto = { path = "../glyx-crypto" }
+glyx-store = { path = "../glyx-store" }
