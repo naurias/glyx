@@ -20,3 +20,5 @@ blake3.workspace = true
 getrandom.workspace = true
 base64.workspace = true
 glyx-core = { path = "../glyx-core" }
+ssh-key = { workspace = true, features = ["ed25519", "rsa", "rand_core"] }
+totp-rs = { workspace = true, features = ["otpauth"] }
