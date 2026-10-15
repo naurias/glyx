@@ -77,11 +77,15 @@ fn decode_hlc(ms: i64, seq: i64, node: Vec<u8>) -> rusqlite::Result<glyx_core::H
     })
 }
 
-pub fn list(conn: &Connection) -> Result<Vec<IndexRow>, StoreError> {
-    let mut stmt = conn.prepare(
+pub fn list(conn: &Connection, include_deleted: bool) -> Result<Vec<IndexRow>, StoreError> {
+    let sql = if include_deleted {
         "SELECT id, hlc_ms, hlc_seq, node, rev, deleted, item_type, name
-         FROM items ORDER BY updated_ms DESC",
-    )?;
+         FROM items ORDER BY updated_ms DESC"
+    } else {
+        "SELECT id, hlc_ms, hlc_seq, node, rev, deleted, item_type, name
+         FROM items WHERE deleted = 0 ORDER BY updated_ms DESC"
+    };
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([], |r| {
         let id_hex: String = r.get(0)?;
         Ok(IndexRow {
