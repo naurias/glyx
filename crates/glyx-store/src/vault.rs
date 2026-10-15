@@ -3,7 +3,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt as _;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension as _};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -94,18 +94,7 @@ impl Vault {
                 }
             };
             match slot.unseal(password, keyfile) {
-                Ok(key) => {
-                    let session = lock_file(&self.path)?;
-                    let conn = Connection::open(self.path.join(layout::INDEX_DB))?;
-                    index::init_schema(&conn)?;
-                    return Ok(UnlockedVault {
-                        path: self.path.clone(),
-                        config: self.config.clone(),
-                        key,
-                        conn,
-                        _session: session,
-                    });
-                }
+                Ok(key) => return self.finish_unlock(key),
                 Err(e) => last_err = e.into(),
             }
         }
@@ -114,11 +103,7 @@ impl Vault {
     pub fn scan_headers(&self) -> Result<Vec<EnvelopeHeader>, StoreError> {
         let mut out = Vec::new();
         for entry in fs::read_dir(self.path.join(layout::ITEMS_DIR))?.flatten() {
-            if !entry
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".envelope.json")
-            {
+            if !is_envelope_file(&entry.path()) {
                 continue;
             }
             let bytes = fs::read(entry.path())?;
@@ -135,11 +120,7 @@ impl Vault {
         conn.execute("DELETE FROM items", [])?;
         let mut n = 0;
         for entry in fs::read_dir(self.path.join(layout::ITEMS_DIR))?.flatten() {
-            if !entry
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".envelope.json")
-            {
+            if !is_envelope_file(&entry.path()) {
                 continue;
             }
             let bytes = fs::read(entry.path())?;
@@ -164,8 +145,59 @@ impl Vault {
     pub fn keyslot_count(&self) -> Result<usize, StoreError> {
         Ok(fs::read_dir(self.path.join(layout::KEYSLOTS_DIR))?
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+            .filter(|e| has_extension(&e.path(), "json"))
             .count())
+    }
+    pub fn device_id(&self) -> Result<glyx_core::DeviceId, StoreError> {
+        let file = self.path.join("device.id");
+        if file.exists() {
+            let raw = fs::read(&file)?;
+            if let Ok(bytes) = <[u8; 16]>::try_from(raw) {
+                return Ok(glyx_core::DeviceId(bytes));
+            }
+        }
+        let id = glyx_core::DeviceId::generate();
+        atomic_write(&file, &id.0)?;
+        Ok(id)
+    }
+    pub fn verify_slot(
+        &self,
+        id: &Uuid,
+        password: &[u8],
+        keyfile: &[u8; 32],
+    ) -> Result<bool, StoreError> {
+        let bytes = fs::read(
+            self.path
+                .join(layout::KEYSLOTS_DIR)
+                .join(format!("slot-{}.json", id.as_simple())),
+        )?;
+        let slot: glyx_crypto::Keyslot =
+            serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        match slot.unseal(password, keyfile) {
+            Ok(_) => Ok(true),
+            Err(glyx_crypto::CryptoError::Decrypt) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+    pub fn open_session(&self, pin: Option<&[u8]>) -> Result<Option<UnlockedVault>, StoreError> {
+        match crate::session::open_ticket(&self.config.vault_id, pin)? {
+            Some(key) => Ok(Some(self.finish_unlock(key)?)),
+            None => Ok(None),
+        }
+    }
+    fn finish_unlock(&self, key: Zeroizing<[u8; 32]>) -> Result<UnlockedVault, StoreError> {
+        let node = self.device_id()?;
+        let session = lock_file(&self.path)?;
+        let conn = Connection::open(self.path.join(layout::INDEX_DB))?;
+        index::init_schema(&conn)?;
+        Ok(UnlockedVault {
+            path: self.path.clone(),
+            config: self.config.clone(),
+            key,
+            conn,
+            node,
+            _session: session,
+        })
     }
 }
 
