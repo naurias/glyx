@@ -106,6 +106,27 @@ enum Cmd {
     },
     #[command(about = "Vault sync state")]
     SyncStatus,
+    #[command(about = "Merge sync-conflict copies, optionally with another vault")]
+    Sync {
+        #[arg(help = "Other vault directory for pairwise merge")]
+        path: Option<PathBuf>,
+        #[arg(long, help = "Other vault keyfile")]
+        other_keyfile: Option<PathBuf>,
+        #[arg(long, help = "Other vault password env var")]
+        other_password_env: Option<String>,
+    },
+    #[command(about = "List merge conflicts")]
+    Conflicts {
+        #[command(subcommand)]
+        cmd: Option<ConflictsCmd>,
+    },
+    #[command(about = "Purge old tombstones")]
+    Gc {
+        #[arg(long, default_value = "30d", help = "Purge tombstones older than this")]
+        older_than: String,
+        #[arg(long, help = "List only, change nothing")]
+        dry_run: bool,
+    },
     #[command(about = "Check vault health")]
     Doctor {
         #[arg(long, help = "Rebuild the SQLite index from envelope headers")]
@@ -140,6 +161,28 @@ enum VaultCmd {
         preset: Option<Preset>,
         #[arg(long, help = "Keep old keyslots")]
         keep_old_slots: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConflictsCmd {
+    #[command(about = "Show one conflict")]
+    Show {
+        #[arg(help = "Id, id prefix, or exact name")]
+        query: String,
+        #[arg(long, help = "Reveal secret values")]
+        reveal: bool,
+    },
+    #[command(about = "Resolve one conflict")]
+    Resolve {
+        #[arg(help = "Id, id prefix, or exact name")]
+        query: String,
+        #[arg(long, help = "Keep the local version")]
+        mine: bool,
+        #[arg(long, help = "Keep the remote version")]
+        theirs: bool,
+        #[arg(long, help = "Set field as key=value (repeatable)")]
+        field: Vec<String>,
     },
 }
 
@@ -243,28 +286,7 @@ fn main() -> Result<()> {
 
 fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
     match cmd {
-        Cmd::Vault { cmd } => match cmd {
-            VaultCmd::Init {
-                path,
-                preset,
-                cipher,
-                keyfile,
-            } => vault_init(ctx, &path, preset, cipher, &keyfile),
-            VaultCmd::Rekey {
-                new_keyfile,
-                new_password_env,
-                cipher,
-                preset,
-                keep_old_slots,
-            } => vault_rekey(
-                ctx,
-                new_keyfile.as_ref(),
-                new_password_env.as_deref(),
-                cipher,
-                preset,
-                keep_old_slots,
-            ),
-        },
+        Cmd::Vault { cmd } => dispatch_vault(ctx, cmd),
         Cmd::Unlock { ttl, with_pin } => cmd_unlock(ctx, ttl, with_pin),
         Cmd::Lock => cmd_lock(ctx),
         Cmd::Ls {
@@ -318,6 +340,30 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             } => cmd_ssh_gen(ctx, name, kind, comment, folder),
         },
         Cmd::SyncStatus => cmd_sync_status(ctx),
+        Cmd::Sync {
+            path,
+            other_keyfile,
+            other_password_env,
+        } => cmd_sync(
+            ctx,
+            path.as_ref(),
+            other_keyfile.as_ref(),
+            other_password_env.as_deref(),
+        ),
+        Cmd::Conflicts { cmd } => match cmd {
+            None => cmd_conflicts(ctx),
+            Some(ConflictsCmd::Show { query, reveal }) => cmd_conflict_show(ctx, &query, reveal),
+            Some(ConflictsCmd::Resolve {
+                query,
+                mine,
+                theirs,
+                field,
+            }) => cmd_conflict_resolve(ctx, &query, mine, theirs, &field),
+        },
+        Cmd::Gc {
+            older_than,
+            dry_run,
+        } => cmd_gc(ctx, &older_than, dry_run),
         Cmd::Doctor {
             rebuild_index,
             with_unlock,
@@ -328,6 +374,31 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             with_unlock,
             ctx.password_env.as_deref(),
             ctx.json,
+        ),
+    }
+}
+
+fn dispatch_vault(ctx: &Ctx, cmd: VaultCmd) -> Result<()> {
+    match cmd {
+        VaultCmd::Init {
+            path,
+            preset,
+            cipher,
+            keyfile,
+        } => vault_init(ctx, &path, preset, cipher, &keyfile),
+        VaultCmd::Rekey {
+            new_keyfile,
+            new_password_env,
+            cipher,
+            preset,
+            keep_old_slots,
+        } => vault_rekey(
+            ctx,
+            new_keyfile.as_ref(),
+            new_password_env.as_deref(),
+            cipher,
+            preset,
+            keep_old_slots,
         ),
     }
 }
@@ -682,6 +753,9 @@ fn cmd_sync_status(ctx: &Ctx) -> Result<()> {
     let headers = vault.scan_headers()?;
     let live = headers.iter().filter(|h| !h.deleted).count();
     let max_rev = headers.iter().map(|h| h.rev).max().unwrap_or(0);
+    let uv = ctx.unlocked()?;
+    let conflicts = uv.list_conflicts()?.len();
+    let last_merge = uv.last_merge_ms()?;
     if ctx.json {
         println!(
             "{}",
@@ -690,14 +764,271 @@ fn cmd_sync_status(ctx: &Ctx) -> Result<()> {
                 "live": live,
                 "tombstones": headers.len() - live,
                 "max_rev": max_rev,
+                "conflicts": conflicts,
+                "last_merge_ms": last_merge,
             })
         );
     } else {
         println!("envelopes: {}", headers.len());
         println!("live: {live}, tombstones: {}", headers.len() - live);
         println!("max rev: {max_rev}");
+        println!("conflicts: {conflicts}");
+        match last_merge {
+            Some(ms) => println!("last merge: {ms}"),
+            None => println!("last merge: never"),
+        }
     }
     Ok(())
+}
+
+fn cmd_sync(
+    ctx: &Ctx,
+    other: Option<&PathBuf>,
+    other_keyfile: Option<&PathBuf>,
+    other_password_env: Option<&str>,
+) -> Result<()> {
+    let mut uv = ctx.unlocked()?;
+    let heal = uv.heal_conflict_files()?;
+    let mut adopted = 0usize;
+    let mut merged = heal.merged;
+    let mut conflicts = heal.conflicts;
+    let mut blobs = 0usize;
+    if let Some(other_path) = other {
+        let other_vault = glyx_store::Vault::open(other_path)?;
+        let kf = other_keyfile
+            .or(ctx.keyfile.as_ref())
+            .context("other vault needs --other-keyfile or --keyfile")?;
+        let pw_env = other_password_env.or(ctx.password_env.as_deref());
+        let pw = auth::read_password(pw_env)?;
+        let kf_bytes = auth::read_keyfile(kf)?;
+        let other_uv = other_vault.unlock(&pw, &kf_bytes)?;
+        let rep = uv.sync_from(&other_uv)?;
+        adopted = rep.adopted;
+        merged += rep.merged;
+        conflicts += rep.conflicts;
+        blobs = rep.blobs;
+    }
+    if heal.healed + adopted + merged > 0 {
+        uv.stamp_merge()?;
+    }
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "healed": heal.healed,
+                "adopted": adopted,
+                "merged": merged,
+                "conflicts": conflicts,
+                "blobs": blobs,
+            })
+        );
+    } else {
+        println!(
+            "healed: {}, adopted: {adopted}, merged: {merged}, conflicts: {conflicts}, blobs: {blobs}",
+            heal.healed
+        );
+    }
+    Ok(())
+}
+
+fn find_conflict(uv: &glyx_store::UnlockedVault, query: &str) -> Result<glyx_store::ConflictMeta> {
+    let metas = uv.list_conflicts()?;
+    if let Ok(id) = query.parse::<Uuid>() {
+        if let Some(m) = metas.into_iter().rfind(|m| m.item_id == id) {
+            return Ok(m);
+        }
+        bail!("no conflict for {id}");
+    }
+    let mut hits: Vec<_> = metas
+        .into_iter()
+        .filter(|m| m.item_id.as_simple().to_string().starts_with(query))
+        .collect();
+    if hits.len() == 1 {
+        return Ok(hits.remove(0));
+    }
+    if hits.len() > 1 {
+        bail!("ambiguous id prefix, matches {} conflicts", hits.len());
+    }
+    let item = items::resolve_query(uv, query)?;
+    uv.list_conflicts()?
+        .into_iter()
+        .rfind(|m| m.item_id == item.id)
+        .context("no conflict for item")
+}
+
+fn cmd_conflicts(ctx: &Ctx) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    let metas = uv.list_conflicts()?;
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::Value::Array(
+                metas
+                    .iter()
+                    .map(|m| serde_json::json!({
+                        "item": m.item_id,
+                        "created_ms": m.created_ms,
+                        "targets": m.race_targets,
+                    }))
+                    .collect()
+            )
+        );
+    } else {
+        for m in &metas {
+            println!("{} races: {}", m.item_id, m.race_targets.join(","));
+        }
+        if metas.is_empty() {
+            println!("no conflicts");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_conflict_show(ctx: &Ctx, query: &str, reveal: bool) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    let meta = find_conflict(&uv, query)?;
+    let Some((winner, local, remote, targets)) = uv.read_conflict(&meta.item_id)? else {
+        bail!("conflict vanished");
+    };
+    let show_val = |v: &str| {
+        if reveal {
+            v.to_owned()
+        } else {
+            "••••".to_owned()
+        }
+    };
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "item": meta.item_id,
+                "targets": targets,
+                "winner_rev": winner.rev,
+                "local_rev": local.rev,
+                "remote_rev": remote.rev,
+            })
+        );
+    } else {
+        println!("conflict {} targets: {}", meta.item_id, targets.join(","));
+        for t in &targets {
+            let (mine, theirs) = race_values(&local, &remote, t);
+            println!("{t}: mine={} theirs={}", show_val(&mine), show_val(&theirs));
+        }
+    }
+    Ok(())
+}
+
+fn race_values(
+    local: &glyx_core::Item,
+    remote: &glyx_core::Item,
+    target: &str,
+) -> (String, String) {
+    if let Some(field) = target.strip_prefix("field:") {
+        let mine = local.fields.get(field).map_or("", |f| f.value.expose());
+        let theirs = remote.fields.get(field).map_or("", |f| f.value.expose());
+        return (mine.to_owned(), theirs.to_owned());
+    }
+    match target {
+        "name" => (local.name.clone(), remote.name.clone()),
+        "folder" => (local.folder.clone(), remote.folder.clone()),
+        _ => (String::new(), String::new()),
+    }
+}
+
+fn cmd_conflict_resolve(
+    ctx: &Ctx,
+    query: &str,
+    mine: bool,
+    theirs: bool,
+    field: &[String],
+) -> Result<()> {
+    if mine && theirs {
+        bail!("pass only one of --mine or --theirs");
+    }
+    if (mine || theirs) && !field.is_empty() {
+        bail!("--field cannot combine with --mine or --theirs");
+    }
+    let mut uv = ctx.unlocked()?;
+    let meta = find_conflict(&uv, query)?;
+    let resolution = if mine {
+        glyx_store::Resolution::Mine
+    } else if theirs {
+        glyx_store::Resolution::Theirs
+    } else {
+        let mut map = BTreeMap::new();
+        for pair in field {
+            let (k, v) = items::split_field(pair)?;
+            map.insert(k, v);
+        }
+        if map.is_empty() {
+            bail!("nothing to resolve: pass --mine, --theirs, or --field");
+        }
+        glyx_store::Resolution::Fields(map)
+    };
+    if !uv.resolve_conflict(&meta.item_id, resolution)? {
+        bail!("conflict vanished");
+    }
+    if ctx.json {
+        println!("{}", serde_json::json!({"ok": true, "id": meta.item_id}));
+    } else {
+        println!("resolved {}", meta.item_id);
+    }
+    Ok(())
+}
+
+fn parse_duration_ms(text: &str) -> Result<u64> {
+    let (num, mult) = if let Some(n) = text.strip_suffix('d') {
+        (n, 86_400_000u64)
+    } else if let Some(n) = text.strip_suffix('h') {
+        (n, 3_600_000u64)
+    } else if let Some(n) = text.strip_suffix('m') {
+        (n, 60_000u64)
+    } else {
+        (text, 86_400_000u64)
+    };
+    Ok(num
+        .parse::<u64>()
+        .context("bad duration")?
+        .saturating_mul(mult))
+}
+
+fn cmd_gc(ctx: &Ctx, older_than: &str, dry_run: bool) -> Result<()> {
+    let window = parse_duration_ms(older_than)?;
+    if dry_run {
+        let uv = ctx.unlocked()?;
+        let now = glyx_core::ids::wall_ms_now();
+        let cutoff = now.saturating_sub(window);
+        let mut ids = Vec::new();
+        for row in uv.list(true)? {
+            if !row.deleted {
+                continue;
+            }
+            if let Some(item) = uv.get_item(&row.id)? {
+                if item.hlc.wall_ms < cutoff {
+                    ids.push(row.id);
+                }
+            }
+        }
+        output_ids(ctx.json, &ids, "would purge");
+        return Ok(());
+    }
+    let mut uv = ctx.unlocked()?;
+    let ids = uv.gc_tombstones(window)?;
+    output_ids(ctx.json, &ids, "purged");
+    Ok(())
+}
+
+fn output_ids(as_json: bool, ids: &[Uuid], verb: &str) {
+    if as_json {
+        println!("{}", serde_json::json!({ "ids": ids }));
+    } else {
+        for id in ids {
+            println!("{verb} {id}");
+        }
+        if ids.is_empty() {
+            println!("nothing to purge");
+        }
+    }
 }
 
 fn type_label(item_type: glyx_core::ItemType) -> &'static str {
