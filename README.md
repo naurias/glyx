@@ -2,7 +2,7 @@
 
 Local-first password manager for Linux, Windows, and Android. CLI, WebUI, and desktop app on one Rust core. No accounts, no telemetry, your vault stays yours.
 
-> Status: M4 browser fill, Git helper, and clipboard fill work. SSH agent and file injection arrive in M5. This README is a living user guide and grows with each milestone.
+> Status: M5 file exports, secret injection, and SSH agent work. Android support arrives in M6. This README is a living user guide and grows with each milestone.
 
 ## What glyx will do
 
@@ -118,22 +118,34 @@ At creation you pick a preset; advanced users can tune KDF cost and cipher:
 
 Unlock is password plus keyfile (a 32 byte random file you keep apart from the vault, for example on USB). Lose either and the vault cannot be recovered, by design. Rekeying later (`glyx vault rekey`) changes password, keyfile, or cipher without a new vault.
 
-## File projection and injection (planned, M5)
+## File projection and injection
 
-Two ways to let apps use secrets while the vault is unlocked:
-
-1. Full export: a vault file is copied to a path you choose with `chmod 600`, tracked in a local ledger, and securely deleted on lock or recall.
-2. In-place injection: a tracked file keeps a placeholder when locked and gets the real secret while unlocked:
+Two ways to let apps use secrets while the vault is unlocked. Files you do not mark `--keep` are shredded when the vault locks; `--keep` files (real exports) stay but are re-synced on unlock:
 
 ```sh
-# locked view
-password: __GLYXENC:V1:opaque-blob__
+# Full-file export: a field, blob, or SSH key lands at a path
+glyx export add ~/.aws/credentials --item aws --field secret_key
+glyx export add ~/.ssh/id_glyx --ssh deploy --keep
+glyx export ls
+glyx export recall ~/.aws/credentials
+glyx export enforce [--force]
 
-# unlocked view
-password: s3cret-value
+# In-place injection: author {{glyx:<id>/<field>}} refs, they resolve on unlock
+glyx inject add ~/project/.env
+glyx inject add ~/notes/todo.md --form masked
 ```
 
-Placeholders default to opaque encrypted pointers so a locked file reveals nothing about which item it points to. If a file changed while the vault was locked, glyx shows a diff on next unlock instead of overwriting silently.
+Locked files show opaque encrypted pointers by default (`__GLYXENC:V1:…`, bound to their target path so copying them elsewhere fails closed). Where tooling must parse locked files, `--form masked` writes fixed-size `ENC[…]` tags instead. If a file changed while locked, unlock reports it instead of overwriting: `glyx export tamper`, then `export enforce --force` or leave it alone. The ledger (`agent-ledger.sqlite`, local only, never synced) tracks every registration.
+
+## SSH agent
+
+```sh
+glyx ssh export deploy --to ~/.ssh/id_glyx   # file export, ledger-tracked
+eval $(glyx ssh agent-env)                    # daemon socket, sign-only
+ssh-add -L                                    # lists glyx:<name> identities
+```
+
+The agent socket serves Ed25519 keys while the daemon is unlocked and vanishes on lock; private material never touches disk through this path.
 
 ## Sync
 
@@ -213,7 +225,7 @@ crates/
   glyx-crypto    Argon2id KDF, XChaCha/AES-GCM, keyslots, BLAKE3
   glyx-store     Vault init/open, envelopes, blobs, index, merge/heal/GC
   glyx-sync      Field-LWW merge, dominance check, header ordering, classifier
-  glyx-agent     Export ledger traits (engine in M5)
+  glyx-agent     Export/inject ledger, shred, tamper, SSH agent socket
   glyx-autofill  Clipboard backend + fill helpers (no Secret Service by design)
   glyx-daemon    Axum /v1 API + embedded WebUI, token auth, idle auto-lock
   glyx-tauri     Tauri desktop shell hosting the built WebUI
@@ -225,7 +237,7 @@ local/           Agent and developer docs (gitignored, local only)
 
 ## Roadmap
 
-Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 browser/Git/clipboard fill (done), M5 file agent plus SSH, M6 Android plus notes, M7 hardening and installers.
+Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 browser/Git/clipboard fill (done), M5 file agent plus SSH (done), M6 Android plus notes, M7 hardening and installers.
 
 ## License
 
