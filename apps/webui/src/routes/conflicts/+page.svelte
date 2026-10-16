@@ -30,6 +30,7 @@
   <a href="/items">Items</a>
   <a href="/add">Add</a>
   <a href="/conflicts">Conflicts</a>
+  <a href="/exports">Exports</a>
   <a href="/settings">Settings</a>
 </nav>
 <main>

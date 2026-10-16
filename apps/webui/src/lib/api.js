@@ -44,5 +44,12 @@ export const api = {
   conflict: (id, reveal = false) => req('GET', `/v1/conflicts/${id}?reveal=${reveal}`),
   resolve: (id, body) => req('POST', `/v1/conflicts/${id}/resolve`, body),
   gc: (body) => req('POST', '/v1/gc', body),
-  doctor: () => req('GET', '/v1/doctor')
+  doctor: () => req('GET', '/v1/doctor'),
+  exports: () => req('GET', '/v1/exports'),
+  recall: (target) => req('DELETE', `/v1/exports?target=${encodeURIComponent(target)}`),
+  enforce: (force) => req('POST', '/v1/exports/enforce', { force }),
+  trackInject: (target, form) => req('POST', '/v1/injects', { target, form }),
+  tamper: () => req('GET', '/v1/agent/tamper'),
+  resolveTamper: (target, action) => req('POST', '/v1/agent/resolve', { target, action }),
+  sshEnv: () => req('GET', '/v1/ssh/env')
 };
