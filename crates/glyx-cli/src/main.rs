@@ -1,5 +1,6 @@
 mod auth;
 mod daemon;
+mod exports;
 mod extension;
 mod gitcred;
 mod items;
@@ -117,6 +118,16 @@ enum Cmd {
     Ssh {
         #[command(subcommand)]
         cmd: SshCmd,
+    },
+    #[command(about = "File and secret exports")]
+    Export {
+        #[command(subcommand)]
+        cmd: ExportCmd,
+    },
+    #[command(about = "Secret injection into files")]
+    Inject {
+        #[command(subcommand)]
+        cmd: InjectCmd,
     },
     #[command(about = "Vault sync state")]
     SyncStatus,
@@ -267,6 +278,63 @@ enum SshCmd {
         #[arg(long, help = "Folder path")]
         folder: Option<String>,
     },
+    #[command(about = "Print SSH_AUTH_SOCK for the daemon agent")]
+    AgentEnv,
+    #[command(about = "Export a key to a file")]
+    Export {
+        #[arg(help = "Id, id prefix, or exact name")]
+        query: String,
+        #[arg(long, help = "Target path")]
+        to: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ExportCmd {
+    #[command(about = "Register a file export")]
+    Add {
+        #[arg(help = "Target path")]
+        target: PathBuf,
+        #[arg(long, help = "Source item")]
+        item: Option<String>,
+        #[arg(long, help = "Source field")]
+        field: Option<String>,
+        #[arg(long, help = "Source blob address")]
+        blob: Option<String>,
+        #[arg(long, help = "Source ssh key item")]
+        ssh: Option<String>,
+        #[arg(long, help = "Keep the file on lock")]
+        keep: bool,
+        #[arg(long, help = "File mode bits, e.g. 384 for 0600")]
+        perm: Option<u32>,
+    },
+    #[command(about = "List registered exports and injections")]
+    Ls,
+    #[command(about = "Wipe a tracked file and forget it")]
+    Recall {
+        #[arg(help = "Target path")]
+        target: PathBuf,
+    },
+    #[command(about = "Materialize all registered exports")]
+    Enforce {
+        #[arg(long, help = "Overwrite drifted files")]
+        force: bool,
+    },
+    #[command(about = "Show tamper findings")]
+    Tamper,
+}
+
+#[derive(Debug, Subcommand)]
+enum InjectCmd {
+    #[command(about = "Track a file for secret injection")]
+    Add {
+        #[arg(help = "Target file")]
+        file: PathBuf,
+        #[arg(long, default_value = "encrypted-pointer", help = "Locked form")]
+        form: String,
+    },
+    #[command(about = "List tracked injections")]
+    Ls,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -430,14 +498,9 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             timeout,
             dry_run,
         } => cmd_fill(ctx, &query, &field, timeout, dry_run),
-        Cmd::Ssh { cmd } => match cmd {
-            SshCmd::Gen {
-                name,
-                kind,
-                comment,
-                folder,
-            } => cmd_ssh_gen(ctx, name, kind, comment, folder),
-        },
+        Cmd::Ssh { cmd } => dispatch_ssh(ctx, cmd),
+        Cmd::Export { cmd } => dispatch_export(ctx, cmd),
+        Cmd::Inject { cmd } => dispatch_inject(ctx, cmd),
         Cmd::SyncStatus => cmd_sync_status(ctx),
         Cmd::Sync {
             path,
@@ -477,6 +540,65 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
         Cmd::Daemon { cmd } => dispatch_daemon(ctx, cmd),
         Cmd::Extension { cmd } => dispatch_extension(ctx, cmd),
         Cmd::Git { cmd } => dispatch_git(ctx, cmd),
+    }
+}
+
+fn dispatch_ssh(ctx: &Ctx, cmd: SshCmd) -> Result<()> {
+    match cmd {
+        SshCmd::Gen {
+            name,
+            kind,
+            comment,
+            folder,
+        } => cmd_ssh_gen(ctx, name, kind, comment, folder),
+        SshCmd::AgentEnv => exports::cmd_agent_env(ctx.json),
+        SshCmd::Export { query, to } => {
+            let mut uv = ctx.unlocked()?;
+            exports::cmd_ssh_export(&mut uv, &query, to, ctx.json)
+        }
+    }
+}
+
+fn dispatch_export(ctx: &Ctx, cmd: ExportCmd) -> Result<()> {
+    match cmd {
+        ExportCmd::Add {
+            target,
+            item,
+            field,
+            blob,
+            ssh,
+            keep,
+            perm,
+        } => {
+            let uv = ctx.unlocked()?;
+            exports::cmd_add(
+                exports::ExportAdd {
+                    target,
+                    item,
+                    field,
+                    blob,
+                    ssh,
+                    keep,
+                    perm,
+                },
+                &uv,
+                ctx.json,
+            )
+        }
+        ExportCmd::Ls => exports::cmd_ls(ctx.json),
+        ExportCmd::Recall { target } => exports::cmd_recall(&target, ctx.json),
+        ExportCmd::Enforce { force } => {
+            let mut uv = ctx.unlocked()?;
+            exports::cmd_enforce(&mut uv, force, ctx.json)
+        }
+        ExportCmd::Tamper => exports::cmd_tamper(ctx.vault.as_ref(), ctx.json),
+    }
+}
+
+fn dispatch_inject(ctx: &Ctx, cmd: InjectCmd) -> Result<()> {
+    match cmd {
+        InjectCmd::Add { file, form } => exports::cmd_inject_add(&file, &form, ctx.json),
+        InjectCmd::Ls => exports::cmd_ls(ctx.json),
     }
 }
 
@@ -620,7 +742,8 @@ fn vault_rekey(
 fn cmd_unlock(ctx: &Ctx, ttl: Option<u64>, with_pin: bool) -> Result<()> {
     let vault_path = ctx.vault_path()?;
     let vault = glyx_store::Vault::open(&vault_path)?;
-    let uv = auth::full_unlock(&vault, ctx.keyfile.as_deref(), ctx.password_env.as_deref())?;
+    let mut uv = auth::full_unlock(&vault, ctx.keyfile.as_deref(), ctx.password_env.as_deref())?;
+    let rep = glyx_agent::enforce_all(&mut uv, false).map_err(|e| anyhow::anyhow!(e))?;
     let ttl = ttl.unwrap_or(auth::load_config().session_ttl_min);
     if with_pin {
         let pin = rpassword::prompt_password("new PIN: ").context("cannot read PIN")?;
@@ -635,11 +758,47 @@ fn cmd_unlock(ctx: &Ctx, ttl: Option<u64>, with_pin: bool) -> Result<()> {
         println!("{}", serde_json::json!({"ok": true, "ttl_min": ttl}));
     } else {
         println!("unlocked for {ttl} minutes");
+        println!(
+            "exports: {} file(s), {} injection(s)",
+            rep.files, rep.injected
+        );
+        for s in &rep.skipped {
+            println!("skipped: {s} (run export enforce --force)");
+        }
     }
     Ok(())
 }
 
 fn cmd_lock(ctx: &Ctx) -> Result<()> {
+    if let Some(path) = ctx.vault.as_ref() {
+        if let Ok(vault) = glyx_store::Vault::open(path) {
+            let session_path = glyx_store::session::session_path(&vault.config().vault_id);
+            if session_path.exists() {
+                let uv = if let Some(uv) = vault.open_session(None)? {
+                    Some(uv)
+                } else {
+                    let pin =
+                        rpassword::prompt_password("vault PIN for file cleanup (empty to skip): ")
+                            .unwrap_or_default();
+                    if pin.is_empty() {
+                        eprintln!("skipping file cleanup");
+                        None
+                    } else {
+                        vault.open_session(Some(pin.as_bytes()))?
+                    }
+                };
+                if let Some(uv) = uv {
+                    let rep = glyx_agent::teardown_all(&uv).map_err(|e| anyhow::anyhow!(e))?;
+                    if !ctx.json && (rep.wiped > 0 || rep.restored > 0 || !rep.drifted.is_empty()) {
+                        println!("agent: wiped {}, restored {}", rep.wiped, rep.restored);
+                        for d in &rep.drifted {
+                            println!("drifted: {d}");
+                        }
+                    }
+                }
+            }
+        }
+    }
     let n = match ctx.vault.as_ref() {
         Some(path) => {
             let vault = glyx_store::Vault::open(path)?;
