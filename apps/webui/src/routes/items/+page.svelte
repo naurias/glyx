@@ -33,7 +33,7 @@
 </nav>
 <main>
   <div class="row">
-    <input bind:value={q} placeholder="Search name or type" />
+    <input bind:value={q} autofocus placeholder="Search name or type" />
   </div>
   {#if error}<p style="color: var(--danger)">{error}</p>{/if}
   {#each filtered as item (item.id)}
