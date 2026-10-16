@@ -92,19 +92,31 @@
         ];
       in
       {
-        # M-1: CLI (+ daemon lib) only. WebUI embedding via pnpm lands in M3;
-        # see TODO below. Desktop package below reuses this binary until the
-        # Tauri crate lands.
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "glyx";
           inherit version;
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           buildInputs = [ pkgs.openssl ];
-          nativeBuildInputs = [ pkgs.pkg-config ];
+          nativeBuildInputs = [
+            pkgs.pkg-config
+            pkgs.nodejs_22
+            pkgs.pnpm
+            pkgs.pnpmConfigHook
+          ];
+          pnpmDeps = pkgs.fetchPnpmDeps {
+            pname = "glyx-webui";
+            inherit version;
+            src = ./apps/webui;
+            fetcherVersion = 4;
+            hash = "sha256-t/lXdo/UFpBiSzocyv9Bh9KB21SWqaeHNryWU0iSJ/w=";
+          };
+          pnpmRoot = "apps/webui";
           cargoBuildFlags = [
             "--bin"
             "glyx"
+            "--bin"
+            "glyx-daemon"
           ];
           cargoTestFlags = [
             "-p"
@@ -112,18 +124,17 @@
             "-p"
             "glyx-crypto"
           ];
-          # TODO(M3): add pnpmDeps + preBuild `(cd apps/webui && pnpm build)`
-          # with EMBED_UI=1 once apps/webui exists, mirroring liber-rs.
+          preBuild = ''
+            (cd apps/webui && pnpm build)
+          '';
           meta = with pkgs.lib; {
-            description = "glyx local-first password manager CLI";
+            description = "glyx local-first password manager CLI plus daemon";
             homepage = "https://github.com/glyx/glyx";
             license = licenses.gpl3Plus;
             mainProgram = "glyx";
           };
         };
 
-        # Desktop app stub: same binary with GApps wrapping + .desktop entry.
-        # Becomes the real Tauri binary in M3 (crates/glyx-tauri or apps/desktop).
         packages.glyx-desktop = pkgs.rustPlatform.buildRustPackage {
           pname = "glyx-desktop";
           inherit version;
@@ -133,15 +144,29 @@
           nativeBuildInputs = [
             pkgs.pkg-config
             pkgs.wrapGAppsHook3
+            pkgs.nodejs_22
+            pkgs.pnpm
+            pkgs.pnpmConfigHook
           ];
+          pnpmDeps = pkgs.fetchPnpmDeps {
+            pname = "glyx-webui";
+            inherit version;
+            src = ./apps/webui;
+            fetcherVersion = 4;
+            hash = "sha256-t/lXdo/UFpBiSzocyv9Bh9KB21SWqaeHNryWU0iSJ/w=";
+          };
+          pnpmRoot = "apps/webui";
           cargoBuildFlags = [
             "--bin"
-            "glyx"
+            "glyx-tauri"
           ];
           cargoTestFlags = [
             "-p"
             "glyx-core"
           ];
+          preBuild = ''
+            (cd apps/webui && pnpm build)
+          '';
           postInstall = ''
             mkdir -p $out/share/applications $out/share/icons/hicolor/32x32/apps $out/share/icons/hicolor/128x128/apps
             cat > $out/share/applications/glyx.desktop <<EOF
@@ -149,11 +174,13 @@
             Type=Application
             Name=glyx
             Comment=Local-first password manager
-            Exec=glyx
+            Exec=glyx-tauri
             Icon=glyx
             Categories=Utility;Security;
             Terminal=false
             EOF
+            cp crates/glyx-tauri/icons/32x32.png $out/share/icons/hicolor/32x32/apps/glyx.png
+            cp crates/glyx-tauri/icons/128x128.png $out/share/icons/hicolor/128x128/apps/glyx.png
           '';
         };
 
@@ -169,15 +196,17 @@
             ''
               mkdir -p bundle/glyx-${version}
               cp ${cli}/bin/glyx bundle/glyx-${version}/
-              cp ${desktop}/bin/.glyx-wrapped bundle/glyx-${version}/glyx-desktop 2>/dev/null || cp ${desktop}/bin/glyx bundle/glyx-${version}/glyx-desktop
+              cp ${cli}/bin/glyx-daemon bundle/glyx-${version}/
+              cp ${desktop}/bin/.glyx-tauri-wrapped bundle/glyx-${version}/glyx-tauri 2>/dev/null || cp ${desktop}/bin/glyx-tauri bundle/glyx-${version}/glyx-tauri
               cat > bundle/glyx-${version}/INSTALL.txt <<EOF
               glyx ${version} (${system})
               Run from this directory or add it to PATH:
                 ./glyx                  CLI + vault management
-                ./glyx-desktop          desktop entry (Tauri binary lands in M3)
+                ./glyx-daemon           localhost daemon (API plus web UI)
+                ./glyx-tauri            desktop app (needs a display plus system webkit)
               Verify with: (cd glyx-${version} && sha256sum -c SHA256SUMS)
               EOF
-              (cd bundle/glyx-${version} && sha256sum glyx glyx-desktop > SHA256SUMS)
+              (cd bundle/glyx-${version} && sha256sum glyx glyx-daemon glyx-tauri > SHA256SUMS)
               (cd bundle && tar -czf $out glyx-${version})
             '';
 
@@ -277,13 +306,17 @@
           drv = self.packages.${system}.default;
           exePath = "/bin/glyx";
         };
+        apps.glyx-daemon = flake-utils.lib.mkApp {
+          drv = self.packages.${system}.default;
+          exePath = "/bin/glyx-daemon";
+        };
         apps.bundle = flake-utils.lib.mkApp {
           drv = self.packages.${system}.bundle;
           exePath = "/bin/glyx";
         };
         apps.glyx-desktop = flake-utils.lib.mkApp {
           drv = self.packages.${system}.glyx-desktop;
-          exePath = "/bin/glyx";
+          exePath = "/bin/glyx-tauri";
         };
       }
     );

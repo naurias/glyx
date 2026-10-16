@@ -2,7 +2,7 @@
 
 Local-first password manager for Linux, Windows, and Android. CLI, WebUI, and desktop app on one Rust core. No accounts, no telemetry, your vault stays yours.
 
-> Status: M2 sync merge works. Daemon and WebUI arrive in M3. This README is a living user guide and grows with each milestone.
+> Status: M3 daemon, WebUI, and desktop app work. Browser autofill arrives in M4. This README is a living user guide and grows with each milestone.
 
 ## What glyx will do
 
@@ -153,6 +153,21 @@ glyx gc --older-than 30d         # purge tombstones older than 30 days
 
 Rules: newer fields win, tombstones win over edits, true same-field races keep a deterministic winner and record both sides under `conflicts/` for you to resolve. Nothing is silently dropped. Note the one caveat: purging a tombstone older than the GC window means a device offline longer than that window can resurrect the deleted item on its next sync. A self-hostable LAN relay is planned later with the same merge rules and end to end encryption.
 
+## Daemon, WebUI, desktop
+
+The daemon owns the unlocked vault and serves the API plus the WebUI on loopback only:
+
+```sh
+glyx --vault ~/vaults/main.glyx daemon start
+glyx --vault ~/vaults/main.glyx daemon status
+```
+
+Open the printed address in a browser, paste the token from the runtime dir (`daemon-<vault>.json`), unlock, and manage items, TOTP codes, conflicts, sync, GC, and doctor from the UI. Secrets stay in memory only and never touch `localStorage`. The desktop app (`glyx-tauri`, or `nix run .#glyx-desktop`) hosts the same UI. `daemon stop` (or Lock in the UI) drops the key.
+
+```sh
+nix profile install .#bundle   # CLI, daemon, and desktop in one profile
+```
+
 ## Configuration
 
 | Item            | Location (planned)                          |
@@ -175,7 +190,8 @@ crates/
   glyx-sync      Field-LWW merge, dominance check, header ordering, classifier
   glyx-agent     Export ledger traits (engine in M5)
   glyx-autofill  Provider traits (OS bridges in M4)
-  glyx-daemon    Lock-state machine (networking in M3)
+  glyx-daemon    Axum /v1 API + embedded WebUI, token auth, idle auto-lock
+  glyx-tauri     Tauri desktop shell hosting the built WebUI
   glyx-cli       Full CLI: items, sessions, rekey, sync, conflicts, gc
 apps/            webui, desktop, android, extension (fill in M3+)
 local/           Agent and developer docs (gitignored, local only)
@@ -183,7 +199,7 @@ local/           Agent and developer docs (gitignored, local only)
 
 ## Roadmap
 
-Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop, M4 autofill, M5 file agent plus SSH, M6 Android plus notes, M7 hardening and installers.
+Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 autofill, M5 file agent plus SSH, M6 Android plus notes, M7 hardening and installers.
 
 ## License
 
