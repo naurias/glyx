@@ -48,6 +48,7 @@ totp-rs = { version = "5", default-features = false, features = ["otpauth"] }
 ssh-key = { version = "0.6", features = ["ed25519", "rsa", "rand_core"] }
 arboard = "3"
 tauri-plugin-global-shortcut = "2"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 base64 = "0.22"
 
 [workspace.lints.rust]
