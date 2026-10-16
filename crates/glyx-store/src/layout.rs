@@ -3,6 +3,7 @@ pub const KEYSLOTS_DIR: &str = "keyslots";
 pub const ITEMS_DIR: &str = "items";
 pub const BLOBS_DIR: &str = "blobs";
 pub const HISTORY_DIR: &str = "history";
+pub const CONFLICTS_DIR: &str = "conflicts";
 pub const INDEX_DB: &str = "glyx.db";
 pub const LOCK_FILE: &str = "glyx.db.lock";
 pub const INDEX_SCHEMA_VERSION: i64 = 1;
