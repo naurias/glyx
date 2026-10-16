@@ -4,11 +4,29 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "glyx-daemon"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
 tokio.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+axum.workspace = true
+rust-embed.workspace = true
+mime_guess.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+zeroize.workspace = true
 glyx-core = { path = "../glyx-core" }
 glyx-store = { path = "../glyx-store" }
+glyx-crypto = { path = "../glyx-crypto" }
+
+[dev-dependencies]
+tower.workspace = true
+tempfile = "3"
