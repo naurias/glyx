@@ -228,6 +228,7 @@ struct ListQuery {
     folder: Option<String>,
     tag: Option<String>,
     all: Option<bool>,
+    q: Option<String>,
 }
 
 async fn list_items(
@@ -248,6 +249,12 @@ async fn list_items(
     let out: Vec<_> = rows
         .into_iter()
         .filter(|r| q.item_type.as_ref().is_none_or(|t| &r.item_type == t))
+        .filter(|r| {
+            q.q.as_ref().is_none_or(|needle| {
+                let needle = needle.to_lowercase();
+                r.name.to_lowercase().contains(&needle)
+            })
+        })
         .collect();
     let out: Vec<_> = out
         .into_iter()
