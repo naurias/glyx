@@ -113,6 +113,14 @@ pub fn list(conn: &Connection, include_deleted: bool) -> Result<Vec<IndexRow>, S
         .map_err(StoreError::from)
 }
 
+pub fn remove(conn: &Connection, id: &Uuid) -> Result<(), StoreError> {
+    conn.execute(
+        "DELETE FROM items WHERE id = ?1",
+        [&id.as_simple().to_string()],
+    )?;
+    Ok(())
+}
+
 pub fn count(conn: &Connection) -> Result<i64, StoreError> {
     Ok(conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?)
 }
