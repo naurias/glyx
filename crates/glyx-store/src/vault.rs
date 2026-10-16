@@ -29,6 +29,7 @@ impl Vault {
         fs::create_dir_all(path.join(layout::ITEMS_DIR))?;
         fs::create_dir_all(path.join(layout::BLOBS_DIR))?;
         fs::create_dir_all(path.join(layout::HISTORY_DIR))?;
+        fs::create_dir_all(path.join(layout::CONFLICTS_DIR))?;
         let _session = lock_file(path)?;
         let config = glyx_core::VaultConfig::new(Uuid::now_v7(), suite);
         config.validate()?;
@@ -190,14 +191,19 @@ impl Vault {
         let session = lock_file(&self.path)?;
         let conn = Connection::open(self.path.join(layout::INDEX_DB))?;
         index::init_schema(&conn)?;
-        Ok(UnlockedVault {
+        let mut uv = UnlockedVault {
             path: self.path.clone(),
             config: self.config.clone(),
             key,
             conn,
             node,
             _session: session,
-        })
+        };
+        let healed = uv.heal_conflict_files()?;
+        if healed.healed > 0 {
+            uv.stamp_merge()?;
+        }
+        Ok(uv)
     }
 }
 
@@ -225,6 +231,10 @@ impl UnlockedVault {
     }
     pub fn put_item(&mut self, item: &glyx_core::Item) -> Result<(), StoreError> {
         item.validate()?;
+        if has_conflict_files(&self.path) {
+            self.heal_conflict_files()?;
+            self.stamp_merge()?;
+        }
         let env = Envelope::seal(item, &self.key, self.cipher())?;
         let target = self.path.join(layout::ITEMS_DIR).join(env.filename());
         if target.exists() {
@@ -459,6 +469,365 @@ impl UnlockedVault {
         )?;
         Ok(n)
     }
+
+    pub fn last_merge_ms(&self) -> Result<Option<u64>, StoreError> {
+        Ok(self
+            .meta_get("last_merge_ms")?
+            .and_then(|v| u64::try_from(v).ok()))
+    }
+
+    pub fn stamp_merge(&self) -> Result<(), StoreError> {
+        self.meta_set("last_merge_ms", glyx_core::ids::wall_ms_now().cast_signed())
+    }
+
+    fn read_envelope(&self, id: &Uuid) -> Result<Option<Envelope>, StoreError> {
+        let file = self
+            .path
+            .join(layout::ITEMS_DIR)
+            .join(format!("{}.envelope.json", id.as_simple()));
+        if !file.exists() {
+            return Ok(None);
+        }
+        serde_json::from_slice(&fs::read(file)?)
+            .map_err(|e| StoreError::Corrupt(e.to_string()))
+            .map(Some)
+    }
+
+    pub fn merge_envelope(
+        &mut self,
+        remote: &Envelope,
+    ) -> Result<crate::conflicts::MergeReport, StoreError> {
+        use crate::conflicts::{MergeOutcome, MergeReport};
+        let local_env = self.read_envelope(&remote.id)?;
+        let Some(local_env) = local_env else {
+            let item = remote.open(&self.key)?;
+            self.put_item(&item)?;
+            return Ok(MergeReport {
+                outcome: MergeOutcome::Adopted,
+                races: 0,
+            });
+        };
+        let local_item = local_env.open(&self.key)?;
+        let remote_item = remote.open(&self.key)?;
+        if local_item == remote_item {
+            return Ok(MergeReport {
+                outcome: MergeOutcome::Stale,
+                races: 0,
+            });
+        }
+        if local_item.deleted != remote_item.deleted {
+            if local_item.deleted {
+                return Ok(MergeReport {
+                    outcome: MergeOutcome::Tombstoned,
+                    races: 0,
+                });
+            }
+            self.put_item(&remote_item)?;
+            return Ok(MergeReport {
+                outcome: MergeOutcome::Tombstoned,
+                races: 0,
+            });
+        }
+        if glyx_sync::remote_dominates(&local_item, &remote_item) {
+            self.put_item(&remote_item)?;
+            return Ok(MergeReport {
+                outcome: MergeOutcome::FastForwarded,
+                races: 0,
+            });
+        }
+        let tick = self.next_hlc()?;
+        let (winner, races) = glyx_sync::merge_items(
+            &local_item,
+            &remote_item,
+            tick,
+            self.node,
+            local_item.hlc.node,
+            remote_item.hlc.node,
+        );
+        self.put_item(&winner)?;
+        let n = races.len();
+        if n > 0 {
+            let winner_env = Envelope::seal(&winner, &self.key, self.cipher())?;
+            let file = crate::conflicts::ConflictFile {
+                v: crate::conflicts::CONFLICT_VERSION,
+                item_id: winner.id,
+                created_ms: tick.wall_ms,
+                winner: winner_env,
+                local: local_env,
+                remote: remote.clone(),
+                race_targets: races
+                    .iter()
+                    .map(|r| crate::conflicts::target_label(&r.target))
+                    .collect(),
+            };
+            crate::conflicts::write_conflict(
+                &self.path.join(layout::CONFLICTS_DIR),
+                &file,
+                tick.wall_ms,
+                tick.seq,
+            )?;
+        }
+        Ok(MergeReport {
+            outcome: MergeOutcome::Merged,
+            races: n,
+        })
+    }
+}
+
+impl UnlockedVault {
+    pub fn heal_conflict_files(&mut self) -> Result<crate::conflicts::HealReport, StoreError> {
+        use crate::conflicts::{HealReport, MergeOutcome};
+        let mut report = HealReport::default();
+        let mut copies = Vec::new();
+        for entry in fs::read_dir(self.path.join(layout::ITEMS_DIR))?.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_sync_conflict_copy(&name) {
+                copies.push(entry.path());
+            }
+        }
+        let mut pending = Vec::new();
+        for copy in copies {
+            let Some(original) = original_envelope_name(&copy) else {
+                continue;
+            };
+            let bytes = fs::read(&copy)?;
+            let remote: Envelope = match serde_json::from_slice(&bytes) {
+                Ok(env) => env,
+                Err(_) => continue,
+            };
+            if remote.id.as_simple().to_string() + ".envelope.json" != original {
+                continue;
+            }
+            fs::remove_file(&copy)?;
+            pending.push(remote);
+        }
+        for remote in &pending {
+            let rep = self.merge_envelope(remote)?;
+            report.healed += 1;
+            match rep.outcome {
+                MergeOutcome::Merged => {
+                    report.merged += 1;
+                    report.conflicts += usize::from(rep.races > 0);
+                }
+                MergeOutcome::Adopted | MergeOutcome::FastForwarded | MergeOutcome::Tombstoned => {
+                    report.merged += 1;
+                }
+                MergeOutcome::Stale => {}
+            }
+        }
+        Ok(report)
+    }
+
+    pub fn sync_from(
+        &mut self,
+        other: &UnlockedVault,
+    ) -> Result<crate::conflicts::SyncReport, StoreError> {
+        use crate::conflicts::{MergeOutcome, SyncReport};
+        let mut report = SyncReport::default();
+        let headers = other.scan_headers_unlocked()?;
+        for header in headers {
+            let Some(other_env) = other.read_envelope(&header.id)? else {
+                continue;
+            };
+            let Ok(remote_item) = other_env.open(&other.key) else {
+                continue;
+            };
+            let mut adopted = Envelope::seal(&remote_item, &self.key, self.cipher())?;
+            adopted.hlc = other_env.hlc;
+            adopted.rev = other_env.rev;
+            adopted.deleted = other_env.deleted;
+            let rep = self.merge_envelope(&adopted)?;
+            match rep.outcome {
+                MergeOutcome::Adopted | MergeOutcome::FastForwarded | MergeOutcome::Tombstoned => {
+                    report.merged += 1;
+                }
+                MergeOutcome::Merged => {
+                    report.merged += 1;
+                    report.conflicts += usize::from(rep.races > 0);
+                }
+                MergeOutcome::Stale => {}
+            }
+            if rep.outcome != MergeOutcome::Stale {
+                report.blobs += usize::from(self.ensure_file_blob(other, &header.id)?);
+            }
+        }
+        self.stamp_merge()?;
+        Ok(report)
+    }
+
+    fn ensure_file_blob(&mut self, other: &UnlockedVault, id: &Uuid) -> Result<bool, StoreError> {
+        let Some(mut item) = self.get_item(id)? else {
+            return Ok(false);
+        };
+        if item.item_type != glyx_core::ItemType::File {
+            return Ok(false);
+        }
+        let Some(addr) = item.fields.get("blob").map(|f| f.value.expose().to_owned()) else {
+            return Ok(false);
+        };
+        if self
+            .path
+            .join(layout::BLOBS_DIR)
+            .join(format!("{addr}.enc"))
+            .exists()
+        {
+            return Ok(false);
+        }
+        let data = other.get_blob(&addr)?;
+        let (new_addr, sealed) = blob::seal(&data, &self.key, self.cipher(), b"glyx-blob-v1")?;
+        atomic_write(
+            &self
+                .path
+                .join(layout::BLOBS_DIR)
+                .join(format!("{new_addr}.enc")),
+            &sealed,
+        )?;
+        if new_addr != addr {
+            let hlc = self.next_hlc()?;
+            if let Some(field) = item.fields.get_mut("blob") {
+                field.value = glyx_core::SecretString::new(new_addr);
+                field.field_hlc = hlc;
+            }
+            item.hlc = hlc;
+            item.rev = item.rev.saturating_add(1);
+            item.updated_by = self.node;
+            self.put_item(&item)?;
+        }
+        Ok(true)
+    }
+
+    pub fn list_conflicts(&self) -> Result<Vec<crate::conflicts::ConflictMeta>, StoreError> {
+        let dir = self.path.join(layout::CONFLICTS_DIR);
+        let mut out = Vec::new();
+        if !dir.exists() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(dir)?.flatten() {
+            let path = entry.path();
+            if !has_extension(&path, "json") {
+                continue;
+            }
+            if let Ok(file) = crate::conflicts::read_conflict(&path) {
+                out.push(crate::conflicts::ConflictMeta {
+                    item_id: file.item_id,
+                    path,
+                    created_ms: file.created_ms,
+                    race_targets: file.race_targets,
+                });
+            }
+        }
+        out.sort_by_key(|m| (m.item_id.as_bytes().to_vec(), m.created_ms));
+        Ok(out)
+    }
+
+    pub fn read_conflict(
+        &self,
+        item_id: &Uuid,
+    ) -> Result<Option<crate::conflicts::ConflictTriple>, StoreError> {
+        let mut metas = self.list_conflicts()?;
+        metas.retain(|m| &m.item_id == item_id);
+        let Some(meta) = metas.into_iter().next() else {
+            return Ok(None);
+        };
+        let file = crate::conflicts::read_conflict(&meta.path)?;
+        Ok(Some((
+            file.winner.open(&self.key)?,
+            file.local.open(&self.key)?,
+            file.remote.open(&self.key)?,
+            file.race_targets,
+        )))
+    }
+
+    pub fn resolve_conflict(
+        &mut self,
+        item_id: &Uuid,
+        resolution: crate::conflicts::Resolution,
+    ) -> Result<bool, StoreError> {
+        use crate::conflicts::Resolution;
+        let Some((winner, local, remote, _)) = self.read_conflict(item_id)? else {
+            return Ok(false);
+        };
+        let mut item = match resolution {
+            Resolution::Mine => local,
+            Resolution::Theirs => remote,
+            Resolution::Fields(map) => {
+                let mut item = winner;
+                let hlc = self.next_hlc()?;
+                for (k, v) in &map {
+                    if k == "name" {
+                        item.name.clone_from(v);
+                    } else if k == "folder" {
+                        item.folder.clone_from(v);
+                    } else {
+                        item.fields.insert(
+                            k.clone(),
+                            glyx_core::Field {
+                                value: glyx_core::SecretString::new(v.clone()),
+                                field_hlc: hlc,
+                            },
+                        );
+                    }
+                }
+                item.hlc = hlc;
+                item
+            }
+        };
+        item.hlc = self.next_hlc()?;
+        item.rev = item.rev.saturating_add(1);
+        item.deleted = false;
+        item.updated_by = self.node;
+        self.put_item(&item)?;
+        for meta in self.list_conflicts()? {
+            if &meta.item_id == item_id {
+                fs::remove_file(meta.path)?;
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn gc_tombstones(&mut self, older_than_ms: u64) -> Result<Vec<Uuid>, StoreError> {
+        let now = glyx_core::ids::wall_ms_now();
+        let cutoff = now.saturating_sub(older_than_ms);
+        let mut purged = Vec::new();
+        for header in self.scan_headers_unlocked()? {
+            if !header.deleted || header.hlc.wall_ms >= cutoff {
+                continue;
+            }
+            fs::remove_file(
+                self.path
+                    .join(layout::ITEMS_DIR)
+                    .join(format!("{}.envelope.json", header.id.as_simple())),
+            )?;
+            index::remove(&self.conn, &header.id)?;
+            purged.push(header.id);
+        }
+        Ok(purged)
+    }
+}
+
+fn has_conflict_files(vault_path: &Path) -> bool {
+    fs::read_dir(vault_path.join(layout::ITEMS_DIR)).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| is_sync_conflict_copy(&e.file_name().to_string_lossy()))
+    })
+}
+
+fn is_sync_conflict_copy(name: &str) -> bool {
+    name.contains(".sync-conflict-") || name.contains("conflicted copy")
+}
+
+fn original_envelope_name(copy_path: &Path) -> Option<String> {
+    let name = copy_path.file_name()?.to_string_lossy().into_owned();
+    if let Some((head, _)) = name.split_once(".sync-conflict-") {
+        let ext = copy_path.extension()?.to_string_lossy().into_owned();
+        return Some(format!("{head}.{ext}"));
+    }
+    if let Some((head, _)) = name.split_once(" (conflicted copy") {
+        let ext = copy_path.extension()?.to_string_lossy().into_owned();
+        return Some(format!("{head}.{ext}"));
+    }
+    None
 }
 
 impl std::fmt::Debug for UnlockedVault {
