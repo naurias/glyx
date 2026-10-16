@@ -1073,3 +1073,328 @@ mod m1_tests {
         assert_eq!(uv.list(false).expect("list").len(), 1);
     }
 }
+
+#[cfg(test)]
+mod test_helpers {
+    use super::*;
+
+    pub fn copy_dir(src: &Path, dst: &Path) {
+        fs::create_dir_all(dst).expect("mkdir");
+        for entry in fs::read_dir(src).expect("read").flatten() {
+            let to = dst.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_dir(&entry.path(), &to);
+            } else {
+                fs::copy(entry.path(), to).expect("copy");
+            }
+        }
+    }
+
+    pub fn m1_item(uv: &mut UnlockedVault, name: &str, fields: &[(&str, &str)]) -> glyx_core::Item {
+        let hlc = uv.next_hlc().expect("tick");
+        let node = uv.device_node();
+        let map = fields
+            .iter()
+            .map(|(k, v)| {
+                (
+                    (*k).to_owned(),
+                    glyx_core::Field {
+                        value: glyx_core::SecretString::new((*v).to_owned()),
+                        field_hlc: hlc,
+                    },
+                )
+            })
+            .collect();
+        glyx_core::Item {
+            id: Uuid::now_v7(),
+            item_type: glyx_core::ItemType::Login,
+            name: name.to_owned(),
+            folder: String::new(),
+            tags: Vec::new(),
+            fields: map,
+            hlc,
+            rev: 1,
+            deleted: false,
+            updated_by: node,
+        }
+    }
+
+    pub fn two_vaults() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a.glyx");
+        let b = dir.path().join("b.glyx");
+        let suite = glyx_core::CipherSuiteConfig {
+            kdf: glyx_core::KdfId::Argon2id,
+            cipher: glyx_core::Cipher::Xchacha20poly1305,
+            params: glyx_core::KdfParams::mobile(),
+        };
+        Vault::init(&a, suite, b"pw", &[9u8; 32]).expect("init");
+        copy_dir(&a, &b);
+        fs::remove_file(b.join("device.id")).ok();
+        (dir, a, b)
+    }
+
+    pub fn seed_b_from_a(a: &Path, b: &Path) {
+        let vault_a = Vault::open(a).expect("open");
+        let uv_a = vault_a.unlock(b"pw", &[9u8; 32]).expect("unlock");
+        let vault_b = Vault::open(b).expect("open");
+        let mut uv_b = vault_b.unlock(b"pw", &[9u8; 32]).expect("unlock");
+        uv_b.sync_from(&uv_a).expect("seed");
+    }
+
+    pub fn race_pair(a: &Path, b: &Path, id: &Uuid, field: &str, left: &str, right: &str) {
+        for (path, val) in [(a, left), (b, right)] {
+            let vault = Vault::open(path).expect("open");
+            let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+            let mut item = uv.get_item(id).expect("get").expect("found");
+            let hlc = glyx_core::Hlc {
+                wall_ms: 60_000,
+                seq: 0,
+                node: uv.device_node(),
+            };
+            item.fields.insert(
+                field.to_owned(),
+                glyx_core::Field {
+                    value: glyx_core::SecretString::new(val.to_owned()),
+                    field_hlc: hlc,
+                },
+            );
+            item.hlc = hlc;
+            item.rev += 1;
+            uv.put_item(&item).expect("put");
+        }
+    }
+}
+
+#[cfg(test)]
+mod m2_tests {
+    use super::test_helpers::*;
+    use super::*;
+
+    #[test]
+    fn pairwise_disjoint_edits_union() {
+        let (_d, a, b) = two_vaults();
+        let id = {
+            let vault = Vault::open(&a).expect("open");
+            let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+            let item = m1_item(&mut uv, "x", &[("password", "p0"), ("username", "u0")]);
+            let id = item.id;
+            uv.put_item(&item).expect("put");
+            id
+        };
+        seed_b_from_a(&a, &b);
+        {
+            let vault = Vault::open(&a).expect("open");
+            let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+            let mut item = uv.get_item(&id).expect("get").expect("found");
+            let hlc = uv.next_hlc().expect("tick");
+            item.fields.insert(
+                "password".to_owned(),
+                glyx_core::Field {
+                    value: glyx_core::SecretString::new("pA".to_owned()),
+                    field_hlc: hlc,
+                },
+            );
+            item.hlc = hlc;
+            item.rev += 1;
+            uv.put_item(&item).expect("put");
+        }
+        {
+            let vault = Vault::open(&b).expect("open");
+            let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+            let mut item = uv.get_item(&id).expect("get").expect("found");
+            let hlc = uv.next_hlc().expect("tick");
+            item.fields.insert(
+                "username".to_owned(),
+                glyx_core::Field {
+                    value: glyx_core::SecretString::new("uB".to_owned()),
+                    field_hlc: hlc,
+                },
+            );
+            item.hlc = hlc;
+            item.rev += 1;
+            uv.put_item(&item).expect("put");
+        }
+        let vault_a = Vault::open(&a).expect("open");
+        let mut uv_a = vault_a.unlock(b"pw", &[9u8; 32]).expect("unlock");
+        let vault_b = Vault::open(&b).expect("open");
+        let uv_b = vault_b.unlock(b"pw", &[9u8; 32]).expect("unlock");
+        let rep = uv_a.sync_from(&uv_b).expect("sync");
+        assert_eq!(rep.conflicts, 0);
+        let merged = uv_a.get_item(&id).expect("get").expect("found");
+        assert_eq!(merged.fields["password"].value.expose(), "pA");
+        assert_eq!(merged.fields["username"].value.expose(), "uB");
+    }
+
+    #[test]
+    fn same_field_race_records_and_resolves() {
+        let (_d, a, b) = two_vaults();
+        let id = {
+            let vault = Vault::open(&a).expect("open");
+            let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+            let item = m1_item(&mut uv, "x", &[("nickname", "base")]);
+            let id = item.id;
+            uv.put_item(&item).expect("put");
+            id
+        };
+        seed_b_from_a(&a, &b);
+        for (path, val) in [(&a, "alpha"), (&b, "beta")] {
+            let vault = Vault::open(path).expect("open");
+            let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+            let mut item = uv.get_item(&id).expect("get").expect("found");
+            let hlc = glyx_core::Hlc {
+                wall_ms: 50_000,
+                seq: 0,
+                node: uv.device_node(),
+            };
+            item.fields.insert(
+                "nickname".to_owned(),
+                glyx_core::Field {
+                    value: glyx_core::SecretString::new(val.to_owned()),
+                    field_hlc: hlc,
+                },
+            );
+            item.hlc = hlc;
+            item.rev += 1;
+            uv.put_item(&item).expect("put");
+        }
+        let vault_a = Vault::open(&a).expect("open");
+        let mut uv_a = vault_a.unlock(b"pw", &[9u8; 32]).expect("unlock");
+        let vault_b = Vault::open(&b).expect("open");
+        let uv_b = vault_b.unlock(b"pw", &[9u8; 32]).expect("unlock");
+        let rep = uv_a.sync_from(&uv_b).expect("sync");
+        assert_eq!(rep.conflicts, 1);
+        assert_eq!(uv_a.list_conflicts().expect("list").len(), 1);
+        let val = uv_a.get_item(&id).expect("get").expect("found").fields["nickname"]
+            .value
+            .expose()
+            .to_owned();
+        assert!(val == "alpha" || val == "beta");
+        assert!(uv_a
+            .resolve_conflict(&id, crate::conflicts::Resolution::Theirs)
+            .expect("resolve"));
+        assert!(uv_a.list_conflicts().expect("list").is_empty());
+    }
+
+    #[test]
+    fn conflict_copy_heals_on_unlock() {
+        let (_d, a, _) = two_vaults();
+        let vault = Vault::open(&a).expect("open");
+        let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+        let item = m1_item(&mut uv, "x", &[("password", "p")]);
+        uv.put_item(&item).expect("put");
+        drop(uv);
+        let hex = item.id.as_simple().to_string();
+        let src = a
+            .join(layout::ITEMS_DIR)
+            .join(format!("{hex}.envelope.json"));
+        let copy = a.join(layout::ITEMS_DIR).join(format!(
+            "{hex}.envelope.sync-conflict-20240101-101010-ABCDEF1.json"
+        ));
+        fs::copy(&src, &copy).expect("craft copy");
+        let vault = Vault::open(&a).expect("open");
+        let _uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+        assert!(!copy.exists());
+    }
+
+    #[test]
+    fn gc_purges_only_old_tombstones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("g.glyx");
+        let suite = glyx_core::CipherSuiteConfig {
+            kdf: glyx_core::KdfId::Argon2id,
+            cipher: glyx_core::Cipher::Xchacha20poly1305,
+            params: glyx_core::KdfParams::mobile(),
+        };
+        Vault::init(&path, suite, b"pw", &[9u8; 32]).expect("init");
+        let vault = Vault::open(&path).expect("open");
+        let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+        let item = m1_item(&mut uv, "gone", &[("password", "p")]);
+        let id = item.id;
+        uv.put_item(&item).expect("put");
+        assert!(uv.delete_item(&id).expect("delete"));
+        assert!(uv.gc_tombstones(u64::MAX).expect("gc").is_empty());
+        assert_eq!(uv.gc_tombstones(0).expect("gc"), vec![id]);
+        assert!(uv.get_item(&id).expect("get").is_none());
+    }
+}
+
+#[cfg(test)]
+mod m2_resolve_tests {
+    use super::test_helpers::*;
+    use super::*;
+
+    fn raced_id(a: &std::path::Path, b: &std::path::Path) -> Uuid {
+        let id = {
+            let vault = Vault::open(a).expect("open");
+            let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+            let item = m1_item(&mut uv, "x", &[("city", "base"), ("zip", "1")]);
+            let id = item.id;
+            uv.put_item(&item).expect("put");
+            id
+        };
+        seed_b_from_a(a, b);
+        race_pair(a, b, &id, "city", "alpha", "beta");
+        id
+    }
+
+    fn synced_a(a: &std::path::Path, b: &std::path::Path) -> UnlockedVault {
+        let vault_a = Vault::open(a).expect("open");
+        let mut uv_a = vault_a.unlock(b"pw", &[9u8; 32]).expect("unlock");
+        let vault_b = Vault::open(b).expect("open");
+        let uv_b = vault_b.unlock(b"pw", &[9u8; 32]).expect("unlock");
+        let rep = uv_a.sync_from(&uv_b).expect("sync");
+        assert_eq!(rep.conflicts, 1);
+        uv_a
+    }
+
+    #[test]
+    fn resolve_mine_keeps_local_side() {
+        let (_d, a, b) = two_vaults();
+        let id = raced_id(&a, &b);
+        let mut uv_a = synced_a(&a, &b);
+        assert!(uv_a
+            .resolve_conflict(&id, crate::conflicts::Resolution::Mine)
+            .expect("resolve"));
+        let after = uv_a.get_item(&id).expect("get").expect("found");
+        assert!(!after.deleted);
+        assert!(uv_a.list_conflicts().expect("list").is_empty());
+    }
+
+    #[test]
+    fn resolve_fields_overrides() {
+        let (_d, a, b) = two_vaults();
+        let id = raced_id(&a, &b);
+        let mut uv_a = synced_a(&a, &b);
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("city".to_owned(), "chosen".to_owned());
+        map.insert("name".to_owned(), "renamed".to_owned());
+        assert!(uv_a
+            .resolve_conflict(&id, crate::conflicts::Resolution::Fields(map))
+            .expect("resolve"));
+        let after = uv_a.get_item(&id).expect("get").expect("found");
+        assert_eq!(after.fields["city"].value.expose(), "chosen");
+        assert_eq!(after.name, "renamed");
+        assert_eq!(after.fields["zip"].value.expose(), "1");
+        assert!(!uv_a
+            .resolve_conflict(&id, crate::conflicts::Resolution::Mine)
+            .expect("again"));
+    }
+
+    #[test]
+    fn read_conflict_triple() {
+        let (_d, a, b) = two_vaults();
+        let id = raced_id(&a, &b);
+        let uv_a = synced_a(&a, &b);
+        let Some((winner, local, remote, targets)) = uv_a.read_conflict(&id).expect("read") else {
+            panic!("expected conflict");
+        };
+        assert_eq!(targets, vec!["field:city".to_owned()]);
+        assert_ne!(
+            local.fields["city"].value.expose(),
+            remote.fields["city"].value.expose()
+        );
+        assert!(winner.fields.contains_key("city"));
+        assert!(uv_a.read_conflict(&Uuid::now_v7()).expect("read").is_none());
+    }
+}
