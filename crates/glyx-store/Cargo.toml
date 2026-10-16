@@ -20,6 +20,7 @@ rusqlite.workspace = true
 fs2.workspace = true
 glyx-core = { path = "../glyx-core" }
 glyx-crypto = { path = "../glyx-crypto" }
+glyx-sync = { path = "../glyx-sync" }
 
 [dev-dependencies]
 tempfile = "3"
