@@ -2,7 +2,7 @@
 
 Local-first password manager for Linux, Windows, and Android. CLI, WebUI, and desktop app on one Rust core. No accounts, no telemetry, your vault stays yours.
 
-> Status: M1 item management works end to end. Sync merge arrives in M2. This README is a living user guide and grows with each milestone.
+> Status: M2 sync merge works. Daemon and WebUI arrive in M3. This README is a living user guide and grows with each milestone.
 
 ## What glyx will do
 
@@ -135,9 +135,23 @@ password: s3cret-value
 
 Placeholders default to opaque encrypted pointers so a locked file reveals nothing about which item it points to. If a file changed while the vault was locked, glyx shows a diff on next unlock instead of overwriting silently.
 
-## Sync (planned, M2, relay in Phase 2)
+## Sync
 
-Point any file sync you trust (Syncthing, Nextcloud, plain copy) at the `my.glyx/` folder. Each item carries a sync header so concurrent offline edits merge field by field; true conflicts are kept for you to resolve, never dropped. A self-hostable LAN relay is planned later with the same merge rules and end to end encryption.
+Point any file sync you trust (Syncthing, Nextcloud, plain copy) at the vault folder. When the same item changes on two devices, glyx merges field by field on the next unlock or `sync`:
+
+```sh
+glyx sync                        # heal file-sync conflict copies in place
+glyx sync /mnt/usb/other.glyx    # pairwise merge from another vault copy
+glyx conflicts                   # list same-field races the merge recorded
+glyx conflicts show site         # compare both versions
+glyx conflicts resolve site --theirs
+glyx conflicts resolve site --field city=Bergen
+glyx sync-status                 # envelopes, tombstones, conflicts, last merge
+glyx gc --dry-run                # preview tombstone purge
+glyx gc --older-than 30d         # purge tombstones older than 30 days
+```
+
+Rules: newer fields win, tombstones win over edits, true same-field races keep a deterministic winner and record both sides under `conflicts/` for you to resolve. Nothing is silently dropped. Note the one caveat: purging a tombstone older than the GC window means a device offline longer than that window can resurrect the deleted item on its next sync. A self-hostable LAN relay is planned later with the same merge rules and end to end encryption.
 
 ## Configuration
 
@@ -157,19 +171,19 @@ flake.nix        Nix shells, packages, apps
 crates/
   glyx-core      Item/HLC/DeviceId/SecretString types, VAULT.toml spec
   glyx-crypto    Argon2id KDF, XChaCha/AES-GCM, keyslots, BLAKE3
-  glyx-store     Vault init/open, envelopes, blobs, SQLite index
-  glyx-sync      Header ordering and conflict classifier (merge in M2)
+  glyx-store     Vault init/open, envelopes, blobs, index, merge/heal/GC
+  glyx-sync      Field-LWW merge, dominance check, header ordering, classifier
   glyx-agent     Export ledger traits (engine in M5)
   glyx-autofill  Provider traits (OS bridges in M4)
   glyx-daemon    Lock-state machine (networking in M3)
-  glyx-cli       `glyx vault init`, `glyx doctor`
+  glyx-cli       Full CLI: items, sessions, rekey, sync, conflicts, gc
 apps/            webui, desktop, android, extension (fill in M3+)
 local/           Agent and developer docs (gitignored, local only)
 ```
 
 ## Roadmap
 
-Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge, M3 daemon plus WebUI plus desktop, M4 autofill, M5 file agent plus SSH, M6 Android plus notes, M7 hardening and installers.
+Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop, M4 autofill, M5 file agent plus SSH, M6 Android plus notes, M7 hardening and installers.
 
 ## License
 
