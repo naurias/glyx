@@ -4,6 +4,7 @@ pub mod hash;
 pub mod kdf;
 pub mod keyslot;
 pub mod pass;
+pub mod pointer;
 pub mod rand;
 pub mod ssh;
 pub mod totp;
