@@ -1,0 +1,19 @@
+[package]
+name = "glyx-nm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "glyx-native-host"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+glyx-store = { path = "../glyx-store" }
