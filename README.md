@@ -2,7 +2,7 @@
 
 Local-first password manager for Linux, Windows, and Android. CLI, WebUI, and desktop app on one Rust core. No accounts, no telemetry, your vault stays yours.
 
-> Status: M3 daemon, WebUI, and desktop app work. Browser autofill arrives in M4. This README is a living user guide and grows with each milestone.
+> Status: M4 browser fill, Git helper, and clipboard fill work. SSH agent and file injection arrive in M5. This README is a living user guide and grows with each milestone.
 
 ## What glyx will do
 
@@ -105,7 +105,7 @@ session_ttl_min = 15
 
 Threat model, stated plainly: a session file holds the data key under `0600` in your runtime dir (up to 8h max), like `ssh-agent` holds keys in RAM. Anyone who can read your files can read an active session. The default stays one-shot (no session files unless you run `unlock`), and `lock` wipes them.
 
-## Vault creation and crypto (planned, M1)
+## Vault creation and crypto
 
 At creation you pick a preset; advanced users can tune KDF cost and cipher:
 
@@ -168,6 +168,31 @@ Open the printed address in a browser, paste the token from the runtime dir (`da
 nix profile install .#bundle   # CLI, daemon, and desktop in one profile
 ```
 
+## Browser fill, Git, clipboard
+
+Desktop secret storage stays with gnome-keyring; glyx covers browsers, Git, and the terminal:
+
+```sh
+# Browser extension (Chrome + Firefox, needs a running daemon)
+glyx --vault ~/vaults/main.glyx extension install --firefox
+glyx --vault ~/vaults/main.glyx extension install   # Chrome manifests
+# load apps/extension in the browser, then for Chrome:
+glyx extension allow <id-from-chrome://extensions>
+
+# Git HTTPS credentials (no prompts after one unlock)
+glyx git setup
+export GLYX_VAULT=~/vaults/main.glyx GLYX_KEYFILE=~/keys/main.key
+glyx unlock   # or rely on a session/PIN
+git clone https://github.com/you/repo
+
+# Terminal copy with auto-clear (nothing secret on stdout)
+glyx fill github
+glyx fill github --field username --timeout 30
+glyx fill github --dry-run
+```
+
+The desktop app also registers Ctrl+Shift+G to pop up the vault search. Fill never auto-submits web forms.
+
 ## Configuration
 
 | Item            | Location (planned)                          |
@@ -189,17 +214,18 @@ crates/
   glyx-store     Vault init/open, envelopes, blobs, index, merge/heal/GC
   glyx-sync      Field-LWW merge, dominance check, header ordering, classifier
   glyx-agent     Export ledger traits (engine in M5)
-  glyx-autofill  Provider traits (OS bridges in M4)
+  glyx-autofill  Clipboard backend + fill helpers (no Secret Service by design)
   glyx-daemon    Axum /v1 API + embedded WebUI, token auth, idle auto-lock
   glyx-tauri     Tauri desktop shell hosting the built WebUI
-  glyx-cli       Full CLI: items, sessions, rekey, sync, conflicts, gc
+  glyx-nm        NativeMessaging stdio bridge proxying to the daemon
+  glyx-cli       Full CLI: items, sessions, rekey, sync, conflicts, gc, fill, git, extension
 apps/            webui, desktop, android, extension (fill in M3+)
 local/           Agent and developer docs (gitignored, local only)
 ```
 
 ## Roadmap
 
-Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 autofill, M5 file agent plus SSH, M6 Android plus notes, M7 hardening and installers.
+Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 browser/Git/clipboard fill (done), M5 file agent plus SSH, M6 Android plus notes, M7 hardening and installers.
 
 ## License
 
