@@ -519,6 +519,25 @@ impl UnlockedVault {
             .and_then(|v| u64::try_from(v).ok()))
     }
 
+    pub fn render_locked(
+        &self,
+        item_id: &Uuid,
+        field: &str,
+        target: &str,
+        form: glyx_core::LockedForm,
+    ) -> Result<String, StoreError> {
+        match form {
+            glyx_core::LockedForm::Ref => Ok(glyx_core::ref_placeholder(item_id, field)),
+            glyx_core::LockedForm::EncryptedPointer => {
+                glyx_crypto::pointer::seal_pointer(&self.key, item_id, field, target)
+                    .map_err(StoreError::from)
+            }
+            glyx_core::LockedForm::MaskedShape => Ok(glyx_crypto::pointer::masked_tag(
+                &self.key, item_id, field, target,
+            )),
+        }
+    }
+
     pub fn stamp_merge(&self) -> Result<(), StoreError> {
         self.meta_set("last_merge_ms", glyx_core::ids::wall_ms_now().cast_signed())
     }
