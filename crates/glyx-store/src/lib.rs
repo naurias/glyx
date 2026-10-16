@@ -4,6 +4,7 @@ pub mod envelope;
 pub mod error;
 pub mod index;
 pub mod layout;
+pub mod present;
 pub mod session;
 pub mod vault;
 

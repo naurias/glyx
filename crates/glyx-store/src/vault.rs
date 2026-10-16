@@ -258,6 +258,49 @@ impl UnlockedVault {
         index::upsert(&self.conn, item)?;
         Ok(())
     }
+    pub fn resolve(&self, query: &str) -> Result<glyx_core::Item, StoreError> {
+        if let Ok(id) = query.parse::<Uuid>() {
+            return self
+                .get_item(&id)?
+                .ok_or_else(|| StoreError::NotFound(query.to_owned()));
+        }
+        let rows = self.list(true)?;
+        let live: Vec<_> = rows.iter().filter(|r| !r.deleted).collect();
+        let mut hits = Vec::new();
+        for row in &live {
+            if row.id.as_simple().to_string().starts_with(query) {
+                hits.push(row.id);
+            }
+        }
+        if hits.len() == 1 {
+            return self
+                .get_item(&hits[0])?
+                .ok_or_else(|| StoreError::NotFound(query.to_owned()));
+        }
+        if hits.len() > 1 {
+            return Err(StoreError::Ambiguous(query.to_owned(), hits.len()));
+        }
+        let mut named = Vec::new();
+        for row in &live {
+            if row.name == query {
+                named.push(row.id);
+            }
+        }
+        if named.len() == 1 {
+            return self
+                .get_item(&named[0])?
+                .ok_or_else(|| StoreError::NotFound(query.to_owned()));
+        }
+        if named.is_empty() {
+            let dead = rows.len() - live.len();
+            if dead > 0 {
+                return Err(StoreError::NotFound(format!("{query} ({dead} deleted)")));
+            }
+            return Err(StoreError::NotFound(query.to_owned()));
+        }
+        Err(StoreError::Ambiguous(query.to_owned(), named.len()))
+    }
+
     pub fn get_item(&self, id: &Uuid) -> Result<Option<glyx_core::Item>, StoreError> {
         let file = self
             .path
