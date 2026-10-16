@@ -6,3 +6,7 @@ local/
 target/
 result
 result-*
+node_modules/
+.svelte-kit/
+apps/webui/build/
+crates/glyx-tauri/gen/
