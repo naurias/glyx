@@ -26,6 +26,7 @@ zeroize.workspace = true
 glyx-core = { path = "../glyx-core" }
 glyx-store = { path = "../glyx-store" }
 glyx-crypto = { path = "../glyx-crypto" }
+glyx-agent = { path = "../glyx-agent" }
 
 [dev-dependencies]
 tower.workspace = true

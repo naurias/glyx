@@ -15,6 +15,8 @@ pub struct AppState {
     pub token: String,
     pub idle_lock_ms: u64,
     pub last_activity_ms: Mutex<u64>,
+    pub agent_stop: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+    pub tamper: Mutex<Vec<String>>,
 }
 
 fn now_ms() -> u64 {
@@ -94,6 +96,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/conflicts/:id/resolve", post(resolve_conflict))
         .route("/v1/gc", post(gc))
         .route("/v1/doctor", get(doctor))
+        .route(
+            "/v1/exports",
+            get(list_exports).post(add_export).delete(recall_export),
+        )
+        .route("/v1/exports/enforce", post(enforce_exports))
+        .route("/v1/injects", post(add_inject))
+        .route("/v1/agent/tamper", get(agent_tamper))
+        .route("/v1/agent/resolve", post(agent_resolve))
+        .route("/v1/ssh/env", get(ssh_env))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state)
 }
@@ -172,6 +183,7 @@ async fn unlock(
         Ok(v) => v,
         Err(e) => return store_error(&e).into_response(),
     };
+    let vault_id = vault.config().vault_id;
     let result = tokio::task::spawn_blocking(move || {
         if let Some(pin) = body.pin {
             return vault.open_session(Some(pin.as_bytes())).and_then(|opt| {
@@ -192,7 +204,27 @@ async fn unlock(
     })
     .await;
     match result {
-        Ok(Ok(uv)) => {
+        Ok(Ok(mut uv)) => {
+            let agent_report = glyx_agent::enforce_all(&mut uv, false)
+                .map(|r| r.skipped)
+                .unwrap_or_default();
+            let identities = glyx_agent::ssh_agent::load_identities(&uv).unwrap_or_default();
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if !identities.is_empty() {
+                let sock = glyx_agent::ssh_agent::socket_path(&vault_id);
+                let run_flag = flag.clone();
+                std::thread::spawn(move || {
+                    glyx_agent::ssh_agent::serve_until(&sock, &identities, &run_flag).ok();
+                });
+            }
+            *state
+                .agent_stop
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(flag);
+            *state
+                .tamper
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = agent_report;
             *state
                 .vault
                 .lock()
@@ -208,16 +240,42 @@ async fn unlock(
     }
 }
 
-async fn lock(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+fn stop_agent_socket(state: &AppState) {
+    if let Some(flag) = state
+        .agent_stop
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Ok(vault) = glyx_store::Vault::open(&state.vault_path) {
+        glyx_agent::ssh_agent::stop(&glyx_agent::ssh_agent::socket_path(
+            &vault.config().vault_id,
+        ));
+    }
+}
+
+fn do_lock(state: &AppState) {
     let taken = state
         .vault
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
+    if let Some(uv) = taken.as_ref() {
+        if glyx_agent::teardown_all(uv).is_err() {
+            eprintln!("agent teardown failed");
+        }
+    }
     drop(taken);
+    stop_agent_socket(state);
     if let Ok(vault) = glyx_store::Vault::open(&state.vault_path) {
         glyx_store::session::wipe_ticket(&vault.config().vault_id);
     }
+}
+
+async fn lock(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    do_lock(&state);
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
@@ -803,6 +861,311 @@ async fn doctor(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(report).into_response()
 }
 
+async fn list_exports(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let _ = state;
+    let conn = match glyx_agent::ledger::open_db() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let exports = glyx_agent::ledger::list_exports(&conn).unwrap_or_default();
+    let injects = glyx_agent::ledger::list_injects(&conn).unwrap_or_default();
+    Json(serde_json::json!({
+        "exports": exports.iter().map(|e| serde_json::json!({
+            "target": e.target, "kind": e.kind, "keep": e.keep_on_lock,
+        })).collect::<Vec<_>>(),
+        "injects": injects.iter().map(|i| serde_json::json!({
+            "target": i.target, "form": i.form,
+        })).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct AddExportBody {
+    target: PathBuf,
+    kind: String,
+    item: Option<String>,
+    field: Option<String>,
+    blob: Option<String>,
+    ssh: Option<String>,
+    keep: Option<bool>,
+    perm: Option<u32>,
+}
+
+async fn add_export(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AddExportBody>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let resolved = match (&body.item, &body.ssh) {
+        (Some(q), _) | (_, Some(q)) => match uv.resolve(q) {
+            Ok(item) => Some(item.id),
+            Err(e) => return store_error(&e).into_response(),
+        },
+        (None, None) => None,
+    };
+    if body.kind != "field" && body.kind != "blob" && body.kind != "ssh" {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "kind must be field, blob, or ssh"})),
+        )
+            .into_response();
+    }
+    let conn = match glyx_agent::ledger::open_db() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    match glyx_agent::ledger::register_export(
+        &conn,
+        &glyx_agent::ledger::ExportSpec {
+            target: &body.target,
+            kind: &body.kind,
+            item_id: resolved,
+            field: body.field.as_deref(),
+            blob_addr: body.blob.as_deref(),
+            keep_on_lock: body.keep.unwrap_or(false),
+            perm: body.perm.unwrap_or(0o600),
+        },
+    ) {
+        Ok(id) => Json(serde_json::json!({"ok": true, "id": id})).into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct TargetQuery {
+    target: PathBuf,
+}
+
+async fn recall_export(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<TargetQuery>,
+) -> impl IntoResponse {
+    let _ = state;
+    match glyx_agent::engine::recall_target(&q.target) {
+        Ok(removed) => Json(serde_json::json!({"ok": true, "removed": removed})).into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct EnforceBody {
+    force: Option<bool>,
+}
+
+async fn enforce_exports(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<EnforceBody>,
+) -> impl IntoResponse {
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return locked_error().into_response();
+    };
+    match glyx_agent::enforce_all(uv, body.force.unwrap_or(false)) {
+        Ok(rep) => {
+            state
+                .tamper
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone_from(&rep.skipped);
+            Json(serde_json::json!({
+                "files": rep.files, "injected": rep.injected, "skipped": rep.skipped,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AddInjectBody {
+    target: PathBuf,
+    form: Option<String>,
+}
+
+async fn add_inject(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AddInjectBody>,
+) -> impl IntoResponse {
+    let _ = state;
+    let conn = match glyx_agent::ledger::open_db() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    match glyx_agent::ledger::register_inject(
+        &conn,
+        &body.target,
+        &body.form.unwrap_or_else(|| "encrypted-pointer".to_owned()),
+    ) {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn agent_tamper(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.as_ref().is_none() {
+        let conn = match glyx_agent::ledger::open_db() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+        return match glyx_agent::engine::check_all(&conn, true) {
+            Ok(found) => Json(
+                found
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "target": t.target,
+                            "kind": format!("{:?}", t.kind),
+                            "detail": t.detail,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .into_response(),
+            Err(e) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        };
+    }
+    drop(guard);
+    let pending = state
+        .tamper
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    Json(serde_json::Value::Array(
+        pending.into_iter().map(serde_json::Value::String).collect(),
+    ))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct AgentResolveBody {
+    target: Option<PathBuf>,
+    action: String,
+}
+
+async fn agent_resolve(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AgentResolveBody>,
+) -> impl IntoResponse {
+    if body.action == "force" {
+        let mut guard = state
+            .vault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(uv) = guard.as_mut() else {
+            return locked_error().into_response();
+        };
+        return match glyx_agent::enforce_all(uv, true) {
+            Ok(rep) => {
+                state
+                    .tamper
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone_from(&rep.skipped);
+                Json(serde_json::json!({"ok": true, "skipped": rep.skipped})).into_response()
+            }
+            Err(e) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        };
+    }
+    if body.action == "keep" {
+        let Some(target) = body.target else {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "keep needs a target"})),
+            )
+                .into_response();
+        };
+        return match glyx_agent::engine::forget_target(&target) {
+            Ok(forgotten) => {
+                Json(serde_json::json!({"ok": true, "forgotten": forgotten})).into_response()
+            }
+            Err(e) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        };
+    }
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({"error": "action must be force or keep"})),
+    )
+        .into_response()
+}
+
+async fn ssh_env(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let _ = state;
+    match glyx_agent::ssh_agent::live_socket() {
+        Some(sock) => Json(serde_json::json!({"sock": sock})).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no agent socket"})),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn serve(
     config: DaemonConfig,
     token: String,
@@ -813,6 +1176,8 @@ pub async fn serve(
         token,
         idle_lock_ms: config.idle_lock_ms,
         last_activity_ms: Mutex::new(now_ms()),
+        agent_stop: Mutex::new(None),
+        tamper: Mutex::new(Vec::new()),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -828,10 +1193,7 @@ pub async fn serve(
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
             if idle.idle_lock_ms > 0 && idle_for >= idle.idle_lock_ms {
-                idle.vault
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
+                do_lock(&idle);
             }
         }
     });
@@ -869,6 +1231,8 @@ mod tests {
             token: "test-token".to_owned(),
             idle_lock_ms: 0,
             last_activity_ms: Mutex::new(now_ms()),
+            agent_stop: Mutex::new(None),
+            tamper: Mutex::new(Vec::new()),
         });
         (dir, state)
     }
