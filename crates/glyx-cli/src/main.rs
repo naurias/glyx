@@ -1,5 +1,7 @@
 mod auth;
 mod daemon;
+mod extension;
+mod gitcred;
 mod items;
 
 use std::collections::BTreeMap;
@@ -100,6 +102,17 @@ enum Cmd {
         #[arg(help = "Id, id prefix, or exact name")]
         query: String,
     },
+    #[command(about = "Copy a field to the clipboard")]
+    Fill {
+        #[arg(help = "Id, id prefix, or exact name")]
+        query: String,
+        #[arg(long, default_value = "password", help = "Field to copy")]
+        field: String,
+        #[arg(long, default_value = "15", help = "Clear after N seconds, 0 keeps")]
+        timeout: u64,
+        #[arg(long, help = "Resolve only, touch nothing")]
+        dry_run: bool,
+    },
     #[command(about = "SSH key operations")]
     Ssh {
         #[command(subcommand)]
@@ -139,6 +152,16 @@ enum Cmd {
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
+    },
+    #[command(about = "Browser extension native host")]
+    Extension {
+        #[command(subcommand)]
+        cmd: ExtensionCmd,
+    },
+    #[command(about = "Git credential helper setup")]
+    Git {
+        #[command(subcommand)]
+        cmd: GitCmd,
     },
 }
 
@@ -192,7 +215,7 @@ enum ConflictsCmd {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Copy, Subcommand)]
 enum DaemonCmd {
     #[command(about = "Start the localhost daemon")]
     Start {
@@ -202,6 +225,32 @@ enum DaemonCmd {
     #[command(about = "Stop the localhost daemon")]
     Stop,
     #[command(about = "Daemon status")]
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum ExtensionCmd {
+    #[command(about = "Install native host manifests")]
+    Install {
+        #[arg(long, help = "Install Chrome manifest")]
+        chrome: bool,
+        #[arg(long, help = "Install Firefox manifest")]
+        firefox: bool,
+    },
+    #[command(about = "Allow a Chrome extension id")]
+    Allow {
+        #[arg(help = "Extension id from chrome://extensions")]
+        id: String,
+    },
+    #[command(about = "Extension wiring status")]
+    Status,
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+enum GitCmd {
+    #[command(about = "Configure git to use glyx")]
+    Setup,
+    #[command(about = "Git helper diagnostics")]
     Status,
 }
 
@@ -284,6 +333,11 @@ fn cipher_of(cipher: CipherOpt) -> glyx_core::Cipher {
 }
 
 fn main() -> Result<()> {
+    if let Some(name) = std::env::args().next() {
+        if name.ends_with("git-credential-glyx") {
+            return git_credential_main();
+        }
+    }
     let cli = Cli::parse();
     let Cli {
         json,
@@ -301,6 +355,26 @@ fn main() -> Result<()> {
         no_session,
     };
     dispatch(&ctx, cmd)
+}
+
+fn git_credential_main() -> Result<()> {
+    let action = std::env::args().nth(1).unwrap_or_default();
+    let input = gitcred::read_credential_input()?;
+    let vault_path = auth::resolve_vault_path(None)?;
+    let mut uv = auth::resolve_unlocked(&auth::AuthFlags {
+        vault: vault_path,
+        keyfile: std::env::var("GLYX_KEYFILE").ok().map(PathBuf::from),
+        password_env: std::env::var("GLYX_PASSWORD")
+            .ok()
+            .map(|_| "GLYX_PASSWORD".to_owned()),
+        no_session: false,
+    })?;
+    match action.as_str() {
+        "get" => gitcred::cmd_get(&mut uv, &input),
+        "store" => gitcred::cmd_store(&mut uv, &input),
+        "erase" => gitcred::cmd_erase(&mut uv, &input),
+        _ => Ok(()),
+    }
 }
 
 fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
@@ -350,6 +424,12 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
         } => cmd_edit(ctx, &query, rename, &field, &delete_field, interactive),
         Cmd::Rm { query } => cmd_rm(ctx, &query),
         Cmd::Totp { query } => cmd_totp(ctx, &query),
+        Cmd::Fill {
+            query,
+            field,
+            timeout,
+            dry_run,
+        } => cmd_fill(ctx, &query, &field, timeout, dry_run),
         Cmd::Ssh { cmd } => match cmd {
             SshCmd::Gen {
                 name,
@@ -394,13 +474,39 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             ctx.password_env.as_deref(),
             ctx.json,
         ),
-        Cmd::Daemon { cmd } => match cmd {
-            DaemonCmd::Start { idle_lock_min } => {
-                daemon::cmd_start(&ctx.vault_path()?, idle_lock_min, ctx.json)
-            }
-            DaemonCmd::Stop => daemon::cmd_stop(&ctx.vault_path()?, ctx.json),
-            DaemonCmd::Status => daemon::cmd_status(&ctx.vault_path()?, ctx.json),
-        },
+        Cmd::Daemon { cmd } => dispatch_daemon(ctx, cmd),
+        Cmd::Extension { cmd } => dispatch_extension(ctx, cmd),
+        Cmd::Git { cmd } => dispatch_git(ctx, cmd),
+    }
+}
+
+fn dispatch_daemon(ctx: &Ctx, cmd: DaemonCmd) -> Result<()> {
+    match cmd {
+        DaemonCmd::Start { idle_lock_min } => {
+            daemon::cmd_start(&ctx.vault_path()?, idle_lock_min, ctx.json)
+        }
+        DaemonCmd::Stop => daemon::cmd_stop(&ctx.vault_path()?, ctx.json),
+        DaemonCmd::Status => daemon::cmd_status(&ctx.vault_path()?, ctx.json),
+    }
+}
+
+fn dispatch_extension(ctx: &Ctx, cmd: ExtensionCmd) -> Result<()> {
+    match cmd {
+        ExtensionCmd::Install { chrome, firefox } => {
+            extension::cmd_install(&ctx.vault_path()?, chrome, firefox, ctx.json)
+        }
+        ExtensionCmd::Allow { id } => extension::cmd_allow(&id, ctx.json),
+        ExtensionCmd::Status => {
+            extension::cmd_status(&ctx.vault_path()?, ctx.json);
+            Ok(())
+        }
+    }
+}
+
+fn dispatch_git(ctx: &Ctx, cmd: GitCmd) -> Result<()> {
+    match cmd {
+        GitCmd::Setup => cmd_git_setup(ctx.json),
+        GitCmd::Status => cmd_git_status(ctx.json),
     }
 }
 
@@ -713,6 +819,59 @@ fn cmd_rm(ctx: &Ctx, query: &str) -> Result<()> {
         println!("{}", serde_json::json!({"ok": true, "id": id}));
     } else {
         println!("deleted {id} (tombstone kept for sync)");
+    }
+    Ok(())
+}
+
+fn cmd_fill(ctx: &Ctx, query: &str, field: &str, timeout: u64, dry_run: bool) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    let item = items::resolve_query(&uv, query)?;
+    let value = item
+        .fields
+        .get(field)
+        .context("no such field")?
+        .value
+        .expose()
+        .to_owned();
+    if dry_run {
+        if ctx.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": true,
+                    "id": item.id,
+                    "field": field,
+                    "backend": glyx_autofill::clipboard::backend_name(),
+                })
+            );
+        } else {
+            println!("would copy {} from {}", field, item.id);
+        }
+        return Ok(());
+    }
+    glyx_autofill::clipboard::copy(&value).map_err(|e| anyhow::anyhow!(e))?;
+    if timeout == 0 {
+        if ctx.json {
+            println!("{}", serde_json::json!({"ok": true, "cleared": false}));
+        } else {
+            println!("copied {field} (stays until replaced)");
+        }
+        return Ok(());
+    }
+    if ctx.json {
+        println!("{}", serde_json::json!({"ok": true, "timeout_s": timeout}));
+    } else {
+        println!("copied {field}, clearing in {timeout}s");
+    }
+    std::thread::sleep(std::time::Duration::from_secs(timeout));
+    let cleared =
+        glyx_autofill::clipboard::clear_if_ours(&value).map_err(|e| anyhow::anyhow!(e))?;
+    if !ctx.json {
+        if cleared {
+            println!("cleared");
+        } else {
+            println!("clipboard changed, left alone");
+        }
     }
     Ok(())
 }
@@ -1057,6 +1216,46 @@ fn output_ids(as_json: bool, ids: &[Uuid], verb: &str) {
     }
 }
 
+fn cmd_git_setup(as_json: bool) -> Result<()> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let dir = PathBuf::from(home).join(".local").join("bin");
+    std::fs::create_dir_all(&dir)?;
+    let link = dir.join("git-credential-glyx");
+    let exe = std::env::current_exe()?;
+    #[cfg(unix)]
+    {
+        if std::fs::read_link(&link).is_err() {
+            std::os::unix::fs::symlink(&exe, &link)?;
+        }
+    }
+    let status = std::process::Command::new("git")
+        .args(["config", "--global", "credential.helper", "glyx"])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("git config failed");
+    }
+    if as_json {
+        println!("{}", serde_json::json!({"ok": true, "link": link}));
+    } else {
+        println!("git credential helper installed: {}", link.display());
+        println!("set GLYX_VAULT (and GLYX_KEYFILE) or unlock once for silent fills");
+    }
+    Ok(())
+}
+
+fn cmd_git_status(as_json: bool) -> Result<()> {
+    let out = std::process::Command::new("git")
+        .args(["config", "--get", "credential.helper"])
+        .output()?;
+    let helper = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if as_json {
+        println!("{}", serde_json::json!({"helper": helper}));
+    } else {
+        println!("credential.helper: {helper}");
+    }
+    Ok(())
+}
+
 fn type_label(item_type: glyx_core::ItemType) -> &'static str {
     match item_type {
         glyx_core::ItemType::Login => "login",
@@ -1120,11 +1319,24 @@ fn doctor(
         report["decrypted_items"] = serde_json::json!(items_ok);
     }
     report["ok"] = serde_json::json!(true);
+    report["clipboard"] = serde_json::json!({
+        "backend": glyx_autofill::clipboard::backend_name(),
+        "available": glyx_autofill::clipboard::available(),
+    });
     if as_json {
         println!("{report}");
     } else {
         println!("vault ok: {}", path.display());
         println!("format: v{}", vault.config().format_version);
+        println!(
+            "clipboard: {} ({})",
+            glyx_autofill::clipboard::backend_name(),
+            if glyx_autofill::clipboard::available() {
+                "available"
+            } else {
+                "unavailable"
+            }
+        );
         println!("keyslots: {}", report["keyslots"]);
         println!("envelopes: {} (live {})", headers.len(), report["live"]);
         if let Some(n) = report.get("rebuilt_index") {
