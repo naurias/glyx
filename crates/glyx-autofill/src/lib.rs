@@ -1,5 +1,7 @@
 use uuid::Uuid;
 
+pub mod clipboard;
+
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub id: Uuid,
