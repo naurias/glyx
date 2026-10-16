@@ -18,8 +18,10 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 rpassword.workspace = true
+arboard.workspace = true
 uuid.workspace = true
 inquire = { workspace = true, features = ["crossterm"] }
 glyx-core = { path = "../glyx-core" }
 glyx-crypto = { path = "../glyx-crypto" }
 glyx-store = { path = "../glyx-store" }
+glyx-autofill = { path = "../glyx-autofill" }
