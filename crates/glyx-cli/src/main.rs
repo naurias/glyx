@@ -1,4 +1,5 @@
 mod auth;
+mod daemon;
 mod items;
 
 use std::collections::BTreeMap;
@@ -134,6 +135,11 @@ enum Cmd {
         #[arg(long, help = "Also unlock and decrypt every item and blob")]
         with_unlock: bool,
     },
+    #[command(about = "Manage the localhost daemon")]
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCmd,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -184,6 +190,19 @@ enum ConflictsCmd {
         #[arg(long, help = "Set field as key=value (repeatable)")]
         field: Vec<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCmd {
+    #[command(about = "Start the localhost daemon")]
+    Start {
+        #[arg(long, help = "Idle auto-lock minutes")]
+        idle_lock_min: Option<u64>,
+    },
+    #[command(about = "Stop the localhost daemon")]
+    Stop,
+    #[command(about = "Daemon status")]
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -375,6 +394,13 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             ctx.password_env.as_deref(),
             ctx.json,
         ),
+        Cmd::Daemon { cmd } => match cmd {
+            DaemonCmd::Start { idle_lock_min } => {
+                daemon::cmd_start(&ctx.vault_path()?, idle_lock_min, ctx.json)
+            }
+            DaemonCmd::Stop => daemon::cmd_stop(&ctx.vault_path()?, ctx.json),
+            DaemonCmd::Status => daemon::cmd_status(&ctx.vault_path()?, ctx.json),
+        },
     }
 }
 

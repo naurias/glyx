@@ -1,87 +1,17 @@
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Context, Result};
-use uuid::Uuid;
 
 pub fn resolve_query(uv: &glyx_store::UnlockedVault, query: &str) -> Result<glyx_core::Item> {
-    if let Ok(id) = query.parse::<Uuid>() {
-        if let Some(item) = uv.get_item(&id)? {
-            return Ok(item);
-        }
-        bail!("no item with id {id}");
-    }
-    let rows = uv.list(true)?;
-    let mut live_rows = Vec::new();
-    let mut dead = 0;
-    for row in &rows {
-        if row.deleted {
-            dead += 1;
-        } else {
-            live_rows.push(row);
-        }
-    }
-    let mut hits = Vec::new();
-    for row in &live_rows {
-        if row.id.as_simple().to_string().starts_with(query) {
-            hits.push(row.id);
-        }
-    }
-    if hits.len() == 1 {
-        return uv.get_item(&hits[0])?.context("item vanished");
-    }
-    if hits.len() > 1 {
-        bail!("ambiguous id prefix, matches {} items", hits.len());
-    }
-    let mut named = Vec::new();
-    for row in &live_rows {
-        if row.name == query {
-            named.push(row.id);
-        }
-    }
-    if named.len() == 1 {
-        return uv.get_item(&named[0])?.context("item vanished");
-    }
-    if named.is_empty() {
-        if dead > 0 {
-            bail!("no live item matching {query:?} ({dead} deleted)");
-        }
-        bail!("no item matching {query:?}");
-    }
-    bail!("ambiguous name, matches {} items; use an id", named.len());
+    uv.resolve(query).map_err(|e| anyhow::anyhow!(e))
 }
 
 pub fn display_value(item_type: glyx_core::ItemType, key: &str, reveal: bool) -> bool {
-    if reveal {
-        return true;
-    }
-    !glyx_core::template::spec(item_type)
-        .iter()
-        .any(|s| s.name == key && s.secret)
+    glyx_store::present::display_value(item_type, key, reveal)
 }
 
 pub fn item_json(item: &glyx_core::Item, reveal: bool) -> serde_json::Value {
-    let mut fields = serde_json::Map::new();
-    for (k, f) in &item.fields {
-        let show = display_value(item.item_type, k, reveal);
-        fields.insert(
-            k.clone(),
-            serde_json::Value::String(if show {
-                f.value.expose().to_owned()
-            } else {
-                "••••".to_owned()
-            }),
-        );
-    }
-    serde_json::json!({
-        "id": item.id,
-        "type": item.item_type,
-        "name": item.name,
-        "folder": item.folder,
-        "tags": item.tags,
-        "fields": fields,
-        "rev": item.rev,
-        "deleted": item.deleted,
-    })
+    glyx_store::present::item_json(item, reveal)
 }
 
 pub fn split_field(pair: &str) -> Result<(String, String)> {
@@ -165,7 +95,7 @@ pub fn wizard_fill(
             if make {
                 out.insert(
                     field.name.to_owned(),
-                    glyx_crypto::pass::generate_password(24)?,
+                    glyx_crypto::pass::generate_password(24).map_err(|e| anyhow::anyhow!(e))?,
                 );
                 continue;
             }
@@ -200,32 +130,8 @@ pub fn build_new(
     tags: Vec<String>,
     values: BTreeMap<String, String>,
 ) -> Result<glyx_core::Item> {
-    let hlc = uv.next_hlc()?;
-    let node = uv.device_node();
-    let mut fields = BTreeMap::new();
-    for (k, v) in values {
-        fields.insert(
-            k,
-            glyx_core::Field {
-                value: glyx_core::SecretString::new(v),
-                field_hlc: hlc,
-            },
-        );
-    }
-    let item = glyx_core::Item {
-        id: uuid::Uuid::now_v7(),
-        item_type,
-        name,
-        folder,
-        tags,
-        fields,
-        hlc,
-        rev: 1,
-        deleted: false,
-        updated_by: node,
-    };
-    item.validate().map_err(|e| anyhow::anyhow!(e))?;
-    Ok(item)
+    glyx_store::present::build_new(uv, item_type, name, folder, tags, values)
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 pub fn apply_fields(
@@ -233,47 +139,9 @@ pub fn apply_fields(
     item: &mut glyx_core::Item,
     values: BTreeMap<String, String>,
 ) -> Result<()> {
-    let hlc = uv.next_hlc()?;
-    for (k, v) in values {
-        item.fields.insert(
-            k,
-            glyx_core::Field {
-                value: glyx_core::SecretString::new(v),
-                field_hlc: hlc,
-            },
-        );
-    }
-    item.hlc = hlc;
-    item.rev = item.rev.saturating_add(1);
-    item.updated_by = uv.device_node();
-    Ok(())
+    glyx_store::present::apply_fields(uv, item, values).map_err(|e| anyhow::anyhow!(e))
 }
 
 pub fn totp_params(item: &glyx_core::Item) -> Result<glyx_crypto::TotpParams> {
-    let to_anyhow = |e: glyx_crypto::CryptoError| anyhow::anyhow!(e);
-    let seed_field = item
-        .fields
-        .get("seed")
-        .context("totp item has no seed field")?;
-    let raw = seed_field.value.expose().trim();
-    if let Some(uri) = raw.strip_prefix("otpauth://") {
-        let full = format!("otpauth://{uri}");
-        return glyx_crypto::totp::params_from_uri(&full).map_err(to_anyhow);
-    }
-    if raw.contains('?') || raw.contains("secret=") {
-        return glyx_crypto::totp::params_from_uri(raw).map_err(to_anyhow);
-    }
-    let step = item
-        .fields
-        .get("period")
-        .map_or(30, |f| f.value.expose().trim().parse().unwrap_or(30));
-    let digits = item
-        .fields
-        .get("digits")
-        .map_or(6, |f| f.value.expose().trim().parse().unwrap_or(6));
-    Ok(glyx_crypto::TotpParams {
-        seed: glyx_crypto::totp::seed_from_b32(raw).map_err(to_anyhow)?,
-        step,
-        digits,
-    })
+    glyx_store::present::totp_params(item).map_err(|e| anyhow::anyhow!(e))
 }
