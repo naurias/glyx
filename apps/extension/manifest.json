@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "glyx",
+  "version": "0.1.0",
+  "description": "Fill logins, TOTP codes, and identities from your local glyx vault.",
+  "permissions": ["activeTab", "nativeMessaging", "storage"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "glyx"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "glyx@local",
+      "strict_min_version": "109.0"
+    }
+  }
+}

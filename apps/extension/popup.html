@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { width: 320px; font-family: system-ui, sans-serif; background: #14161a; color: #e8eaf0; margin: 0; }
+      header { padding: 10px 12px; border-bottom: 1px solid #2c313a; display: flex; gap: 8px; }
+      input { flex: 1; background: #1c1f25; color: inherit; border: 1px solid #2c313a; border-radius: 6px; padding: 6px; }
+      button { background: #1c1f25; color: inherit; border: 1px solid #2c313a; border-radius: 6px; padding: 6px 8px; cursor: pointer; }
+      .item { padding: 8px 12px; border-bottom: 1px solid #2c313a; }
+      .item .row { display: flex; gap: 6px; margin-top: 6px; }
+      .dim { color: #9aa1b2; font-size: 12px; }
+      .err { padding: 8px 12px; color: #ff7a7a; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <input id="q" placeholder="Search vault" />
+      <button id="lock">Lock</button>
+    </header>
+    <div id="err"></div>
+    <div id="list"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>
