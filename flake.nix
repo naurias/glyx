@@ -117,6 +117,8 @@
             "glyx"
             "--bin"
             "glyx-daemon"
+            "--bin"
+            "glyx-native-host"
           ];
           cargoTestFlags = [
             "-p"
@@ -126,6 +128,9 @@
           ];
           preBuild = ''
             (cd apps/webui && pnpm build)
+          '';
+          postInstall = ''
+            ln -s glyx $out/bin/git-credential-glyx
           '';
           meta = with pkgs.lib; {
             description = "glyx local-first password manager CLI plus daemon";
@@ -197,6 +202,8 @@
               mkdir -p bundle/glyx-${version}
               cp ${cli}/bin/glyx bundle/glyx-${version}/
               cp ${cli}/bin/glyx-daemon bundle/glyx-${version}/
+              cp ${cli}/bin/glyx-native-host bundle/glyx-${version}/
+              cp ${cli}/bin/git-credential-glyx bundle/glyx-${version}/ 2>/dev/null || (cd bundle/glyx-${version} && ln -s glyx git-credential-glyx)
               cp ${desktop}/bin/.glyx-tauri-wrapped bundle/glyx-${version}/glyx-tauri 2>/dev/null || cp ${desktop}/bin/glyx-tauri bundle/glyx-${version}/glyx-tauri
               cat > bundle/glyx-${version}/INSTALL.txt <<EOF
               glyx ${version} (${system})
@@ -206,7 +213,7 @@
                 ./glyx-tauri            desktop app (needs a display plus system webkit)
               Verify with: (cd glyx-${version} && sha256sum -c SHA256SUMS)
               EOF
-              (cd bundle/glyx-${version} && sha256sum glyx glyx-daemon glyx-tauri > SHA256SUMS)
+              (cd bundle/glyx-${version} && sha256sum glyx glyx-daemon glyx-native-host glyx-tauri > SHA256SUMS)
               (cd bundle && tar -czf $out glyx-${version})
             '';
 
