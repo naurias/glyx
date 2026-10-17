@@ -63,6 +63,8 @@ enum Cmd {
         query: String,
         #[arg(long, help = "Reveal secret fields")]
         reveal: bool,
+        #[arg(long, help = "Render note refs to values")]
+        render: bool,
     },
     #[command(about = "Add an item")]
     Add {
@@ -78,6 +80,8 @@ enum Cmd {
         field: Vec<String>,
         #[arg(long, help = "Generate into field, optionally name:length")]
         generate: Vec<String>,
+        #[arg(long, help = "Read the note body from a file")]
+        body_file: Option<PathBuf>,
         #[arg(long, help = "Prompt for missing fields")]
         interactive: bool,
     },
@@ -91,6 +95,8 @@ enum Cmd {
         field: Vec<String>,
         #[arg(long, help = "Delete field (repeatable)")]
         delete_field: Vec<String>,
+        #[arg(long, help = "Read the note body from a file")]
+        body_file: Option<PathBuf>,
         #[arg(long, help = "Prompt for fields")]
         interactive: bool,
     },
@@ -347,12 +353,21 @@ enum ExportCmd {
 
 #[derive(Debug, Subcommand)]
 enum InjectCmd {
-    #[command(about = "Track a file for secret injection")]
+    #[command(about = "Track a file or a folder for secret injection")]
     Add {
-        #[arg(help = "Target file")]
+        #[arg(help = "File, or folder of matching files")]
         file: PathBuf,
         #[arg(long, default_value = "encrypted-pointer", help = "Locked form")]
         form: String,
+        #[arg(long, help = "Glob for folders, for example '*.md'")]
+        glob: Option<String>,
+    },
+    #[command(about = "Rescan tracked folders for matching files")]
+    Scan,
+    #[command(about = "Stop tracking a file or folder")]
+    Rm {
+        #[arg(help = "File or folder")]
+        target: PathBuf,
     },
     #[command(about = "List tracked injections")]
     Ls,
@@ -471,9 +486,6 @@ fn git_credential_main() -> Result<()> {
 
 fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
     match cmd {
-        Cmd::Vault { cmd } => dispatch_vault(ctx, cmd),
-        Cmd::Unlock { ttl, with_pin } => cmd_unlock(ctx, ttl, with_pin),
-        Cmd::Lock => cmd_lock(ctx),
         Cmd::Ls {
             folder,
             tag,
@@ -486,7 +498,11 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             item_type.as_deref(),
             all,
         ),
-        Cmd::Show { query, reveal } => cmd_show(ctx, &query, reveal),
+        Cmd::Show {
+            query,
+            reveal,
+            render,
+        } => cmd_show(ctx, &query, reveal, render),
         Cmd::Add {
             item_type,
             name,
@@ -494,6 +510,7 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             tag,
             field,
             generate,
+            body_file,
             interactive,
         } => cmd_add(
             ctx,
@@ -504,6 +521,7 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
                 tag,
                 field,
                 generate,
+                body_file,
                 interactive,
             },
         ),
@@ -512,8 +530,17 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             rename,
             field,
             delete_field,
+            body_file,
             interactive,
-        } => cmd_edit(ctx, &query, rename, &field, &delete_field, interactive),
+        } => cmd_edit(
+            ctx,
+            &query,
+            rename,
+            &field,
+            &delete_field,
+            body_file.as_ref(),
+            interactive,
+        ),
         Cmd::Rm { query } => cmd_rm(ctx, &query),
         Cmd::Totp { query } => cmd_totp(ctx, &query),
         Cmd::Fill {
@@ -522,6 +549,15 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             timeout,
             dry_run,
         } => cmd_fill(ctx, &query, &field, timeout, dry_run),
+        other => dispatch_grouped(ctx, other),
+    }
+}
+
+fn dispatch_grouped(ctx: &Ctx, cmd: Cmd) -> Result<()> {
+    match cmd {
+        Cmd::Vault { cmd } => dispatch_vault(ctx, cmd),
+        Cmd::Unlock { ttl, with_pin } => cmd_unlock(ctx, ttl, with_pin),
+        Cmd::Lock => cmd_lock(ctx),
         Cmd::Ssh { cmd } => dispatch_ssh(ctx, cmd),
         Cmd::Export { cmd } => dispatch_export(ctx, cmd),
         Cmd::Inject { cmd } => dispatch_inject(ctx, cmd),
@@ -564,6 +600,13 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
         Cmd::Daemon { cmd } => dispatch_daemon(ctx, cmd),
         Cmd::Extension { cmd } => dispatch_extension(ctx, cmd),
         Cmd::Git { cmd } => dispatch_git(ctx, cmd),
+        Cmd::Ls { .. }
+        | Cmd::Show { .. }
+        | Cmd::Add { .. }
+        | Cmd::Edit { .. }
+        | Cmd::Rm { .. }
+        | Cmd::Totp { .. }
+        | Cmd::Fill { .. } => unreachable!("item commands handled in dispatch"),
     }
 }
 
@@ -641,7 +684,11 @@ fn dispatch_export(ctx: &Ctx, cmd: ExportCmd) -> Result<()> {
 
 fn dispatch_inject(ctx: &Ctx, cmd: InjectCmd) -> Result<()> {
     match cmd {
-        InjectCmd::Add { file, form } => exports::cmd_inject_add(&file, &form, ctx.json),
+        InjectCmd::Add { file, form, glob } => {
+            exports::cmd_inject_add(&file, &form, glob.as_deref(), ctx.json)
+        }
+        InjectCmd::Scan => exports::cmd_inject_scan(ctx.json),
+        InjectCmd::Rm { target } => exports::cmd_inject_rm(&target, ctx.json),
         InjectCmd::Ls => exports::cmd_ls(ctx.json),
     }
 }
@@ -856,7 +903,8 @@ fn cmd_unlock(ctx: &Ctx, ttl: Option<u64>, with_pin: bool) -> Result<()> {
 }
 
 fn cmd_lock(ctx: &Ctx) -> Result<()> {
-    if let Some(path) = ctx.vault.as_ref() {
+    let vault_path = auth::resolve_vault_path(ctx.vault.as_ref()).ok();
+    if let Some(path) = vault_path.as_ref() {
         if let Ok(vault) = glyx_store::Vault::open(path) {
             let session_path = glyx_store::session::session_path(&vault.config().vault_id);
             if session_path.exists() {
@@ -885,7 +933,7 @@ fn cmd_lock(ctx: &Ctx) -> Result<()> {
             }
         }
     }
-    let n = match ctx.vault.as_ref() {
+    let n = match vault_path.as_ref() {
         Some(path) => {
             let vault = glyx_store::Vault::open(path)?;
             let before = glyx_store::session::session_path(&vault.config().vault_id).exists();
@@ -948,9 +996,26 @@ fn cmd_ls(
     Ok(())
 }
 
-fn cmd_show(ctx: &Ctx, query: &str, reveal: bool) -> Result<()> {
+fn cmd_show(ctx: &Ctx, query: &str, reveal: bool, render: bool) -> Result<()> {
     let uv = ctx.unlocked()?;
     let item = items::resolve_query(&uv, query)?;
+    if render {
+        let body = glyx_store::present::note_rendered(&uv, &item, reveal)?;
+        if ctx.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "id": item.id,
+                    "name": item.name,
+                    "type": item.item_type,
+                    "body": body,
+                })
+            );
+        } else {
+            println!("{body}");
+        }
+        return Ok(());
+    }
     if ctx.json {
         println!(
             "{}",
@@ -983,6 +1048,7 @@ struct AddInput {
     tag: Vec<String>,
     field: Vec<String>,
     generate: Vec<String>,
+    body_file: Option<PathBuf>,
     interactive: bool,
 }
 
@@ -990,8 +1056,14 @@ fn cmd_add(ctx: &Ctx, input: AddInput) -> Result<()> {
     let mut uv = ctx.unlocked()?;
     let parsed =
         glyx_core::template::parse_type(&input.item_type).map_err(|e| anyhow::anyhow!(e))?;
+    let mut field_pairs = input.field;
+    if let Some(path) = input.body_file.as_ref() {
+        let body = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        field_pairs.push(format!("body={body}"));
+    }
     let values = items::collect_fields(
-        &input.field,
+        &field_pairs,
         &input.generate,
         parsed,
         input.interactive,
@@ -1021,6 +1093,7 @@ fn cmd_edit(
     rename: Option<String>,
     field: &[String],
     delete_field: &[String],
+    body_file: Option<&PathBuf>,
     interactive: bool,
 ) -> Result<()> {
     let mut uv = ctx.unlocked()?;
@@ -1033,6 +1106,11 @@ fn cmd_edit(
     for pair in field {
         let (k, v) = items::split_field(pair)?;
         values.insert(k, v);
+    }
+    if let Some(path) = body_file {
+        let body = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        values.insert("body".to_owned(), body);
     }
     if interactive {
         items::wizard_fill(item.item_type, &mut values, Some(&item))?;

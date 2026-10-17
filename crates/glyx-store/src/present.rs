@@ -1,4 +1,7 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
+
+use uuid::Uuid;
 
 use crate::{StoreError, UnlockedVault};
 
@@ -122,4 +125,49 @@ pub fn apply_fields(
     item.rev = item.rev.saturating_add(1);
     item.updated_by = uv.device_node();
     Ok(())
+}
+
+pub fn note_rendered(
+    uv: &UnlockedVault,
+    item: &glyx_core::Item,
+    reveal: bool,
+) -> Result<String, StoreError> {
+    let body = item.fields.get("body").map_or("", |f| f.value.expose());
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(start) = rest.find("{{glyx:") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 7..];
+        let Some(end) = after.find("}}") else {
+            out.push_str(&rest[start..]);
+            return Ok(out);
+        };
+        let inner = &after[..end];
+        let token_end = start + 7 + end + 2;
+        match inner.split_once('/') {
+            Some((id, field)) if !field.is_empty() && !field.contains(['}', '{', ' ', '\n']) => {
+                match id.parse::<Uuid>() {
+                    Ok(uuid) => match uv.get_item(&uuid)? {
+                        Some(target) => match target.fields.get(field) {
+                            Some(f) if display_value(target.item_type, field, reveal) => {
+                                out.push_str(f.value.expose());
+                            }
+                            Some(_) => out.push_str("\u{2022}\u{2022}\u{2022}\u{2022}"),
+                            None => {
+                                let _ = write!(out, "[missing {id}/{field}]");
+                            }
+                        },
+                        None => {
+                            let _ = write!(out, "[missing {id}/{field}]");
+                        }
+                    },
+                    Err(_) => out.push_str(&rest[start..token_end]),
+                }
+            }
+            _ => out.push_str(&rest[start..token_end]),
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }

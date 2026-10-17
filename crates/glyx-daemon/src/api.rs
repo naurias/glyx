@@ -133,6 +133,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(show_item).patch(edit_item).delete(delete_item),
         )
         .route("/v1/items/:id/totp", get(totp_code))
+        .route("/v1/items/:id/rendered", get(rendered_item))
         .route("/v1/ssh-gen", post(ssh_gen))
         .route("/v1/sync", post(sync))
         .route("/v1/conflicts", get(list_conflicts))
@@ -146,6 +147,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/exports/enforce", post(enforce_exports))
         .route("/v1/injects", post(add_inject))
+        .route("/v1/injects/scan", post(scan_injects))
         .route("/v1/agent/tamper", get(agent_tamper))
         .route("/v1/agent/resolve", post(agent_resolve))
         .route(
@@ -429,6 +431,35 @@ async fn show_item(
             q.reveal.unwrap_or(false),
         ))
         .into_response(),
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+async fn rendered_item(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<RevealQuery>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    match uv.resolve(&id) {
+        Ok(item) => {
+            match glyx_store::present::note_rendered(uv, &item, q.reveal.unwrap_or(false)) {
+                Ok(body) => Json(serde_json::json!({
+                    "id": item.id,
+                    "name": item.name,
+                    "type": item.item_type,
+                    "body": body,
+                }))
+                .into_response(),
+                Err(e) => store_error(&e).into_response(),
+            }
+        }
         Err(e) => store_error(&e).into_response(),
     }
 }
@@ -945,12 +976,16 @@ async fn list_exports(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     };
     let exports = glyx_agent::ledger::list_exports(&conn).unwrap_or_default();
     let injects = glyx_agent::ledger::list_injects(&conn).unwrap_or_default();
+    let roots = glyx_agent::ledger::list_inject_roots(&conn).unwrap_or_default();
     Json(serde_json::json!({
         "exports": exports.iter().map(|e| serde_json::json!({
             "target": e.target, "kind": e.kind, "keep": e.keep_on_lock,
         })).collect::<Vec<_>>(),
         "injects": injects.iter().map(|i| serde_json::json!({
             "target": i.target, "form": i.form,
+        })).collect::<Vec<_>>(),
+        "roots": roots.iter().map(|r| serde_json::json!({
+            "root": r.root, "glob": r.glob, "form": r.form,
         })).collect::<Vec<_>>(),
     }))
     .into_response()
@@ -1034,6 +1069,28 @@ async fn recall_export(
     Query(q): Query<TargetQuery>,
 ) -> impl IntoResponse {
     let _ = state;
+    if q.target.is_dir() {
+        let conn = match glyx_agent::ledger::open_db() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+        return match glyx_agent::ledger::forget_inject_root(&conn, &q.target) {
+            Ok(removed) => {
+                Json(serde_json::json!({"ok": true, "removed": removed})).into_response()
+            }
+            Err(e) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        };
+    }
     match glyx_agent::engine::recall_target(&q.target) {
         Ok(removed) => Json(serde_json::json!({"ok": true, "removed": removed})).into_response(),
         Err(e) => (
@@ -1084,6 +1141,7 @@ async fn enforce_exports(
 struct AddInjectBody {
     target: PathBuf,
     form: Option<String>,
+    glob: Option<String>,
 }
 
 async fn add_inject(
@@ -1101,14 +1159,67 @@ async fn add_inject(
                 .into_response();
         }
     };
+    if body.target.is_dir() {
+        let glob = body.glob.unwrap_or_else(|| "*.md".to_owned());
+        let form = body.form.unwrap_or_else(|| "ref".to_owned());
+        if let Err(e) = glyx_agent::ledger::register_inject_root(&conn, &body.target, &glob, &form)
+        {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+        return match glyx_agent::ledger::expand_inject_roots(&conn) {
+            Ok(rep) => Json(serde_json::json!({
+                "ok": true, "root": body.target, "glob": glob, "files": rep.files,
+            }))
+            .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        };
+    }
     match glyx_agent::ledger::register_inject(
         &conn,
         &body.target,
         &body.form.unwrap_or_else(|| "encrypted-pointer".to_owned()),
+        None,
     ) {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn scan_injects(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let _ = state;
+    let conn = match glyx_agent::ledger::open_db() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    match glyx_agent::ledger::expand_inject_roots(&conn) {
+        Ok(rep) => Json(serde_json::json!({
+            "ok": true,
+            "roots": rep.roots,
+            "files": rep.files,
+            "removed": rep.removed,
+            "skipped": rep.skipped,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),

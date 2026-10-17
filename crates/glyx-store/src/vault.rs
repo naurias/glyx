@@ -1040,6 +1040,56 @@ mod tests {
     }
 
     #[test]
+    fn note_refs_resolve_with_masking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("note.glyx");
+        Vault::init(
+            &path,
+            suite(glyx_core::Cipher::Xchacha20poly1305),
+            b"pw",
+            Some(&[3u8; 32]),
+        )
+        .expect("init");
+        let vault = Vault::open(&path).expect("open");
+        let mut uv = vault.unlock(b"pw", &[3u8; 32]).expect("unlock");
+        let node = uv.device_node();
+        let mut login = test_item(node);
+        login.fields.insert(
+            "username".to_owned(),
+            glyx_core::Field {
+                value: glyx_core::SecretString::new("alice".to_owned()),
+                field_hlc: login.hlc,
+            },
+        );
+        let login_id = login.id;
+        uv.put_item(&login).expect("put login");
+        let mut memo = test_item(node);
+        memo.item_type = glyx_core::ItemType::Note;
+        memo.name = "n".to_owned();
+        memo.fields.clear();
+        memo.fields.insert(
+            "body".to_owned(),
+            glyx_core::Field {
+                value: glyx_core::SecretString::new(format!(
+                    "pw={{{{glyx:{login_id}/password}}}} user={{{{glyx:{login_id}/username}}}} missing={{{{glyx:{login_id}/nope}}}}"
+                )),
+                field_hlc: memo.hlc,
+            },
+        );
+        memo.validate().expect("note valid");
+        uv.put_item(&memo).expect("put note");
+        let masked = crate::present::note_rendered(&uv, &memo, false).expect("render");
+        assert!(
+            masked.contains("pw=\u{2022}\u{2022}\u{2022}\u{2022}"),
+            "{masked}"
+        );
+        assert!(masked.contains("user=alice"), "{masked}");
+        assert!(masked.contains("[missing"), "{masked}");
+        let revealed = crate::present::note_rendered(&uv, &memo, true).expect("render");
+        assert!(revealed.contains("pw=s3cret"), "{revealed}");
+    }
+
+    #[test]
     fn vault_lifecycle_both_ciphers() {
         for cipher in [
             glyx_core::Cipher::Xchacha20poly1305,
