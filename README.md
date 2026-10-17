@@ -147,6 +147,11 @@ glyx export enforce [--force]
 # In-place injection: author {{glyx:<id>/<field>}} refs, they resolve on unlock
 glyx inject add ~/project/.env
 glyx inject add ~/notes/todo.md --form masked
+
+# Whole folders (for example an Obsidian vault); refs stay readable while locked
+glyx inject add ~/Obsidian --glob '*.md'
+glyx inject scan
+glyx inject rm ~/Obsidian
 ```
 
 Locked files show opaque encrypted pointers by default (`__GLYXENC:V1:…`, bound to their target path so copying them elsewhere fails closed). Where tooling must parse locked files, `--form masked` writes fixed-size `ENC[…]` tags instead. If a file changed while locked, unlock reports it instead of overwriting: `glyx export tamper`, then combine, keep, or overwrite:
@@ -159,6 +164,19 @@ glyx export merge ~/project/.env --interactive   # walk each hunk
 ```
 
 The merge shows base (locked), theirs (on-disk), and ours (fresh vault values) per hunk; clean hunks apply automatically, adjacent edits form a single hunk like git, and true conflicts need an explicit pick — nothing is ever silently dropped or auto-merged across a real conflict.
+
+## Notes
+
+Notes are markdown items. Reference secrets from an item with `{{glyx:<id>/<field>}}`: the app renders the note with the current value, masking secret fields until you reveal them, so values are never baked into the stored note.
+
+```sh
+glyx add note --name server --body-file server.md
+glyx show server                 # raw body
+glyx show server --render         # refs resolved, secrets masked
+glyx show server --render --reveal
+```
+
+The same refs work in files you track outside the vault: point glyx at a folder of `*.md` files (for example an Obsidian vault) and it substitutes values on unlock, restoring the readable `{{glyx:...}}` placeholders on lock. `glyx inject scan` picks up newly added notes.
 
 ## SSH agent
 
