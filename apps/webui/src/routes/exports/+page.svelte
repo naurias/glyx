@@ -6,6 +6,9 @@
   let error = '';
   let target = '';
   let form = 'encrypted-pointer';
+  let merging = null;
+  let hunks = [];
+  let picks = {};
 
   async function load() {
     try {
@@ -49,6 +52,26 @@
       error = e.message;
     }
   }
+  async function preview(t) {
+    try {
+      const res = await api.mergePreview(t);
+      merging = t;
+      hunks = res.hunks || [];
+      picks = {};
+    } catch (e) {
+      error = e.message;
+    }
+  }
+  async function applyMerge() {
+    try {
+      await api.mergeApply(merging, picks);
+      merging = null;
+      hunks = [];
+      await load();
+    } catch (e) {
+      error = e.message;
+    }
+  }
 </script>
 
 <nav>
@@ -72,6 +95,28 @@
       {/each}
     </div>
   {/if}
+  {#if merging}
+    <div class="card">
+      <strong>Merging {merging}</strong>
+      {#each hunks as h, i}
+        {#if h.kind === 'conflict'}
+          <div class="card">
+            <div class="dim">hunk {i}{h.secret ? ' [secret]' : ''}</div>
+            <div><strong>theirs</strong><pre>{h.theirs.join('\n')}</pre></div>
+            <div><strong>ours</strong><pre>{h.ours.join('\n')}</pre></div>
+            <div class="row">
+              <button on:click={() => (picks[i] = 'theirs')}>Theirs{picks[i] === 'theirs' ? ' ✓' : ''}</button>
+              <button on:click={() => (picks[i] = 'ours')}>Ours{picks[i] === 'ours' ? ' ✓' : ''}</button>
+            </div>
+          </div>
+        {/if}
+      {/each}
+      <div class="row">
+        <button class="primary" on:click={applyMerge}>Apply merge</button>
+        <button on:click={() => (merging = null)}>Cancel</button>
+      </div>
+    </div>
+  {/if}
   <h3>Files</h3>
   {#each data.exports as e}
     <div class="card row">
@@ -87,6 +132,7 @@
       <span>{i.target}</span>
       <span class="dim">{i.form}</span>
       <span style="flex: 1"></span>
+      <button on:click={() => preview(i.target)}>Merge</button>
       <button class="danger" on:click={() => recall(i.target)}>Recall</button>
     </div>
   {/each}

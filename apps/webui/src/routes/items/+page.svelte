@@ -29,6 +29,7 @@
   <a href="/conflicts">Conflicts</a>
   <a href="/exports">Exports</a>
   <a href="/settings">Settings</a>
+  <a href="/onboarding">Vaults</a>
   <span style="flex: 1"></span>
   <button on:click={lock}>Lock</button>
 </nav>

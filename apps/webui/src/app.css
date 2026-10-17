@@ -27,6 +27,7 @@ input, select, button, textarea {
 button { cursor: pointer; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #0b0e14; }
 button.danger { border-color: var(--danger); color: var(--danger); }
+button.selected { border-color: var(--accent); }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .card {
   background: var(--panel);

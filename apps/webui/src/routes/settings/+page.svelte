@@ -4,15 +4,25 @@
   let status = null;
   let report = null;
   let error = '';
+  let settings = null;
 
   async function load() {
     try {
       status = await api.status();
+      settings = await api.settings();
     } catch (e) {
       error = e.message;
     }
   }
   onMount(load);
+  async function setExit(value) {
+    error = '';
+    try {
+      settings = await api.saveSettings({ daemon_on_exit: value });
+    } catch (e) {
+      error = e.message;
+    }
+  }
   async function sync() {
     error = '';
     try {
@@ -54,6 +64,20 @@
     <div class="card">
       <div>Envelopes: {status.envelopes} · live: {status.live} · conflicts: {status.conflicts}</div>
       <div class="dim">Last merge: {status.last_merge_ms ?? 'never'}</div>
+    </div>
+  {/if}
+  {#if settings}
+    <div class="card">
+      <div>When the desktop app closes:</div>
+      <div class="row">
+        <button class:selected={settings.daemon_on_exit === 'stop'} on:click={() => setExit('stop')}>
+          Stop the daemon
+        </button>
+        <button class:selected={settings.daemon_on_exit === 'keep'} on:click={() => setExit('keep')}>
+          Keep it running
+        </button>
+      </div>
+      <p class="dim">Stopping on exit is more private; keeping it running keeps the browser, Git, and SSH agent working.</p>
     </div>
   {/if}
   <div class="row">
