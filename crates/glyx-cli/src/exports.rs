@@ -59,6 +59,7 @@ pub fn cmd_ls(as_json: bool) -> Result<()> {
     let conn = glyx_agent::ledger::open_db()?;
     let exports = glyx_agent::ledger::list_exports(&conn)?;
     let injects = glyx_agent::ledger::list_injects(&conn)?;
+    let roots = glyx_agent::ledger::list_inject_roots(&conn)?;
     if as_json {
         println!(
             "{}",
@@ -69,9 +70,15 @@ pub fn cmd_ls(as_json: bool) -> Result<()> {
                 "injects": injects.iter().map(|i| serde_json::json!({
                     "target": i.target, "form": i.form,
                 })).collect::<Vec<_>>(),
+                "roots": roots.iter().map(|r| serde_json::json!({
+                    "root": r.root, "glob": r.glob, "form": r.form,
+                })).collect::<Vec<_>>(),
             })
         );
     } else {
+        for r in &roots {
+            println!("{} [folder:{}] {}", r.root.display(), r.glob, r.form);
+        }
         for e in &exports {
             let keep = if e.keep_on_lock { "keep" } else { "wipe" };
             println!("{} [{}] {} ({keep})", e.target.display(), e.kind, e.id);
@@ -79,7 +86,7 @@ pub fn cmd_ls(as_json: bool) -> Result<()> {
         for i in &injects {
             println!("{} [inject:{}]", i.target.display(), i.form);
         }
-        if exports.is_empty() && injects.is_empty() {
+        if exports.is_empty() && injects.is_empty() && roots.is_empty() {
             println!("no exports registered");
         }
     }
@@ -103,12 +110,15 @@ pub fn cmd_enforce(uv: &mut glyx_store::UnlockedVault, force: bool, as_json: boo
     if as_json {
         println!(
             "{}",
-            serde_json::json!({"files": rep.files, "injected": rep.injected, "skipped": rep.skipped})
+            serde_json::json!({
+                "files": rep.files, "injected": rep.injected,
+                "scanned": rep.scanned, "skipped": rep.skipped,
+            })
         );
     } else {
         println!(
-            "materialized {} file(s), {} injection(s)",
-            rep.files, rep.injected
+            "materialized {} file(s), {} injection(s) from {} scanned file(s)",
+            rep.files, rep.injected, rep.scanned
         );
         for s in &rep.skipped {
             println!("skipped: {s} (use --force)");
@@ -298,13 +308,79 @@ pub fn cmd_tamper(vault: Option<&PathBuf>, as_json: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_inject_add(target: &std::path::Path, form: &str, as_json: bool) -> Result<()> {
+pub fn cmd_inject_add(
+    target: &std::path::Path,
+    form: &str,
+    glob: Option<&str>,
+    as_json: bool,
+) -> Result<()> {
     let conn = glyx_agent::ledger::open_db()?;
-    glyx_agent::ledger::register_inject(&conn, target, form)?;
+    if target.is_dir() {
+        let glob = glob.unwrap_or("*.md");
+        let form = if form == "encrypted-pointer" {
+            "ref"
+        } else {
+            form
+        };
+        glyx_agent::ledger::register_inject_root(&conn, target, glob, form)?;
+        let rep = glyx_agent::ledger::expand_inject_roots(&conn)?;
+        if as_json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": true, "root": target, "glob": glob, "files": rep.files,
+                })
+            );
+        } else {
+            println!(
+                "tracking folder {} ({glob}, {} file(s), locked form: {form})",
+                target.display(),
+                rep.files
+            );
+        }
+        return Ok(());
+    }
+    glyx_agent::ledger::register_inject(&conn, target, form, None)?;
     if as_json {
         println!("{}", serde_json::json!({"ok": true}));
     } else {
         println!("tracking {} (locked form: {form})", target.display());
+    }
+    Ok(())
+}
+
+pub fn cmd_inject_scan(as_json: bool) -> Result<()> {
+    let rep = glyx_agent::scan_inject_roots().map_err(|e| anyhow::anyhow!(e))?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true, "roots": rep.roots, "files": rep.files,
+                "removed": rep.removed, "skipped": rep.skipped,
+            })
+        );
+    } else {
+        println!(
+            "scanned {} root(s): {} file(s), {} removed, {} skipped",
+            rep.roots, rep.files, rep.removed, rep.skipped
+        );
+    }
+    Ok(())
+}
+
+pub fn cmd_inject_rm(target: &std::path::Path, as_json: bool) -> Result<()> {
+    let conn = glyx_agent::ledger::open_db()?;
+    let removed = if target.is_dir() {
+        glyx_agent::ledger::forget_inject_root(&conn, target)?
+    } else {
+        glyx_agent::forget_target(target)?
+    };
+    if as_json {
+        println!("{}", serde_json::json!({"ok": true, "removed": removed}));
+    } else if removed {
+        println!("forgot {}", target.display());
+    } else {
+        println!("nothing tracked at {}", target.display());
     }
     Ok(())
 }
