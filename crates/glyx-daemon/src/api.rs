@@ -117,6 +117,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(ui_index))
         .fallback(ui_fallback)
         .route("/v1/health", get(health))
+        .route("/v1/templates", get(list_templates))
         .route("/v1/status", get(status))
         .route(
             "/v1/vaults",
@@ -124,6 +125,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/vaults/create", post(create_vault))
         .route("/v1/vaults/select", post(select_vault))
+        .route("/v1/vaults/rekey", post(rekey_vault))
         .route("/v1/settings", get(get_settings).post(set_settings))
         .route("/v1/unlock", post(unlock))
         .route("/v1/lock", post(lock))
@@ -134,6 +136,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/items/:id/totp", get(totp_code))
         .route("/v1/items/:id/rendered", get(rendered_item))
+        .route("/v1/items/:id/fill", post(fill_item))
         .route("/v1/ssh-gen", post(ssh_gen))
         .route("/v1/sync", post(sync))
         .route("/v1/conflicts", get(list_conflicts))
@@ -150,6 +153,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/injects/scan", post(scan_injects))
         .route("/v1/agent/tamper", get(agent_tamper))
         .route("/v1/agent/resolve", post(agent_resolve))
+        .route("/v1/agent/unlock", post(agent_unlock_target))
+        .route("/v1/agent/lock", post(agent_lock_target))
+        .route("/v1/agent/relocate", post(agent_relocate))
         .route(
             "/v1/agent/merge",
             get(agent_merge_preview).post(agent_merge_apply),
@@ -193,6 +199,27 @@ async fn ui_fallback(uri: axum::http::Uri) -> impl IntoResponse {
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"ok": true}))
+}
+
+async fn list_templates() -> impl IntoResponse {
+    let out: Vec<serde_json::Value> = glyx_core::template::ALL_TYPES
+        .iter()
+        .map(|t| {
+            let fields: Vec<serde_json::Value> = glyx_core::template::spec(*t)
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "name": f.name, "secret": f.secret, "required": f.required,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "type": serde_json::to_value(t).unwrap_or(serde_json::Value::Null),
+                "fields": fields,
+            })
+        })
+        .collect();
+    Json(serde_json::Value::Array(out))
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -273,9 +300,14 @@ async fn unlock(
     .await;
     match result {
         Ok(Ok(mut uv)) => {
-            let agent_report = glyx_agent::enforce_all(&mut uv, false)
-                .map(|r| r.skipped)
-                .unwrap_or_default();
+            let auto = glyx_store::config::load().auto_materialize;
+            let agent_report = if auto {
+                glyx_agent::enforce_all(&mut uv, false)
+                    .map(|r| r.skipped)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let identities = glyx_agent::ssh_agent::load_identities(&uv).unwrap_or_default();
             let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             if !identities.is_empty() {
@@ -551,6 +583,8 @@ async fn create_item(
 #[derive(Deserialize)]
 struct EditBody {
     rename: Option<String>,
+    folder: Option<String>,
+    tags: Option<Vec<String>>,
     fields: Option<BTreeMap<String, String>>,
     delete_fields: Option<Vec<String>>,
 }
@@ -575,8 +609,15 @@ async fn edit_item(
     if let Some(name) = body.rename {
         item.name = name;
     }
+    let meta_touched = body.folder.is_some() || body.tags.is_some();
+    if let Some(folder) = body.folder {
+        item.folder = folder;
+    }
+    if let Some(tags) = body.tags {
+        item.tags = tags;
+    }
     let values = body.fields.unwrap_or_default();
-    let touched = !values.is_empty() || body.delete_fields.is_some() || renamed;
+    let touched = !values.is_empty() || body.delete_fields.is_some() || renamed || meta_touched;
     for k in body.delete_fields.unwrap_or_default() {
         item.fields.remove(&k);
     }
@@ -1335,6 +1376,91 @@ async fn agent_resolve(
         .into_response()
 }
 
+#[derive(Deserialize)]
+struct TargetBody {
+    target: PathBuf,
+    force: Option<bool>,
+}
+
+async fn agent_unlock_target(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<TargetBody>,
+) -> impl IntoResponse {
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return locked_error().into_response();
+    };
+    match glyx_agent::materialize_target(uv, &body.target, body.force.unwrap_or(false)) {
+        Ok(rep) => Json(serde_json::json!({
+            "ok": true, "files": rep.files, "injected": rep.injected,
+            "scanned": rep.scanned, "skipped": rep.skipped,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn agent_lock_target(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<TargetBody>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    match glyx_agent::teardown_targets(uv, Some(&body.target)) {
+        Ok(rep) => Json(serde_json::json!({
+            "ok": true, "wiped": rep.wiped, "restored": rep.restored, "drifted": rep.drifted,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RelocateBody {
+    old: PathBuf,
+    new: PathBuf,
+}
+
+async fn agent_relocate(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RelocateBody>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    match glyx_agent::relocate_target(uv, &body.old, &body.new) {
+        Ok(rep) => Json(serde_json::json!({
+            "ok": true, "exports": rep.exports, "roots": rep.roots, "injects": rep.injects,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn agent_merge_preview(
     State(state): State<Arc<AppState>>,
     Query(q): Query<TargetQuery>,
@@ -1473,6 +1599,7 @@ struct SettingsBody {
     daemon_on_exit: Option<String>,
     mode: Option<String>,
     session_ttl_min: Option<u64>,
+    auto_materialize: Option<bool>,
 }
 
 fn vault_json(
@@ -1648,6 +1775,7 @@ async fn get_settings(State(_state): State<Arc<AppState>>) -> impl IntoResponse 
         "daemon_on_exit": cfg.daemon_on_exit,
         "mode": cfg.mode,
         "session_ttl_min": cfg.session_ttl_min,
+        "auto_materialize": cfg.auto_materialize,
     }))
 }
 
@@ -1671,6 +1799,9 @@ async fn set_settings(
     if let Some(ttl) = body.session_ttl_min {
         cfg.session_ttl_min = ttl;
     }
+    if let Some(auto) = body.auto_materialize {
+        cfg.auto_materialize = auto;
+    }
     if let Err(e) = glyx_store::config::save(&cfg) {
         return store_error(&e).into_response();
     }
@@ -1679,8 +1810,159 @@ async fn set_settings(
         "daemon_on_exit": cfg.daemon_on_exit,
         "mode": cfg.mode,
         "session_ttl_min": cfg.session_ttl_min,
+        "auto_materialize": cfg.auto_materialize,
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct FillBody {
+    field: Option<String>,
+    timeout: Option<u64>,
+}
+
+async fn fill_item(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<FillBody>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let item = match uv.resolve(&id) {
+        Ok(item) => item,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    let field = body.field.unwrap_or_else(|| "password".to_owned());
+    let Some(field_value) = item.fields.get(&field) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": format!("no field {field}")})),
+        )
+            .into_response();
+    };
+    let value = field_value.value.expose().to_owned();
+    let timeout = body.timeout.unwrap_or(15);
+    drop(guard);
+    if glyx_autofill::clipboard::copy(&value).is_err() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "clipboard unavailable"})),
+        )
+            .into_response();
+    }
+    if timeout > 0 {
+        let expected = value;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(timeout));
+            let _ = glyx_autofill::clipboard::clear_if_ours(&expected);
+        });
+    }
+    Json(serde_json::json!({"ok": true, "field": field, "timeout_s": timeout})).into_response()
+}
+
+#[derive(Deserialize)]
+struct RekeyBody {
+    password: Option<String>,
+    keyfile: Option<String>,
+    no_keyfile: Option<bool>,
+    cipher: Option<String>,
+    preset: Option<String>,
+    keep_old_slots: Option<bool>,
+}
+
+async fn rekey_vault(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RekeyBody>,
+) -> impl IntoResponse {
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return locked_error().into_response();
+    };
+    let no_keyfile = body.no_keyfile == Some(true);
+    let rotate = body.password.is_some() || body.keyfile.is_some() || no_keyfile;
+    if !rotate && body.cipher.is_none() && body.preset.is_none() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "nothing to rotate"})),
+        )
+            .into_response();
+    }
+    let old_slots: Vec<uuid::Uuid> = uv
+        .list_slots()
+        .map(|s| s.into_iter().map(|(id, _)| id).collect())
+        .unwrap_or_default();
+    let params = match body.preset.as_deref() {
+        Some(p) => preset_params(Some(p)),
+        None => uv.config().cipher_suite.params,
+    };
+    if rotate {
+        let Some(new_pw) = body.password.clone().filter(|p| !p.is_empty()) else {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "password required to rotate credentials"})),
+            )
+                .into_response();
+        };
+        let (new_kf, required) = if no_keyfile {
+            (glyx_crypto::ZERO_KEYFILE, false)
+        } else if let Some(path) = body.keyfile.as_deref() {
+            match glyx_store::keyfile::load_or_create(std::path::Path::new(path)) {
+                Ok(kf) => (kf, true),
+                Err(e) => return store_error(&e).into_response(),
+            }
+        } else if uv.config().keyfile_required {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "this vault needs a keyfile path"})),
+            )
+                .into_response();
+        } else {
+            (glyx_crypto::ZERO_KEYFILE, false)
+        };
+        let id = match uv.add_slot_with_params(new_pw.as_bytes(), &new_kf, params) {
+            Ok(id) => id,
+            Err(e) => return store_error(&e).into_response(),
+        };
+        if let Ok(vault) = glyx_store::Vault::open(&uv.vault_path()) {
+            if !vault
+                .verify_slot(&id, new_pw.as_bytes(), &new_kf)
+                .unwrap_or(false)
+            {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({"error": "new keyslot failed verification"})),
+                )
+                    .into_response();
+            }
+        }
+        if let Err(e) = uv.set_keyfile_required(required) {
+            return store_error(&e).into_response();
+        }
+    }
+    if let Some(cipher) = body.cipher.as_deref() {
+        if let Err(e) = uv.reencrypt(cipher_of(Some(cipher))) {
+            return store_error(&e).into_response();
+        }
+    }
+    if rotate && body.keep_old_slots != Some(true) {
+        for id in &old_slots {
+            if uv
+                .list_slots()
+                .is_ok_and(|s| s.iter().any(|(x, _)| x == id))
+            {
+                let _ = uv.retire_slot(id);
+            }
+        }
+    }
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 pub async fn serve(

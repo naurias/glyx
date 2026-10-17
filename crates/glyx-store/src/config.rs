@@ -50,6 +50,10 @@ fn default_ttl() -> u64 {
     crate::session::SESSION_TTL_DEFAULT_MIN
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -58,6 +62,8 @@ pub struct AppConfig {
     pub session_ttl_min: u64,
     #[serde(default)]
     pub daemon_on_exit: DaemonExit,
+    #[serde(default = "default_true")]
+    pub auto_materialize: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_vault: Option<PathBuf>,
     #[serde(default)]
@@ -70,6 +76,7 @@ impl Default for AppConfig {
             mode: SessionMode::Oneshot,
             session_ttl_min: default_ttl(),
             daemon_on_exit: DaemonExit::Stop,
+            auto_materialize: true,
             current_vault: None,
             vaults: Vec::new(),
         }
@@ -240,5 +247,6 @@ mod tests {
     fn daemon_exit_defaults_to_stop() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.daemon_on_exit, DaemonExit::Stop);
+        assert!(cfg.auto_materialize);
     }
 }
