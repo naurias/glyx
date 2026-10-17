@@ -10,13 +10,7 @@
     "beforeBuildCommand": "pnpm build --dir ../../apps/webui"
   },
   "app": {
-    "windows": [
-      {
-        "title": "glyx",
-        "width": 1100,
-        "height": 750
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:*"
     }

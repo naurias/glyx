@@ -17,3 +17,6 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-global-shortcut = { version = "2" }
+glyx-core = { path = "../glyx-core" }
+glyx-store = { path = "../glyx-store" }
+glyx-daemon = { path = "../glyx-daemon" }
