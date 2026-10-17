@@ -2,7 +2,7 @@
 
 Local-first password manager for Linux, Windows, and Android. CLI, WebUI, and desktop app on one Rust core. No accounts, no telemetry, your vault stays yours.
 
-> Status: M5 file exports, secret injection, and SSH agent work. Android support arrives in M6. This README is a living user guide and grows with each milestone.
+> Status: M5.2 vault onboarding, optional keyfiles, and a self-starting desktop app work. Android support arrives in M6. This README is a living user guide and grows with each milestone.
 
 ## What glyx will do
 
@@ -56,12 +56,18 @@ nix build .#glyx-desktop   # desktop package (real Tauri binary lands in M3)
 
 ## Quickstart
 
-```sh
-# Create a vault (generates the keyfile when missing)
-glyx vault init ~/vaults/main.glyx --preset balanced --keyfile ~/keys/main.key --cipher xchacha
+Run `glyx` with no arguments for an interactive picker: choose an existing vault, add one from a custom location (for example copied from another device), or create and configure a new one. Your choice is remembered in `~/.config/glyx/config.toml` until you pick another.
 
-# Work with items (pass --vault once or set GLYX_VAULT)
-export GLYX_VAULT=~/vaults/main.glyx
+```sh
+# Create a vault. Omit --keyfile for a password-only vault.
+glyx vault init ~/vaults/main.glyx --preset balanced --keyfile ~/keys/main.key --cipher xchacha
+glyx vault init ~/vaults/simple.glyx --preset mobile        # password only
+
+# The picker, also available as an explicit command
+glyx
+glyx vault select
+
+# Work with items (the selected vault is used automatically)
 glyx --keyfile ~/keys/main.key add login --name github --field username=you --generate password
 glyx --keyfile ~/keys/main.key ls
 glyx --keyfile ~/keys/main.key show github
@@ -77,13 +83,14 @@ glyx lock
 
 # Rotate credentials or cipher (old password required)
 glyx --keyfile ~/keys/main.key vault rekey --new-keyfile ~/keys/main2.key
+glyx --keyfile ~/keys/main.key vault rekey --no-keyfile
 glyx --keyfile ~/keys/main2.key vault rekey --cipher aesgcm
 
 # Check vault health
 glyx doctor --with-unlock --json
 ```
 
-Passwords come from a hidden prompt, or from `--password-env VAR` for scripts. The vault is taken from `--vault` or `GLYX_VAULT`; `--no-session` forces a fresh prompt every time. Every command also accepts `--json`; `--reveal` shows secrets in human output (JSON always includes values). Deletes are tombstones, kept for sync safety. For an interactive walkthrough use `add --interactive`.
+Passwords come from a hidden prompt, or from `--password-env VAR` for scripts. The vault comes from `--vault`, then `GLYX_VAULT`, then your selected vault; `--no-session` forces a fresh prompt every time. A keyfile is only required if the vault was created with one. Every command also accepts `--json`; `--reveal` shows secrets in human output (JSON always includes values). Deletes are tombstones, kept for sync safety. For an interactive walkthrough use `add --interactive`.
 
 ## Sessions and convenience passphrase
 
@@ -101,6 +108,13 @@ Set defaults in `~/.config/glyx/config.toml` (or `GLYX_CONFIG`):
 ```toml
 mode = "session"
 session_ttl_min = 15
+daemon_on_exit = "stop"
+current_vault = "/home/you/vaults/main.glyx"
+
+[[vaults]]
+path = "/home/you/vaults/main.glyx"
+name = "Personal"
+keyfile = "/home/you/keys/main.key"
 ```
 
 Threat model, stated plainly: a session file holds the data key under `0600` in your runtime dir (up to 8h max), like `ssh-agent` holds keys in RAM. Anyone who can read your files can read an active session. The default stays one-shot (no session files unless you run `unlock`), and `lock` wipes them.
@@ -116,7 +130,7 @@ At creation you pick a preset; advanced users can tune KDF cost and cipher:
 | Mobile   | Argon2id, 64 MiB, t=3      | XChaCha20-Poly1305   |
 | Custom   | Your m/t/p within safe floors | XChaCha20 or AES-256-GCM |
 
-Unlock is password plus keyfile (a 32 byte random file you keep apart from the vault, for example on USB). Lose either and the vault cannot be recovered, by design. Rekeying later (`glyx vault rekey`) changes password, keyfile, or cipher without a new vault.
+Unlock needs a password, mandatory. A keyfile (a 32 byte random file you keep apart from the vault, for example on USB) is optional but strongly recommended and can be enabled at creation or later with `glyx vault rekey --new-keyfile`; drop it again with `--no-keyfile`. Without a keyfile the password alone protects the vault. Losing a required keyfile makes the vault unrecoverable, by design. Rekeying later (`glyx vault rekey`) changes password, keyfile, or cipher without a new vault.
 
 ## File projection and injection
 
@@ -135,7 +149,16 @@ glyx inject add ~/project/.env
 glyx inject add ~/notes/todo.md --form masked
 ```
 
-Locked files show opaque encrypted pointers by default (`__GLYXENC:V1:…`, bound to their target path so copying them elsewhere fails closed). Where tooling must parse locked files, `--form masked` writes fixed-size `ENC[…]` tags instead. If a file changed while locked, unlock reports it instead of overwriting: `glyx export tamper`, then `export enforce --force` or leave it alone. The ledger (`agent-ledger.sqlite`, local only, never synced) tracks every registration.
+Locked files show opaque encrypted pointers by default (`__GLYXENC:V1:…`, bound to their target path so copying them elsewhere fails closed). Where tooling must parse locked files, `--form masked` writes fixed-size `ENC[…]` tags instead. If a file changed while locked, unlock reports it instead of overwriting: `glyx export tamper`, then combine, keep, or overwrite:
+
+```sh
+glyx export merge ~/project/.env --ours     # take vault side for all conflicts
+glyx export merge ~/project/.env --theirs   # keep on-disk side for all conflicts
+glyx export merge ~/project/.env --pick 2:theirs
+glyx export merge ~/project/.env --interactive   # walk each hunk
+```
+
+The merge shows base (locked), theirs (on-disk), and ours (fresh vault values) per hunk; clean hunks apply automatically, adjacent edits form a single hunk like git, and true conflicts need an explicit pick — nothing is ever silently dropped or auto-merged across a real conflict.
 
 ## SSH agent
 
@@ -167,14 +190,14 @@ Rules: newer fields win, tombstones win over edits, true same-field races keep a
 
 ## Daemon, WebUI, desktop
 
-The daemon owns the unlocked vault and serves the API plus the WebUI on loopback only:
+The daemon owns the unlocked vault and serves the API plus the WebUI on loopback only. It can run without a vault so you can onboard, then switch the active vault in place:
 
 ```sh
-glyx --vault ~/vaults/main.glyx daemon start
-glyx --vault ~/vaults/main.glyx daemon status
+glyx daemon start                 # uses your selected vault, or starts empty
+glyx daemon status
 ```
 
-Open the printed address in a browser, paste the token from the runtime dir (`daemon-<vault>.json`), unlock, and manage items, TOTP codes, conflicts, sync, GC, and doctor from the UI. Secrets stay in memory only and never touch `localStorage`. The desktop app (`glyx-tauri`, or `nix run .#glyx-desktop`) hosts the same UI. `daemon stop` (or Lock in the UI) drops the key.
+Open the printed address in a browser, paste the token from the runtime dir (`daemon.json`), then manage vaults and unlock items, TOTP codes, conflicts, sync, GC, and doctor from the UI. Secrets stay in memory only and never touch `localStorage`. The desktop app (`glyx-tauri`, or `nix run .#glyx-desktop`) hosts the same UI: it starts the daemon for you, wires the URL and token automatically, and ships with onboarding for choosing, adding, or creating a vault. By default it stops the daemon it started when you close the app; change that under Settings. `daemon stop` (or Lock in the UI) drops the key.
 
 ```sh
 nix profile install .#bundle   # CLI, daemon, and desktop in one profile
@@ -207,12 +230,14 @@ The desktop app also registers Ctrl+Shift+G to pop up the vault search. Fill nev
 
 ## Configuration
 
-| Item            | Location (planned)                          |
+| Item            | Location                                    |
 |-----------------|---------------------------------------------|
 | Vault folder    | You choose, for example `~/vaults/main.glyx` |
-| Daemon socket   | Loopback only, token auth (M3)              |
-| Export ledger   | Local only, never synced (M5)               |
-| App config      | XDG config dir (exact path confirmed in M3) |
+| Daemon socket   | Loopback only, token in `daemon.json`, token auth |
+| Export ledger   | Local only, never synced (`agent-ledger.sqlite`) |
+| App config      | `~/.config/glyx/config.toml` (or `GLYX_CONFIG`) |
+| Selected vault  | `current_vault` in the app config           |
+| Keyfiles        | Anywhere you choose; only the path is stored in the app config |
 
 No network listener leaves your machine in v1 except the planned opt-in relay.
 
@@ -227,8 +252,8 @@ crates/
   glyx-sync      Field-LWW merge, dominance check, header ordering, classifier
   glyx-agent     Export/inject ledger, shred, tamper, SSH agent socket
   glyx-autofill  Clipboard backend + fill helpers (no Secret Service by design)
-  glyx-daemon    Axum /v1 API + embedded WebUI, token auth, idle auto-lock
-  glyx-tauri     Tauri desktop shell hosting the built WebUI
+  glyx-daemon    Axum /v1 API + embedded WebUI, vault onboarding, token auth, idle auto-lock
+  glyx-tauri     Tauri desktop shell: autostarts the daemon, hosts the built WebUI
   glyx-nm        NativeMessaging stdio bridge proxying to the daemon
   glyx-cli       Full CLI: items, sessions, rekey, sync, conflicts, gc, fill, git, extension
 apps/            webui, desktop, android, extension (fill in M3+)
@@ -237,7 +262,7 @@ local/           Agent and developer docs (gitignored, local only)
 
 ## Roadmap
 
-Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 browser/Git/clipboard fill (done), M5 file agent plus SSH (done), M6 Android plus notes, M7 hardening and installers.
+Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 browser/Git/clipboard fill (done), M5 file agent plus SSH (done), M5.2 vault onboarding plus optional keyfiles plus self-starting desktop (done), M6 Android plus notes, M7 hardening and installers.
 
 ## License
 
