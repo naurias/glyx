@@ -141,6 +141,40 @@ pub fn scan_refs(text: &str) -> Vec<(Uuid, String)> {
     out
 }
 
+#[must_use]
+pub fn scan_pointers(text: &str) -> Vec<String> {
+    const PREFIX: &str = "__GLYXENC:V1:";
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find(PREFIX) {
+        let start = search_from + rel;
+        let body_start = start + PREFIX.len();
+        let mut cursor = body_start;
+        let mut terminator = None;
+        while let Some(rel2) = text[cursor..].find("__") {
+            let term = cursor + rel2;
+            let after = term + 2;
+            let next_is_b64 = bytes
+                .get(after)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_');
+            if !next_is_b64 {
+                terminator = Some(term);
+                break;
+            }
+            cursor = term + 2;
+        }
+        match terminator {
+            Some(term) => {
+                out.push(text[start..term + 2].to_owned());
+                search_from = term + 2;
+            }
+            None => break,
+        }
+    }
+    out
+}
+
 pub fn parse_form(text: &str) -> Result<glyx_core::LockedForm, AgentError> {
     match text {
         "ref" => Ok(glyx_core::LockedForm::Ref),
@@ -423,6 +457,16 @@ mod tests {
         assert!(!glob_match("note.md", "notes.md"));
         assert!(glob_match("*.sync-conflict-*", "a.sync-conflict-1.md"));
         assert!(glob_match("*.md", "a.md") && !glob_match("*.md", "a.MD"));
+    }
+
+    #[test]
+    fn scan_pointers_extracts_only_tokens() {
+        let text = "a = __GLYXENC:V1:AAAA__\n{{glyx:0191a2b3-c4d5-7e6f-8901-234567890abc/password}}\nb = x\nc = __GLYXENC:V1:a__b_c__\n";
+        let found = scan_pointers(text);
+        assert_eq!(found, vec!["__GLYXENC:V1:AAAA__", "__GLYXENC:V1:a__b_c__"]);
+        assert!(scan_pointers("no pointers here").is_empty());
+        assert!(scan_pointers("__GLYXENC:V1:unterminated").is_empty());
+        assert_eq!(scan_pointers("__GLYXENC:V1:ZZ__").len(), 1);
     }
 
     #[test]

@@ -6,8 +6,8 @@ use uuid::Uuid;
 
 use crate::ledger::{
     blake_hex, expand_inject_roots, list_exports, list_injects, open_db, parse_form,
-    recall_target as ledger_recall, scan_refs, shred_file, AgentError, ExpandReport, ExportRow,
-    InjectRow, RefInfo,
+    recall_target as ledger_recall, scan_pointers, scan_refs, shred_file, AgentError, ExpandReport,
+    ExportRow, InjectRow, RefInfo,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -109,6 +109,38 @@ pub fn materialize_export(
     write_target(&row.target, &bytes, row.perm)
 }
 
+fn adopt_pointers(
+    uv: &glyx_store::UnlockedVault,
+    refs: &mut Vec<RefInfo>,
+    new_text: &mut String,
+    target_str: &str,
+) -> Result<usize, AgentError> {
+    let mut changed = 0;
+    for token in scan_pointers(new_text) {
+        if refs.iter().any(|r| r.locked == token) {
+            continue;
+        }
+        let Ok((id, field)) = uv.open_locked_pointer(&token, target_str) else {
+            continue;
+        };
+        let Some(item) = uv.get_item(&id)? else {
+            continue;
+        };
+        let Some(field_value) = item.fields.get(&field) else {
+            continue;
+        };
+        let value = field_value.value.expose().to_owned();
+        *new_text = new_text.replace(&token, &value);
+        refs.push(RefInfo {
+            item_id: id,
+            field,
+            locked: token,
+        });
+        changed += 1;
+    }
+    Ok(changed)
+}
+
 pub fn materialize_inject(
     uv: &glyx_store::UnlockedVault,
     conn: &Connection,
@@ -188,6 +220,7 @@ pub fn materialize_inject(
             changed += 1;
         }
     }
+    changed += adopt_pointers(uv, &mut refs, &mut new_text, &target_str)?;
     if changed == 0 && new_text == text {
         return Ok(0);
     }
@@ -596,6 +629,102 @@ mod tests {
         let refs = scan_refs(&text);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].1, "password");
+    }
+
+    #[test]
+    fn resolves_committed_pointer_without_ledger_refs() {
+        let _env = ENV_LOCK.lock().expect("lock");
+        let runtime = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
+        let work = tempfile::tempdir().expect("tempdir");
+        let vpath = work.path().join("v.glyx");
+        let suite = glyx_core::CipherSuiteConfig {
+            kdf: glyx_core::KdfId::Argon2id,
+            cipher: glyx_core::Cipher::Xchacha20poly1305,
+            params: glyx_core::KdfParams::mobile(),
+        };
+        glyx_store::Vault::init(&vpath, suite, b"pw", Some(&[1u8; 32])).expect("init");
+        let vault = glyx_store::Vault::open(&vpath).expect("open");
+        let mut uv = vault.unlock(b"pw", &[1u8; 32]).expect("unlock");
+        let hlc = uv.next_hlc().expect("tick");
+        let node = uv.device_node();
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "password".to_owned(),
+            glyx_core::Field {
+                value: glyx_core::SecretString::new("s3cret".to_owned()),
+                field_hlc: hlc,
+            },
+        );
+        let item = glyx_core::Item {
+            id: Uuid::now_v7(),
+            item_type: glyx_core::ItemType::Login,
+            name: "x".to_owned(),
+            folder: String::new(),
+            tags: Vec::new(),
+            fields,
+            hlc,
+            rev: 1,
+            deleted: false,
+            updated_by: node,
+        };
+        let id = item.id;
+        uv.put_item(&item).expect("put");
+
+        let target = work.path().join("public.env");
+        let target_str = target.to_string_lossy().into_owned();
+        let pointer = uv
+            .render_locked(
+                &id,
+                "password",
+                &target_str,
+                glyx_core::LockedForm::EncryptedPointer,
+            )
+            .expect("seal");
+        std::fs::write(&target, format!("user = abc\npassword = {pointer}\n")).expect("write");
+
+        let conn = open_db().expect("db");
+        register_inject(&conn, &target, "encrypted-pointer", None).expect("register");
+        let row = list_injects(&conn)
+            .expect("list")
+            .into_iter()
+            .find(|r| r.target == target)
+            .expect("row");
+        let n = materialize_inject(&uv, &conn, &row, false).expect("materialize");
+        assert_eq!(n, 1);
+        let unlocked_text = std::fs::read_to_string(&target).expect("read");
+        assert!(
+            unlocked_text.contains("password = s3cret"),
+            "{unlocked_text}"
+        );
+        assert!(unlocked_text.contains("user = abc"), "{unlocked_text}");
+
+        let row = list_injects(&conn)
+            .expect("list")
+            .into_iter()
+            .find(|r| r.target == target)
+            .expect("row");
+        let refs: Vec<RefInfo> = serde_json::from_str(&row.refs_json).expect("refs");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].item_id, id);
+
+        teardown_all(&uv).expect("teardown");
+        let locked_text = std::fs::read_to_string(&target).expect("read");
+        assert!(locked_text.contains(&pointer), "{locked_text}");
+        assert!(!locked_text.contains("s3cret"));
+
+        let other = work.path().join("moved.env");
+        std::fs::write(&other, format!("password = {pointer}\n")).expect("write");
+        register_inject(&conn, &other, "encrypted-pointer", None).expect("register");
+        let row = list_injects(&conn)
+            .expect("list")
+            .into_iter()
+            .find(|r| r.target == other)
+            .expect("row");
+        let n = materialize_inject(&uv, &conn, &row, false).expect("materialize");
+        assert_eq!(n, 0);
+        let untouched = std::fs::read_to_string(&other).expect("read");
+        assert!(untouched.contains(&pointer), "{untouched}");
     }
 }
 

@@ -556,6 +556,14 @@ impl UnlockedVault {
         }
     }
 
+    pub fn open_locked_pointer(
+        &self,
+        token: &str,
+        target: &str,
+    ) -> Result<(Uuid, String), StoreError> {
+        glyx_crypto::pointer::open_pointer(&self.key, token, target).map_err(StoreError::from)
+    }
+
     pub fn stamp_merge(&self) -> Result<(), StoreError> {
         self.meta_set("last_merge_ms", glyx_core::ids::wall_ms_now().cast_signed())
     }
