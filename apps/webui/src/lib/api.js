@@ -34,6 +34,7 @@ async function req(method, path, body) {
 
 export const api = {
   status: () => req('GET', '/v1/status'),
+  templates: () => req('GET', '/v1/templates'),
   unlock: (password, keyfile) => req('POST', '/v1/unlock', { password, keyfile }),
   unlockPin: (pin) => req('POST', '/v1/unlock', { pin }),
   lock: () => req('POST', '/v1/lock'),
@@ -47,6 +48,9 @@ export const api = {
   edit: (id, body) => req('PATCH', `/v1/items/${id}`, body),
   remove: (id) => req('DELETE', `/v1/items/${id}`),
   totp: (id) => req('GET', `/v1/items/${id}/totp`),
+  fill: (id, field, timeout = 15) => req('POST', `/v1/items/${id}/fill`, { field, timeout }),
+  rekey: (body) => req('POST', '/v1/vaults/rekey', body),
+  addExport: (body) => req('POST', '/v1/exports', body),
   sshGen: (body) => req('POST', '/v1/ssh-gen', body),
   sync: (body = {}) => req('POST', '/v1/sync', body),
   conflicts: () => req('GET', '/v1/conflicts'),
