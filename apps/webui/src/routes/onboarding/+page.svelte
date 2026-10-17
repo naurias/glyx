@@ -1,5 +1,5 @@
 <script>
-  import { api, configured, desktopBootstrapped } from '$lib/api.js';
+  import { api, configured, bootstrapDesktop } from '$lib/api.js';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
   let vaults = [];
@@ -22,9 +22,20 @@
   }
 
   onMount(async () => {
-    await desktopBootstrapped();
+    bootstrapDesktop();
     if (configured()) await load();
   });
+
+  async function forget(path) {
+    error = '';
+    if (!confirm(`Forget ${path}? The vault files are not deleted.`)) return;
+    try {
+      await api.forgetVault(path);
+      await load();
+    } catch (e) {
+      error = e.message;
+    }
+  }
 
   async function select(path) {
     error = '';
@@ -89,6 +100,7 @@
           </div>
           <span style="flex: 1"></span>
           <button on:click={() => select(v.path)}>Use</button>
+          <button class="danger" on:click={() => forget(v.path)}>Forget</button>
         </div>
       {/each}
       {#if !vaults.length}

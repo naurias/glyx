@@ -1,11 +1,12 @@
 <script>
   import { api } from '$lib/api.js';
   import { onMount } from 'svelte';
-  let data = { exports: [], injects: [] };
+  let data = { exports: [], injects: [], roots: [] };
   let tamper = [];
   let error = '';
   let target = '';
   let form = 'encrypted-pointer';
+  let glob = '*.md';
   let merging = null;
   let hunks = [];
   let picks = {};
@@ -37,8 +38,16 @@
   }
   async function track() {
     try {
-      await api.trackInject(target, form);
+      await api.trackInject(target, form, glob);
       target = '';
+      await load();
+    } catch (e) {
+      error = e.message;
+    }
+  }
+  async function scan() {
+    try {
+      await api.scanInjects();
       await load();
     } catch (e) {
       error = e.message;
@@ -117,6 +126,18 @@
       </div>
     </div>
   {/if}
+  <h3>Tracked folders</h3>
+  {#each data.roots as r}
+    <div class="card row">
+      <span>{r.root}</span>
+      <span class="dim">{r.glob} · {r.form}</span>
+      <span style="flex: 1"></span>
+      <button class="danger" on:click={() => recall(r.root)}>Forget</button>
+    </div>
+  {/each}
+  {#if data.roots.length}
+    <div class="row"><button on:click={scan}>Scan folders</button></div>
+  {/if}
   <h3>Files</h3>
   {#each data.exports as e}
     <div class="card row">
@@ -136,12 +157,13 @@
       <button class="danger" on:click={() => recall(i.target)}>Recall</button>
     </div>
   {/each}
-  {#if !data.exports.length && !data.injects.length}
+  {#if !data.exports.length && !data.injects.length && !data.roots.length}
     <p class="dim">Nothing tracked. Register from the CLI: <code>glyx export add</code>, <code>glyx inject add</code>.</p>
   {/if}
-  <h3>Track a file for injection</h3>
+  <h3>Track a file or folder for injection</h3>
   <div class="row">
-    <input bind:value={target} placeholder="/path/to/.env" style="flex: 1" />
+    <input bind:value={target} placeholder="/path/to/.env or /path/to/folder" style="flex: 1" />
+    <input bind:value={glob} placeholder="*.md" />
     <select bind:value={form}>
       <option value="encrypted-pointer">encrypted-pointer</option>
       <option value="masked">masked</option>

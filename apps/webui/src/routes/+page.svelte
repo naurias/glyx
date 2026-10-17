@@ -1,5 +1,5 @@
 <script>
-  import { api, configure, configured, desktopBootstrapped, bootstrapDesktop } from '$lib/api.js';
+  import { api, configure, configured, bootstrapDesktop } from '$lib/api.js';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
   let url = 'http://127.0.0.1:8080';
@@ -29,7 +29,7 @@
   }
 
   onMount(async () => {
-    desktop = bootstrapDesktop() || (await desktopBootstrapped());
+    desktop = bootstrapDesktop();
     if (desktop) {
       try {
         await loadStatus();

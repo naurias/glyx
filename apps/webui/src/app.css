@@ -37,6 +37,15 @@ button.selected { border-color: var(--accent); }
   margin: 8px 0;
 }
 .dim { color: var(--dim); }
+.note { line-height: 1.55; }
+.note h1, .note h2, .note h3 { margin: 12px 0 6px; }
+.note p { margin: 8px 0; }
+.note ul, .note ol { margin: 8px 0; padding-left: 22px; }
+.note blockquote { margin: 8px 0; padding: 2px 12px; border-left: 3px solid var(--line); color: var(--dim); }
+.note code { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+.note pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
+.note pre code { border: 0; padding: 0; }
+.note a { color: var(--accent); }
 a { color: var(--accent); }
 label { display: grid; gap: 4px; margin: 8px 0; }
 nav { display: flex; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); }

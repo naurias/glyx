@@ -1,10 +1,12 @@
 <script>
   import { api } from '$lib/api.js';
+  import { renderMarkdown } from '$lib/markdown.js';
   import { goto } from '$app/navigation';
   let item_type = 'login';
   let name = '';
   let folder = '';
   let rows = [{ k: 'username', v: '' }];
+  let body = '';
   let error = '';
 
   function addRow() {
@@ -14,13 +16,18 @@
     error = '';
     try {
       const fields = {};
-      for (const r of rows) if (r.k) fields[r.k] = r.v;
+      if (item_type === 'note') {
+        fields.body = body;
+      } else {
+        for (const r of rows) if (r.k) fields[r.k] = r.v;
+      }
       const res = await api.create({ type: item_type, name, folder, fields });
       goto(`/items/${res.id}`);
     } catch (e) {
       error = e.message;
     }
   }
+  $: bodyPreview = renderMarkdown(body);
 </script>
 
 <nav>
@@ -42,14 +49,23 @@
   </label>
   <label>Name<input bind:value={name} /></label>
   <label>Folder<input bind:value={folder} /></label>
-  {#each rows as row}
-    <div class="row">
-      <input bind:value={row.k} placeholder="field" />
-      <input bind:value={row.v} placeholder="value" style="flex: 1" />
+  {#if item_type === 'note'}
+    <label>Note (markdown)
+      <textarea bind:value={body} rows="12"></textarea>
+    </label>
+    <div class="card note">{@html bodyPreview}</div>
+  {:else}
+    {#each rows as row}
+      <div class="row">
+        <input bind:value={row.k} placeholder="field" />
+        <input bind:value={row.v} placeholder="value" style="flex: 1" />
+      </div>
+    {/each}
+    <div class="row" style="margin-top: 8px">
+      <button on:click={addRow}>Field</button>
     </div>
-  {/each}
+  {/if}
   <div class="row" style="margin-top: 8px">
-    <button on:click={addRow}>Field</button>
     <button class="primary" on:click={submit}>Save</button>
   </div>
 </main>
