@@ -635,7 +635,8 @@ fn dispatch_grouped(ctx: &Ctx, cmd: Cmd) -> Result<()> {
         | Cmd::Edit { .. }
         | Cmd::Rm { .. }
         | Cmd::Totp { .. }
-        | Cmd::Fill { .. } => unreachable!("item commands handled in dispatch"),
+        | Cmd::Fill { .. }
+        | Cmd::Tui => unreachable!("interactive commands handled in dispatch"),
     }
 }
 
@@ -717,6 +718,18 @@ fn dispatch_inject(ctx: &Ctx, cmd: InjectCmd) -> Result<()> {
             exports::cmd_inject_add(&file, &form, glob.as_deref(), ctx.json)
         }
         InjectCmd::Scan => exports::cmd_inject_scan(ctx.json),
+        InjectCmd::Unlock { target, force } => {
+            let mut uv = ctx.unlocked()?;
+            exports::cmd_target_unlock(&mut uv, &target, force, ctx.json)
+        }
+        InjectCmd::Lock { target } => {
+            let uv = ctx.unlocked()?;
+            exports::cmd_target_lock(&uv, &target, ctx.json)
+        }
+        InjectCmd::Move { old, new } => {
+            let uv = ctx.unlocked()?;
+            exports::cmd_target_move(&uv, &old, &new, ctx.json)
+        }
         InjectCmd::Rm { target } => exports::cmd_inject_rm(&target, ctx.json),
         InjectCmd::Ls => exports::cmd_ls(ctx.json),
     }
@@ -901,11 +914,16 @@ fn vault_rekey(
     Ok(())
 }
 
-fn cmd_unlock(ctx: &Ctx, ttl: Option<u64>, with_pin: bool) -> Result<()> {
+fn cmd_unlock(ctx: &Ctx, ttl: Option<u64>, with_pin: bool, no_materialize: bool) -> Result<()> {
     let vault_path = ctx.vault_path()?;
     let vault = glyx_store::Vault::open(&vault_path)?;
     let mut uv = auth::full_unlock(&vault, ctx.keyfile.as_deref(), ctx.password_env.as_deref())?;
-    let rep = glyx_agent::enforce_all(&mut uv, false).map_err(|e| anyhow::anyhow!(e))?;
+    let auto = !no_materialize && auth::load_config().auto_materialize;
+    let rep = if auto {
+        glyx_agent::enforce_all(&mut uv, false).map_err(|e| anyhow::anyhow!(e))?
+    } else {
+        glyx_agent::MaterializeReport::default()
+    };
     let ttl = ttl.unwrap_or(auth::load_config().session_ttl_min);
     if with_pin {
         let pin = rpassword::prompt_password("new PIN: ").context("cannot read PIN")?;
@@ -917,15 +935,24 @@ fn cmd_unlock(ctx: &Ctx, ttl: Option<u64>, with_pin: bool) -> Result<()> {
         uv.write_plain_session(ttl)?;
     }
     if ctx.json {
-        println!("{}", serde_json::json!({"ok": true, "ttl_min": ttl}));
+        println!(
+            "{}",
+            serde_json::json!({"ok": true, "ttl_min": ttl, "materialized": auto})
+        );
     } else {
         println!("unlocked for {ttl} minutes");
-        println!(
-            "exports: {} file(s), {} injection(s)",
-            rep.files, rep.injected
-        );
-        for s in &rep.skipped {
-            println!("skipped: {s} (run export enforce --force)");
+        if auto {
+            println!(
+                "exports: {} file(s), {} injection(s)",
+                rep.files, rep.injected
+            );
+            for s in &rep.skipped {
+                println!("skipped: {s} (run export enforce --force)");
+            }
+        } else {
+            println!(
+                "auto-materialize off: unlock tracked targets with `glyx inject unlock <target>`"
+            );
         }
     }
     Ok(())
