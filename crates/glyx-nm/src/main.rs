@@ -50,10 +50,18 @@ pub fn resolve_vault() -> Result<PathBuf> {
             return Ok(path);
         }
     }
+    if let Ok(current) = std::env::var("GLYX_CONFIG") {
+        if let Some(path) = vault_from_config(std::path::Path::new(&current)) {
+            return Ok(path);
+        }
+    }
+    if let Some(path) = vault_from_config(&default_config_path()) {
+        return Ok(path);
+    }
     let path = bridge_config_path();
     let text = std::fs::read_to_string(&path).with_context(|| {
         format!(
-            "no bridge config at {}; run glyx extension install",
+            "no selected vault; run glyx extension install or select a vault (bridge config {} missing)",
             path.display()
         )
     })?;
@@ -64,10 +72,27 @@ pub fn resolve_vault() -> Result<PathBuf> {
         .context("bridge config has no vault path")
 }
 
-pub fn daemon_record(vault_path: &std::path::Path) -> Result<DaemonRecord> {
-    let vault = glyx_store::Vault::open(vault_path)?;
-    let id = vault.config().vault_id;
-    let path = glyx_store::session::session_dir().join(format!("daemon-{}.json", id.as_simple()));
+fn default_config_path() -> PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME").map_or_else(
+        |_| {
+            std::env::var("HOME")
+                .map_or_else(|_| PathBuf::from("."), |h| PathBuf::from(h).join(".config"))
+        },
+        PathBuf::from,
+    );
+    base.join("glyx").join("config.toml")
+}
+
+fn vault_from_config(path: &std::path::Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let cfg: toml::Value = toml::from_str(&text).ok()?;
+    let current = cfg.get("current_vault")?.as_str()?;
+    let vault = PathBuf::from(current);
+    vault.exists().then_some(vault)
+}
+
+pub fn daemon_record(_vault_path: &std::path::Path) -> Result<DaemonRecord> {
+    let path = glyx_store::session::session_dir().join("daemon.json");
     let bytes = std::fs::read(&path).context("daemon offline: run glyx daemon start")?;
     serde_json::from_slice(&bytes).context("bad daemon record")
 }

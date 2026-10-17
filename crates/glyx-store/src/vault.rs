@@ -20,7 +20,7 @@ impl Vault {
         path: &Path,
         suite: glyx_core::CipherSuiteConfig,
         password: &[u8],
-        keyfile: &[u8; 32],
+        keyfile: Option<&[u8; 32]>,
     ) -> Result<Self, StoreError> {
         if path.exists() {
             return Err(StoreError::AlreadyExists(path.display().to_string()));
@@ -31,10 +31,11 @@ impl Vault {
         fs::create_dir_all(path.join(layout::HISTORY_DIR))?;
         fs::create_dir_all(path.join(layout::CONFLICTS_DIR))?;
         let _session = lock_file(path)?;
-        let config = glyx_core::VaultConfig::new(Uuid::now_v7(), suite);
+        let keyfile_bytes = keyfile.copied().unwrap_or([0u8; 32]);
+        let config = glyx_core::VaultConfig::new(Uuid::now_v7(), suite, keyfile.is_some());
         config.validate()?;
         atomic_write(&path.join(layout::VAULT_TOML), config.to_toml()?.as_bytes())?;
-        let (key, slot) = glyx_crypto::seal_fresh_vault(password, keyfile, suite.params)?;
+        let (key, slot) = glyx_crypto::seal_fresh_vault(password, &keyfile_bytes, suite.params)?;
         drop(key);
         atomic_write(
             &path.join(layout::KEYSLOTS_DIR).join(slot.filename()),
@@ -75,6 +76,10 @@ impl Vault {
     #[must_use]
     pub fn config(&self) -> &glyx_core::VaultConfig {
         &self.config
+    }
+    #[must_use]
+    pub fn keyfile_required(&self) -> bool {
+        self.config.keyfile_required
     }
     pub fn unlock(&self, password: &[u8], keyfile: &[u8; 32]) -> Result<UnlockedVault, StoreError> {
         let dir = fs::read_dir(self.path.join(layout::KEYSLOTS_DIR))?;
@@ -224,6 +229,10 @@ impl UnlockedVault {
     #[must_use]
     pub fn vault_path(&self) -> PathBuf {
         self.path.clone()
+    }
+    #[must_use]
+    pub fn config(&self) -> &glyx_core::VaultConfig {
+        &self.config
     }
     #[must_use]
     pub fn device_node(&self) -> glyx_core::DeviceId {
@@ -511,6 +520,15 @@ impl UnlockedVault {
             self.config.to_toml()?.as_bytes(),
         )?;
         Ok(n)
+    }
+
+    pub fn set_keyfile_required(&mut self, required: bool) -> Result<(), StoreError> {
+        self.config.keyfile_required = required;
+        atomic_write(
+            &self.path.join(layout::VAULT_TOML),
+            self.config.to_toml()?.as_bytes(),
+        )?;
+        Ok(())
     }
 
     pub fn last_merge_ms(&self) -> Result<Option<u64>, StoreError> {
@@ -982,6 +1000,46 @@ mod tests {
     }
 
     #[test]
+    fn password_only_vault_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nodkf.glyx");
+        Vault::init(
+            &path,
+            suite(glyx_core::Cipher::Xchacha20poly1305),
+            b"pw",
+            None,
+        )
+        .expect("init");
+        let vault = Vault::open(&path).expect("open");
+        assert!(!vault.keyfile_required());
+        let mut unlocked = vault
+            .unlock(b"pw", &glyx_crypto::ZERO_KEYFILE)
+            .expect("unlock with zero keyfile");
+        let item = test_item(glyx_core::DeviceId::zero());
+        unlocked.put_item(&item).expect("put");
+        drop(unlocked);
+        assert!(vault.unlock(b"pw", &[7u8; 32]).is_err());
+        assert!(vault.unlock(b"pw", &glyx_crypto::ZERO_KEYFILE).is_ok());
+    }
+
+    #[test]
+    fn keyfile_vault_rejects_zero_keyfile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kf.glyx");
+        Vault::init(
+            &path,
+            suite(glyx_core::Cipher::Xchacha20poly1305),
+            b"pw",
+            Some(&[5u8; 32]),
+        )
+        .expect("init");
+        let vault = Vault::open(&path).expect("open");
+        assert!(vault.keyfile_required());
+        assert!(vault.unlock(b"pw", &glyx_crypto::ZERO_KEYFILE).is_err());
+        assert!(vault.unlock(b"pw", &[5u8; 32]).is_ok());
+    }
+
+    #[test]
     fn vault_lifecycle_both_ciphers() {
         for cipher in [
             glyx_core::Cipher::Xchacha20poly1305,
@@ -990,7 +1048,7 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("test.glyx");
             let keyfile = [9u8; 32];
-            Vault::init(&path, suite(cipher), b"password", &keyfile).expect("init");
+            Vault::init(&path, suite(cipher), b"password", Some(&keyfile)).expect("init");
             let vault = Vault::open(&path).expect("open");
             assert!(vault.unlock(b"wrong", &keyfile).is_err());
             let mut unlocked = vault.unlock(b"password", &keyfile).expect("unlock");
@@ -1050,7 +1108,7 @@ mod m1_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("t.glyx");
         let kf = [1u8; 32];
-        Vault::init(&path, mobile_suite(), b"pw", &kf).expect("init");
+        Vault::init(&path, mobile_suite(), b"pw", Some(&kf)).expect("init");
         let vault = Vault::open(&path).expect("open");
         let mut uv = vault.unlock(b"pw", &kf).expect("unlock");
         let hlc = uv.next_hlc().expect("tick");
@@ -1080,7 +1138,7 @@ mod m1_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("h.glyx");
         let kf = [2u8; 32];
-        Vault::init(&path, mobile_suite(), b"pw", &kf).expect("init");
+        Vault::init(&path, mobile_suite(), b"pw", Some(&kf)).expect("init");
         let first = {
             let vault = Vault::open(&path).expect("open");
             let mut uv = vault.unlock(b"pw", &kf).expect("unlock");
@@ -1095,7 +1153,7 @@ mod m1_tests {
     fn slot_rotation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("s.glyx");
-        Vault::init(&path, mobile_suite(), b"pw", &[3u8; 32]).expect("init");
+        Vault::init(&path, mobile_suite(), b"pw", Some(&[3u8; 32])).expect("init");
         let vault = Vault::open(&path).expect("open");
         let uv = vault.unlock(b"pw", &[3u8; 32]).expect("unlock");
         let id = uv.add_slot(b"new", &[4u8; 32]).expect("add");
@@ -1114,7 +1172,7 @@ mod m1_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("r.glyx");
         let kf = [5u8; 32];
-        Vault::init(&path, mobile_suite(), b"pw", &kf).expect("init");
+        Vault::init(&path, mobile_suite(), b"pw", Some(&kf)).expect("init");
         let vault = Vault::open(&path).expect("open");
         let mut uv = vault.unlock(b"pw", &kf).expect("unlock");
         let hlc = uv.next_hlc().expect("tick");
@@ -1190,7 +1248,7 @@ mod test_helpers {
             cipher: glyx_core::Cipher::Xchacha20poly1305,
             params: glyx_core::KdfParams::mobile(),
         };
-        Vault::init(&a, suite, b"pw", &[9u8; 32]).expect("init");
+        Vault::init(&a, suite, b"pw", Some(&[9u8; 32])).expect("init");
         copy_dir(&a, &b);
         fs::remove_file(b.join("device.id")).ok();
         (dir, a, b)
@@ -1368,7 +1426,7 @@ mod m2_tests {
             cipher: glyx_core::Cipher::Xchacha20poly1305,
             params: glyx_core::KdfParams::mobile(),
         };
-        Vault::init(&path, suite, b"pw", &[9u8; 32]).expect("init");
+        Vault::init(&path, suite, b"pw", Some(&[9u8; 32])).expect("init");
         let vault = Vault::open(&path).expect("open");
         let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
         let item = m1_item(&mut uv, "gone", &[("password", "p")]);

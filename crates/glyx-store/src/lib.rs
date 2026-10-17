@@ -1,8 +1,10 @@
 pub mod blob;
+pub mod config;
 pub mod conflicts;
 pub mod envelope;
 pub mod error;
 pub mod index;
+pub mod keyfile;
 pub mod layout;
 pub mod present;
 pub mod session;

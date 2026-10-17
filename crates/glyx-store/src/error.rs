@@ -14,6 +14,8 @@ pub enum StoreError {
     Corrupt(String),
     #[error("vault already exists at {0}")]
     AlreadyExists(String),
+    #[error("config: {0}")]
+    Config(String),
     #[error("no item matching {0:?}")]
     NotFound(String),
     #[error("ambiguous query, matches {1} items")]
