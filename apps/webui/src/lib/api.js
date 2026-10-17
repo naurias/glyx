@@ -18,23 +18,6 @@ export function bootstrapDesktop() {
   return false;
 }
 
-export const desktopBootstrapped = async () => {
-  if (typeof window === 'undefined') return false;
-  if (bootstrapDesktop()) return true;
-  if (window.__TAURI__?.core?.invoke) {
-    try {
-      const info = await window.__TAURI__.core.invoke('daemon_info');
-      if (info?.url && info?.token) {
-        configure(info.url, info.token);
-        return true;
-      }
-    } catch {
-      return false;
-    }
-  }
-  return false;
-};
-
 async function req(method, path, body) {
   const res = await fetch(base + path, {
     method,
@@ -59,6 +42,7 @@ export const api = {
     return req('GET', '/v1/items' + (q ? `?${q}` : ''));
   },
   show: (id, reveal = false) => req('GET', `/v1/items/${id}?reveal=${reveal}`),
+  rendered: (id, reveal = false) => req('GET', `/v1/items/${id}/rendered?reveal=${reveal}`),
   create: (body) => req('POST', '/v1/items', body),
   edit: (id, body) => req('PATCH', `/v1/items/${id}`, body),
   remove: (id) => req('DELETE', `/v1/items/${id}`),
@@ -73,7 +57,8 @@ export const api = {
   exports: () => req('GET', '/v1/exports'),
   recall: (target) => req('DELETE', `/v1/exports?target=${encodeURIComponent(target)}`),
   enforce: (force) => req('POST', '/v1/exports/enforce', { force }),
-  trackInject: (target, form) => req('POST', '/v1/injects', { target, form }),
+  trackInject: (target, form, glob) => req('POST', '/v1/injects', { target, form, glob }),
+  scanInjects: () => req('POST', '/v1/injects/scan'),
   tamper: () => req('GET', '/v1/agent/tamper'),
   resolveTamper: (target, action) => req('POST', '/v1/agent/resolve', { target, action }),
   mergePreview: (target) => req('GET', `/v1/agent/merge?target=${encodeURIComponent(target)}`),
