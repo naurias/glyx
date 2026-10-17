@@ -385,6 +385,89 @@ pub fn cmd_inject_rm(target: &std::path::Path, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn cmd_target_unlock(
+    uv: &mut glyx_store::UnlockedVault,
+    target: &std::path::Path,
+    force: bool,
+    as_json: bool,
+) -> Result<()> {
+    let rep = glyx_agent::materialize_target(uv, target, force).map_err(|e| anyhow::anyhow!(e))?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true, "files": rep.files, "injected": rep.injected,
+                "scanned": rep.scanned, "skipped": rep.skipped,
+            })
+        );
+    } else {
+        println!(
+            "unlocked {} ({} file(s), {} injection(s))",
+            target.display(),
+            rep.files,
+            rep.injected
+        );
+        for s in &rep.skipped {
+            println!("skipped: {s} (use --force)");
+        }
+    }
+    Ok(())
+}
+
+pub fn cmd_target_lock(
+    uv: &glyx_store::UnlockedVault,
+    target: &std::path::Path,
+    as_json: bool,
+) -> Result<()> {
+    let rep = glyx_agent::teardown_targets(uv, Some(target)).map_err(|e| anyhow::anyhow!(e))?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true, "wiped": rep.wiped, "restored": rep.restored, "drifted": rep.drifted,
+            })
+        );
+    } else {
+        println!(
+            "locked {} (wiped {}, restored {})",
+            target.display(),
+            rep.wiped,
+            rep.restored
+        );
+        for d in &rep.drifted {
+            println!("drifted: {d}");
+        }
+    }
+    Ok(())
+}
+
+pub fn cmd_target_move(
+    uv: &glyx_store::UnlockedVault,
+    old: &std::path::Path,
+    new: &std::path::Path,
+    as_json: bool,
+) -> Result<()> {
+    let rep = glyx_agent::relocate_target(uv, old, new).map_err(|e| anyhow::anyhow!(e))?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true, "exports": rep.exports, "roots": rep.roots, "injects": rep.injects,
+            })
+        );
+    } else {
+        println!(
+            "moved {} -> {} ({} export(s), {} root(s), {} inject(s))",
+            old.display(),
+            new.display(),
+            rep.exports,
+            rep.roots,
+            rep.injects
+        );
+    }
+    Ok(())
+}
+
 pub fn cmd_ssh_export(
     uv: &mut glyx_store::UnlockedVault,
     query: &str,

@@ -21,6 +21,8 @@ rpassword.workspace = true
 arboard.workspace = true
 uuid.workspace = true
 inquire = { workspace = true, features = ["crossterm"] }
+ratatui.workspace = true
+crossterm.workspace = true
 glyx-core = { path = "../glyx-core" }
 glyx-crypto = { path = "../glyx-crypto" }
 glyx-store = { path = "../glyx-store" }
