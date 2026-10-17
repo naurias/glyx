@@ -10,13 +10,50 @@ use axum::routing::{get, post};
 use axum::{middleware, Router};
 use serde::Deserialize;
 pub struct AppState {
-    pub vault_path: PathBuf,
+    pub active: Mutex<Option<PathBuf>>,
     pub vault: Mutex<Option<glyx_store::UnlockedVault>>,
     pub token: String,
+    pub port: Mutex<u16>,
     pub idle_lock_ms: u64,
     pub last_activity_ms: Mutex<u64>,
     pub agent_stop: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
     pub tamper: Mutex<Vec<String>>,
+}
+
+impl AppState {
+    fn active_path(&self) -> Option<PathBuf> {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn active_vault(&self) -> Result<(PathBuf, glyx_store::Vault), glyx_store::StoreError> {
+        let path = self
+            .active_path()
+            .ok_or_else(|| glyx_store::StoreError::Corrupt("no vault selected".into()))?;
+        let vault = glyx_store::Vault::open(&path)?;
+        Ok((path, vault))
+    }
+
+    fn publish_record(&self) {
+        let active = self.active_path();
+        let vault_id = active
+            .as_ref()
+            .and_then(|p| glyx_store::Vault::open(p).ok())
+            .map(|v| v.config().vault_id);
+        let port = *self
+            .port
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = glyx_daemon::runtime::write_record(&glyx_daemon::runtime::DaemonRecord {
+            port,
+            pid: std::process::id(),
+            token: self.token.clone(),
+            vault_id,
+            vault_path: active,
+        });
+    }
 }
 
 fn now_ms() -> u64 {
@@ -81,6 +118,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .fallback(ui_fallback)
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
+        .route(
+            "/v1/vaults",
+            get(list_vaults).post(add_vault).delete(forget_vault),
+        )
+        .route("/v1/vaults/create", post(create_vault))
+        .route("/v1/vaults/select", post(select_vault))
+        .route("/v1/settings", get(get_settings).post(set_settings))
         .route("/v1/unlock", post(unlock))
         .route("/v1/lock", post(lock))
         .route("/v1/items", get(list_items).post(create_item))
@@ -104,6 +148,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/injects", post(add_inject))
         .route("/v1/agent/tamper", get(agent_tamper))
         .route("/v1/agent/resolve", post(agent_resolve))
+        .route(
+            "/v1/agent/merge",
+            get(agent_merge_preview).post(agent_merge_apply),
+        )
         .route("/v1/ssh/env", get(ssh_env))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state)
@@ -146,26 +194,38 @@ async fn health() -> impl IntoResponse {
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let active = state.active_path();
+    let vault_info = active.as_ref().and_then(|p| {
+        glyx_store::Vault::open(p).ok().map(|v| {
+            serde_json::json!({
+                "path": p,
+                "vault_id": v.config().vault_id,
+                "keyfile_required": v.keyfile_required(),
+            })
+        })
+    });
     let guard = state
         .vault
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match guard.as_ref() {
-        None => Json(serde_json::json!({"locked": true})),
+    let mut report = match guard.as_ref() {
+        None => serde_json::json!({"locked": true}),
         Some(uv) => {
             let headers = uv.list(true).unwrap_or_default();
             let live = headers.iter().filter(|r| !r.deleted).count();
             let conflicts = uv.list_conflicts().map_or(0, |c| c.len());
             let last_merge = uv.last_merge_ms().unwrap_or(None);
-            Json(serde_json::json!({
+            serde_json::json!({
                 "locked": false,
                 "envelopes": headers.len(),
                 "live": live,
                 "conflicts": conflicts,
                 "last_merge_ms": last_merge,
-            }))
+            })
         }
-    }
+    };
+    report["vault"] = vault_info.unwrap_or(serde_json::Value::Null);
+    Json(report)
 }
 
 #[derive(Deserialize)]
@@ -179,26 +239,32 @@ async fn unlock(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UnlockBody>,
 ) -> impl IntoResponse {
-    let vault = match glyx_store::Vault::open(&state.vault_path) {
-        Ok(v) => v,
+    let vault = match state.active_vault() {
+        Ok((_, v)) => v,
         Err(e) => return store_error(&e).into_response(),
     };
     let vault_id = vault.config().vault_id;
+    let keyfile_required = vault.keyfile_required();
     let result = tokio::task::spawn_blocking(move || {
         if let Some(pin) = body.pin {
             return vault.open_session(Some(pin.as_bytes())).and_then(|opt| {
                 opt.ok_or_else(|| glyx_store::StoreError::Corrupt("bad PIN".into()))
             });
         }
-        let kf_path = body.keyfile.ok_or_else(|| {
-            glyx_store::StoreError::Corrupt("password and keyfile required".into())
-        })?;
-        let kf_bytes = std::fs::read(&kf_path).map_err(glyx_store::StoreError::from)?;
-        if kf_bytes.len() != 32 {
-            return Err(glyx_store::StoreError::Corrupt("bad keyfile".into()));
-        }
-        let mut kf = [0u8; 32];
-        kf.copy_from_slice(&kf_bytes);
+        let kf = if keyfile_required {
+            let kf_path = body.keyfile.ok_or_else(|| {
+                glyx_store::StoreError::Corrupt("this vault requires a keyfile".into())
+            })?;
+            let bytes = std::fs::read(&kf_path).map_err(glyx_store::StoreError::from)?;
+            if bytes.len() != 32 {
+                return Err(glyx_store::StoreError::Corrupt("bad keyfile".into()));
+            }
+            let mut kf = [0u8; 32];
+            kf.copy_from_slice(&bytes);
+            kf
+        } else {
+            glyx_crypto::ZERO_KEYFILE
+        };
         let pw = body.password.unwrap_or_default();
         vault.unlock(pw.as_bytes(), &kf)
     })
@@ -249,11 +315,15 @@ fn stop_agent_socket(state: &AppState) {
     {
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    if let Ok(vault) = glyx_store::Vault::open(&state.vault_path) {
-        glyx_agent::ssh_agent::stop(&glyx_agent::ssh_agent::socket_path(
-            &vault.config().vault_id,
-        ));
+}
+
+fn release_vault(uv: &glyx_store::UnlockedVault) {
+    if glyx_agent::teardown_all(uv).is_err() {
+        eprintln!("agent teardown failed");
     }
+    let vault_id = uv.config().vault_id;
+    glyx_agent::ssh_agent::stop(&glyx_agent::ssh_agent::socket_path(&vault_id));
+    glyx_store::session::wipe_ticket(&vault_id);
 }
 
 fn do_lock(state: &AppState) {
@@ -262,15 +332,9 @@ fn do_lock(state: &AppState) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
-    if let Some(uv) = taken.as_ref() {
-        if glyx_agent::teardown_all(uv).is_err() {
-            eprintln!("agent teardown failed");
-        }
-    }
-    drop(taken);
     stop_agent_socket(state);
-    if let Ok(vault) = glyx_store::Vault::open(&state.vault_path) {
-        glyx_store::session::wipe_ticket(&vault.config().vault_id);
+    if let Some(uv) = taken.as_ref() {
+        release_vault(uv);
     }
 }
 
@@ -640,32 +704,38 @@ async fn sync(State(state): State<Arc<AppState>>, Json(body): Json<SyncBody>) ->
         Ok(v) => v,
         Err(e) => return store_error(&e).into_response(),
     };
-    let Some(kf_path) = body.other_keyfile else {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({"error": "other_keyfile required"})),
-        )
-            .into_response();
-    };
-    let kf_bytes = match std::fs::read(&kf_path) {
-        Ok(b) => b,
-        Err(e) => {
+    let kf = if other_vault.keyfile_required() {
+        let Some(kf_path) = body.other_keyfile else {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({"error": e.to_string()})),
+                Json(serde_json::json!({"error": "other_keyfile required"})),
             )
                 .into_response();
+        };
+        match std::fs::read(&kf_path) {
+            Ok(bytes) if bytes.len() == 32 => {
+                let mut kf = [0u8; 32];
+                kf.copy_from_slice(&bytes);
+                kf
+            }
+            Ok(_) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({"error": "bad keyfile"})),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
         }
+    } else {
+        glyx_crypto::ZERO_KEYFILE
     };
-    if kf_bytes.len() != 32 {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({"error": "bad keyfile"})),
-        )
-            .into_response();
-    }
-    let mut kf = [0u8; 32];
-    kf.copy_from_slice(&kf_bytes);
     let pw = body.other_password.unwrap_or_default();
     let other_uv = match other_vault.unlock(pw.as_bytes(), &kf) {
         Ok(v) => v,
@@ -837,8 +907,8 @@ async fn doctor(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .vault
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let vault = match glyx_store::Vault::open(&state.vault_path) {
-        Ok(v) => v,
+    let vault = match state.active_vault() {
+        Ok((_, v)) => v,
         Err(e) => return store_error(&e).into_response(),
     };
     let headers = vault.scan_headers().unwrap_or_default();
@@ -1154,6 +1224,85 @@ async fn agent_resolve(
         .into_response()
 }
 
+async fn agent_merge_preview(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<TargetQuery>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    match glyx_agent::engine::preview_merge(uv, &q.target) {
+        Ok(preview) => Json(serde_json::json!({
+            "target": preview.target,
+            "hunks": preview.hunks,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct MergeApplyBody {
+    target: PathBuf,
+    picks: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+}
+
+async fn agent_merge_apply(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<MergeApplyBody>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let mut picks = std::collections::BTreeMap::new();
+    for (idx, choice) in body.picks.unwrap_or_default() {
+        let idx: usize = match idx.parse() {
+            Ok(i) => i,
+            Err(_) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({"error": "bad hunk index"})),
+                )
+                    .into_response();
+            }
+        };
+        let pick = if choice == "theirs" {
+            glyx_agent::merge::Pick::Theirs
+        } else if choice == "ours" {
+            glyx_agent::merge::Pick::Ours
+        } else if let Some(custom) = choice.get("custom").and_then(|v| v.as_str()) {
+            glyx_agent::merge::Pick::Custom(custom.to_owned())
+        } else {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "pick must be theirs, ours, or {custom}"})),
+            )
+                .into_response();
+        };
+        picks.insert(idx, pick);
+    }
+    match glyx_agent::engine::apply_merge(uv, &body.target, &picks) {
+        Ok(merged) => Json(serde_json::json!({"ok": true, "bytes": merged.len()})).into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn ssh_env(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let _ = state;
     match glyx_agent::ssh_agent::live_socket() {
@@ -1166,21 +1315,280 @@ async fn ssh_env(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
+fn preset_params(preset: Option<&str>) -> glyx_core::KdfParams {
+    match preset {
+        Some("hardened") => glyx_core::KdfParams::hardened(),
+        Some("mobile") => glyx_core::KdfParams::mobile(),
+        _ => glyx_core::KdfParams::balanced(),
+    }
+}
+
+fn cipher_of(name: Option<&str>) -> glyx_core::Cipher {
+    match name {
+        Some("aesgcm" | "aes256gcm" | "aes-gcm" | "aes") => glyx_core::Cipher::Aes256gcm,
+        _ => glyx_core::Cipher::Xchacha20poly1305,
+    }
+}
+
+#[derive(Deserialize)]
+struct VaultAddBody {
+    path: PathBuf,
+    name: Option<String>,
+    keyfile: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VaultCreateBody {
+    path: PathBuf,
+    name: Option<String>,
+    preset: Option<String>,
+    cipher: Option<String>,
+    password: String,
+    keyfile: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VaultSelectBody {
+    path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct ForgetQuery {
+    path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct SettingsBody {
+    daemon_on_exit: Option<String>,
+    mode: Option<String>,
+    session_ttl_min: Option<u64>,
+}
+
+fn vault_json(
+    entry: &glyx_store::config::VaultEntry,
+    current: Option<&std::path::Path>,
+) -> serde_json::Value {
+    let opened = glyx_store::Vault::open(&entry.path);
+    let (valid, vault_id, keyfile_required, error) = match opened {
+        Ok(v) => (
+            true,
+            Some(v.config().vault_id),
+            Some(v.keyfile_required()),
+            None,
+        ),
+        Err(e) => (false, entry.vault_id, None, Some(e.to_string())),
+    };
+    let is_current = current.is_some_and(|c| {
+        glyx_store::config::normalize(c) == glyx_store::config::normalize(&entry.path)
+    });
+    serde_json::json!({
+        "path": entry.path,
+        "name": entry.name,
+        "label": entry.label(),
+        "vault_id": vault_id,
+        "keyfile_required": keyfile_required,
+        "keyfile": entry.keyfile,
+        "last_used_ms": entry.last_used_ms,
+        "valid": valid,
+        "error": error,
+        "current": is_current,
+    })
+}
+
+async fn list_vaults(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = glyx_store::config::load();
+    let current = cfg.current_vault.clone();
+    let vaults: Vec<_> = cfg
+        .vaults
+        .iter()
+        .map(|e| vault_json(e, current.as_deref()))
+        .collect();
+    Json(serde_json::json!({"current": current, "vaults": vaults}))
+}
+
+async fn add_vault(
+    State(_state): State<Arc<AppState>>,
+    Json(body): Json<VaultAddBody>,
+) -> impl IntoResponse {
+    let vault = match glyx_store::Vault::open(&body.path) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    let mut cfg = glyx_store::config::load();
+    cfg.register(glyx_store::config::VaultEntry {
+        path: body.path.clone(),
+        name: body.name,
+        vault_id: Some(vault.config().vault_id),
+        keyfile: body.keyfile.map(PathBuf::from),
+        last_used_ms: 0,
+    });
+    if let Err(e) = glyx_store::config::save(&cfg) {
+        return store_error(&e).into_response();
+    }
+    Json(serde_json::json!({"ok": true, "vault_id": vault.config().vault_id})).into_response()
+}
+
+async fn create_vault(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<VaultCreateBody>,
+) -> impl IntoResponse {
+    let suite = glyx_core::CipherSuiteConfig {
+        kdf: glyx_core::KdfId::Argon2id,
+        cipher: cipher_of(body.cipher.as_deref()),
+        params: preset_params(body.preset.as_deref()),
+    };
+    let kf = match body.keyfile.as_deref() {
+        Some(p) => match glyx_store::keyfile::load_or_create(std::path::Path::new(p)) {
+            Ok(k) => Some(k),
+            Err(e) => return store_error(&e).into_response(),
+        },
+        None => None,
+    };
+    let path = body.path.clone();
+    let password = body.password.clone();
+    let created = tokio::task::spawn_blocking(move || {
+        glyx_store::Vault::init(&path, suite, password.as_bytes(), kf.as_ref())
+    })
+    .await;
+    let vault = match created {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return store_error(&e).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let mut cfg = glyx_store::config::load();
+    cfg.register(glyx_store::config::VaultEntry {
+        path: body.path.clone(),
+        name: body.name,
+        vault_id: Some(vault.config().vault_id),
+        keyfile: body.keyfile.map(PathBuf::from),
+        last_used_ms: 0,
+    });
+    cfg.select(&body.path);
+    if let Err(e) = glyx_store::config::save(&cfg) {
+        return store_error(&e).into_response();
+    }
+    do_lock(&state);
+    *state
+        .active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(body.path.clone());
+    state.publish_record();
+    Json(serde_json::json!({
+        "ok": true,
+        "vault_id": vault.config().vault_id,
+        "keyfile_required": vault.keyfile_required(),
+    }))
+    .into_response()
+}
+
+async fn select_vault(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<VaultSelectBody>,
+) -> impl IntoResponse {
+    if let Err(e) = glyx_store::Vault::open(&body.path) {
+        return store_error(&e).into_response();
+    }
+    let mut cfg = glyx_store::config::load();
+    cfg.select(&body.path);
+    if let Err(e) = glyx_store::config::save(&cfg) {
+        return store_error(&e).into_response();
+    }
+    do_lock(&state);
+    *state
+        .active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(body.path.clone());
+    state.publish_record();
+    Json(serde_json::json!({"ok": true, "path": body.path})).into_response()
+}
+
+async fn forget_vault(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ForgetQuery>,
+) -> impl IntoResponse {
+    let mut cfg = glyx_store::config::load();
+    let was_current = cfg.current_vault.as_deref().is_some_and(|p| {
+        glyx_store::config::normalize(p) == glyx_store::config::normalize(&q.path)
+    });
+    cfg.remove(&q.path);
+    if let Err(e) = glyx_store::config::save(&cfg) {
+        return store_error(&e).into_response();
+    }
+    if was_current {
+        do_lock(&state);
+        *state
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        state.publish_record();
+    }
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+async fn get_settings(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = glyx_store::config::load();
+    Json(serde_json::json!({
+        "daemon_on_exit": cfg.daemon_on_exit,
+        "mode": cfg.mode,
+        "session_ttl_min": cfg.session_ttl_min,
+    }))
+}
+
+async fn set_settings(
+    State(_state): State<Arc<AppState>>,
+    Json(body): Json<SettingsBody>,
+) -> impl IntoResponse {
+    let mut cfg = glyx_store::config::load();
+    if let Some(v) = body.daemon_on_exit.as_deref() {
+        cfg.daemon_on_exit = match v {
+            "keep" => glyx_store::config::DaemonExit::Keep,
+            _ => glyx_store::config::DaemonExit::Stop,
+        };
+    }
+    if let Some(v) = body.mode.as_deref() {
+        cfg.mode = match v {
+            "session" => glyx_store::config::SessionMode::Session,
+            _ => glyx_store::config::SessionMode::Oneshot,
+        };
+    }
+    if let Some(ttl) = body.session_ttl_min {
+        cfg.session_ttl_min = ttl;
+    }
+    if let Err(e) = glyx_store::config::save(&cfg) {
+        return store_error(&e).into_response();
+    }
+    Json(serde_json::json!({
+        "ok": true,
+        "daemon_on_exit": cfg.daemon_on_exit,
+        "mode": cfg.mode,
+        "session_ttl_min": cfg.session_ttl_min,
+    }))
+    .into_response()
+}
+
 pub async fn serve(
     config: DaemonConfig,
     token: String,
 ) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
     let state = Arc::new(AppState {
-        vault_path: config.vault_path.clone(),
+        active: Mutex::new(config.vault.clone()),
         vault: Mutex::new(None),
         token,
+        port: Mutex::new(addr.port()),
         idle_lock_ms: config.idle_lock_ms,
         last_activity_ms: Mutex::new(now_ms()),
         agent_stop: Mutex::new(None),
         tamper: Mutex::new(Vec::new()),
     });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
+    state.publish_record();
     let app = router(state.clone());
     let idle = state.clone();
     tokio::spawn(async move {
@@ -1206,7 +1614,7 @@ pub async fn serve(
 }
 
 pub struct DaemonConfig {
-    pub vault_path: PathBuf,
+    pub vault: Option<PathBuf>,
     pub idle_lock_ms: u64,
 }
 
@@ -1224,11 +1632,12 @@ mod tests {
             cipher: glyx_core::Cipher::Xchacha20poly1305,
             params: glyx_core::KdfParams::mobile(),
         };
-        glyx_store::Vault::init(&path, suite, b"pw", &[1u8; 32]).expect("init");
+        glyx_store::Vault::init(&path, suite, b"pw", Some(&[1u8; 32])).expect("init");
         let state = Arc::new(AppState {
-            vault_path: path,
+            active: Mutex::new(Some(path)),
             vault: Mutex::new(None),
             token: "test-token".to_owned(),
+            port: Mutex::new(0),
             idle_lock_ms: 0,
             last_activity_ms: Mutex::new(now_ms()),
             agent_stop: Mutex::new(None),
@@ -1288,8 +1697,6 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-        let kf = state.vault_path.join("..").join("kf");
-        let _ = kf;
         let kf_path = test_kf();
         let (status, _) = call(
             state.clone(),
@@ -1392,5 +1799,61 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let (status, body) = call(state.clone(), "GET", "/v1/doctor", None, "test-token").await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn vault_management_cycle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("GLYX_CONFIG", dir.path().join("config.toml"));
+        std::env::set_var("GLYX_RUNTIME_DIR", dir.path().join("run"));
+        let (_d, state) = test_state();
+
+        let (status, body) = call(state.clone(), "GET", "/v1/vaults", None, "test-token").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["vaults"].as_array().expect("vaults").len(), 0);
+
+        let new_path = dir.path().join("second.glyx");
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/vaults/create",
+            Some(serde_json::json!({"path": new_path, "password": "pw", "preset": "mobile"})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["keyfile_required"], serde_json::json!(false));
+
+        let (status, body) = call(state.clone(), "GET", "/v1/vaults", None, "test-token").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let list = body["vaults"].as_array().expect("vaults");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["current"], serde_json::json!(true));
+        assert_eq!(list[0]["valid"], serde_json::json!(true));
+
+        let (status, body) = call(state.clone(), "GET", "/v1/status", None, "test-token").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["vault"]["keyfile_required"], serde_json::json!(false));
+
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/vaults/select",
+            Some(serde_json::json!({"path": new_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = call(
+            state.clone(),
+            "DELETE",
+            &format!("/v1/vaults?path={}", new_path.display()),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(new_path.exists());
     }
 }

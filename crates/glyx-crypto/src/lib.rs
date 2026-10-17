@@ -9,6 +9,8 @@ pub mod rand;
 pub mod ssh;
 pub mod totp;
 
+pub const ZERO_KEYFILE: [u8; 32] = [0u8; 32];
+
 pub use aead::{decrypt, encrypt, Ciphertext};
 pub use error::CryptoError;
 pub use hash::blake3_hex;

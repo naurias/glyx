@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::CoreError;
 
-pub const MAX_FORMAT_VERSION: u32 = 1;
+pub const MAX_FORMAT_VERSION: u32 = 2;
 pub const KDF_M_KIB_MIN: u32 = 65_536;
 pub const KDF_T_COST_MIN: u32 = 2;
 
@@ -89,16 +89,18 @@ pub struct VaultConfig {
     pub format_version: u32,
     pub vault_id: Uuid,
     pub created_at: DateTime<Utc>,
+    pub keyfile_required: bool,
     pub cipher_suite: CipherSuiteConfig,
 }
 
 impl VaultConfig {
     #[must_use]
-    pub fn new(vault_id: Uuid, suite: CipherSuiteConfig) -> Self {
+    pub fn new(vault_id: Uuid, suite: CipherSuiteConfig, keyfile_required: bool) -> Self {
         Self {
             format_version: MAX_FORMAT_VERSION,
             vault_id,
             created_at: Utc::now(),
+            keyfile_required,
             cipher_suite: suite,
         }
     }
@@ -123,10 +125,13 @@ impl VaultConfig {
                 max_supported: MAX_FORMAT_VERSION,
             });
         }
-        if self.format_version == 0 {
+        if self.format_version < MAX_FORMAT_VERSION {
             return Err(CoreError::Validation {
                 field: "format_version",
-                reason: "must be at least 1".to_owned(),
+                reason: format!(
+                    "format {} is no longer supported; recreate the vault (format {MAX_FORMAT_VERSION} required)",
+                    self.format_version
+                ),
             });
         }
         self.cipher_suite.params.validate()
@@ -139,16 +144,29 @@ mod tests {
 
     #[test]
     fn golden_toml_roundtrip() {
-        let text = "format_version = 1\nvault_id = \"0191a2b3-c4d5-7e6f-8901-234567890abc\"\ncreated_at = \"2026-10-15T00:00:00Z\"\n[cipher_suite]\nkdf = \"argon2id\"\ncipher = \"xchacha20poly1305\"\nm_kib = 262144\nt_cost = 3\np_cost = 4\n";
+        let text = "format_version = 2\nvault_id = \"0191a2b3-c4d5-7e6f-8901-234567890abc\"\ncreated_at = \"2026-10-15T00:00:00Z\"\nkeyfile_required = true\n[cipher_suite]\nkdf = \"argon2id\"\ncipher = \"xchacha20poly1305\"\nm_kib = 262144\nt_cost = 3\np_cost = 4\n";
         let cfg = VaultConfig::parse_toml(text).expect("golden parses");
-        assert_eq!(cfg.format_version, 1);
+        assert_eq!(cfg.format_version, 2);
+        assert!(cfg.keyfile_required);
         assert_eq!(cfg.cipher_suite.cipher, Cipher::Xchacha20poly1305);
         let _ = cfg.to_toml().expect("renders");
     }
 
     #[test]
+    fn rejects_old_version() {
+        let text = "format_version = 1\nvault_id = \"0191a2b3-c4d5-7e6f-8901-234567890abc\"\ncreated_at = \"2026-10-15T00:00:00Z\"\nkeyfile_required = true\n[cipher_suite]\nkdf = \"argon2id\"\ncipher = \"xchacha20poly1305\"\nm_kib = 262144\nt_cost = 3\np_cost = 4\n";
+        assert!(matches!(
+            VaultConfig::parse_toml(text),
+            Err(CoreError::Validation {
+                field: "format_version",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn rejects_future_version() {
-        let text = "format_version = 99\nvault_id = \"0191a2b3-c4d5-7e6f-8901-234567890abc\"\ncreated_at = \"2026-10-15T00:00:00Z\"\n[cipher_suite]\nkdf = \"argon2id\"\ncipher = \"aes256gcm\"\nm_kib = 65536\nt_cost = 3\np_cost = 2\n";
+        let text = "format_version = 99\nvault_id = \"0191a2b3-c4d5-7e6f-8901-234567890abc\"\ncreated_at = \"2026-10-15T00:00:00Z\"\nkeyfile_required = true\n[cipher_suite]\nkdf = \"argon2id\"\ncipher = \"aes256gcm\"\nm_kib = 65536\nt_cost = 3\np_cost = 2\n";
         assert!(matches!(
             VaultConfig::parse_toml(text),
             Err(CoreError::UnsupportedVersion { found: 99, .. })

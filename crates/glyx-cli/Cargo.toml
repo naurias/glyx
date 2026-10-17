@@ -26,3 +26,4 @@ glyx-crypto = { path = "../glyx-crypto" }
 glyx-store = { path = "../glyx-store" }
 glyx-autofill = { path = "../glyx-autofill" }
 glyx-agent = { path = "../glyx-agent" }
+glyx-daemon = { path = "../glyx-daemon" }

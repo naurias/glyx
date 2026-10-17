@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+pub mod runtime;
+
 #[derive(Debug)]
 pub enum DaemonState {
     Locked { path: PathBuf },
