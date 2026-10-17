@@ -5,6 +5,7 @@ mod extension;
 mod gitcred;
 mod items;
 mod select;
+mod tui;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -43,9 +44,13 @@ enum Cmd {
         ttl: Option<u64>,
         #[arg(long, help = "Also set a short convenience passphrase")]
         with_pin: bool,
+        #[arg(long, help = "Do not materialize exports or injections")]
+        no_materialize: bool,
     },
     #[command(about = "Forget sessions")]
     Lock,
+    #[command(about = "Interactive full-screen browser and editor")]
+    Tui,
     #[command(about = "List items")]
     Ls {
         #[arg(long, help = "Filter by folder")]
@@ -364,6 +369,25 @@ enum InjectCmd {
     },
     #[command(about = "Rescan tracked folders for matching files")]
     Scan,
+    #[command(about = "Unlock (materialize) one tracked target")]
+    Unlock {
+        #[arg(help = "Tracked file or folder")]
+        target: PathBuf,
+        #[arg(long, help = "Overwrite drifted files")]
+        force: bool,
+    },
+    #[command(about = "Lock (restore locked form) one tracked target")]
+    Lock {
+        #[arg(help = "Tracked file or folder")]
+        target: PathBuf,
+    },
+    #[command(about = "Point a tracked target at its new path")]
+    Move {
+        #[arg(help = "Old path")]
+        old: PathBuf,
+        #[arg(help = "New path")]
+        new: PathBuf,
+    },
     #[command(about = "Stop tracking a file or folder")]
     Rm {
         #[arg(help = "File or folder")]
@@ -549,6 +573,7 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             timeout,
             dry_run,
         } => cmd_fill(ctx, &query, &field, timeout, dry_run),
+        Cmd::Tui => tui::cmd_tui(ctx),
         other => dispatch_grouped(ctx, other),
     }
 }
@@ -556,7 +581,11 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
 fn dispatch_grouped(ctx: &Ctx, cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Vault { cmd } => dispatch_vault(ctx, cmd),
-        Cmd::Unlock { ttl, with_pin } => cmd_unlock(ctx, ttl, with_pin),
+        Cmd::Unlock {
+            ttl,
+            with_pin,
+            no_materialize,
+        } => cmd_unlock(ctx, ttl, with_pin, no_materialize),
         Cmd::Lock => cmd_lock(ctx),
         Cmd::Ssh { cmd } => dispatch_ssh(ctx, cmd),
         Cmd::Export { cmd } => dispatch_export(ctx, cmd),
