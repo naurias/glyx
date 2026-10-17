@@ -1,5 +1,6 @@
 pub mod engine;
 pub mod ledger;
+pub mod merge;
 pub mod ssh_agent;
 
 pub use engine::{

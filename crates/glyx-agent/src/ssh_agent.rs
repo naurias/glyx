@@ -245,7 +245,7 @@ mod tests {
             cipher: glyx_core::Cipher::Xchacha20poly1305,
             params: glyx_core::KdfParams::mobile(),
         };
-        glyx_store::Vault::init(&vpath, suite, b"pw", &[2u8; 32]).expect("init");
+        glyx_store::Vault::init(&vpath, suite, b"pw", Some(&[2u8; 32])).expect("init");
         let vault = glyx_store::Vault::open(&vpath).expect("open");
         let mut uv = vault.unlock(b"pw", &[2u8; 32]).expect("unlock");
         let pair = glyx_crypto::ssh::generate("ed25519", "test").expect("gen");

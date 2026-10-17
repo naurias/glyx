@@ -13,6 +13,7 @@ serde_json.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 rusqlite.workspace = true
+similar.workspace = true
 ed25519-dalek.workspace = true
 ssh-key = { workspace = true, features = ["ed25519"] }
 glyx-core = { path = "../glyx-core" }

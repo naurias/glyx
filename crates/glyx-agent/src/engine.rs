@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use uuid::Uuid;
@@ -116,6 +116,12 @@ pub fn materialize_inject(
     let target = &row.target;
     let text = std::fs::read_to_string(target)
         .map_err(|_| AgentError::Tamper(format!("{} unreadable", target.display())))?;
+    if row.locked_text.is_none() {
+        conn.execute(
+            "UPDATE injects SET locked_text = ?1, locked_hash = ?2 WHERE target = ?3",
+            rusqlite::params![text, blake_hex(text.as_bytes()), target.to_string_lossy()],
+        )?;
+    }
     let form = parse_form(&row.form)?;
     let target_str = target.to_string_lossy().into_owned();
     let mut refs: Vec<RefInfo> = serde_json::from_str(&row.refs_json).unwrap_or_default();
@@ -126,7 +132,15 @@ pub fn materialize_inject(
     let mut changed = 0;
     let mut new_text = text.clone();
     for (locked, (id, field)) in &by_locked {
-        if new_text.contains(locked.as_str()) {
+        let plain_ref = glyx_core::ref_placeholder(id, field);
+        let present = if new_text.contains(locked.as_str()) {
+            Some(locked.clone())
+        } else if new_text.contains(&plain_ref) {
+            Some(plain_ref)
+        } else {
+            None
+        };
+        if let Some(found) = present {
             let item = uv
                 .get_item(id)?
                 .ok_or_else(|| AgentError::Tamper(format!("item {id} gone")))?;
@@ -137,7 +151,7 @@ pub fn materialize_inject(
                 .value
                 .expose()
                 .to_owned();
-            new_text = new_text.replace(locked.as_str(), &value);
+            new_text = new_text.replace(found.as_str(), &value);
             changed += 1;
         } else if !force {
             return Err(AgentError::Tamper(format!(
@@ -349,13 +363,123 @@ pub fn crash_replay(uv: &glyx_store::UnlockedVault) -> Result<TeardownReport, Ag
     teardown_all(uv)
 }
 
+#[derive(Debug, Clone)]
+pub struct MergePreview {
+    pub target: PathBuf,
+    pub hunks: Vec<crate::merge::Hunk>,
+    pub trailing_newline: bool,
+}
+
+pub fn preview_merge(
+    uv: &glyx_store::UnlockedVault,
+    target: &Path,
+) -> Result<MergePreview, AgentError> {
+    let conn = open_db()?;
+    let row = list_injects(&conn)?
+        .into_iter()
+        .find(|r| r.target.as_path() == target)
+        .ok_or_else(|| AgentError::Tamper(format!("{} not tracked", target.display())))?;
+    let base = row.locked_text.ok_or_else(|| {
+        AgentError::Tamper(format!("{} has no locked baseline", target.display()))
+    })?;
+    let theirs = std::fs::read_to_string(target)
+        .map_err(|_| AgentError::Tamper(format!("{} unreadable", target.display())))?;
+    let refs: Vec<RefInfo> = serde_json::from_str(&row.refs_json).unwrap_or_default();
+    let form = parse_form(&row.form)?;
+    let target_str = target.to_string_lossy().into_owned();
+    let mut ours = base.clone();
+    let mut spans = Vec::new();
+    for r in &refs {
+        let item = uv
+            .get_item(&r.item_id)?
+            .ok_or_else(|| AgentError::Tamper(format!("item {} gone", r.item_id)))?;
+        let value = item
+            .fields
+            .get(&r.field)
+            .ok_or_else(|| AgentError::Tamper(format!("field {} gone", r.field)))?
+            .value
+            .expose()
+            .to_owned();
+        spans.push(r.locked.clone());
+        spans.push(value.clone());
+        let plain_ref = glyx_core::ref_placeholder(&r.item_id, &r.field);
+        if ours.contains(r.locked.as_str()) {
+            ours = ours.replace(r.locked.as_str(), &value);
+        } else if ours.contains(&plain_ref) {
+            ours = ours.replace(&plain_ref, &value);
+        } else {
+            let locked = uv.render_locked(&r.item_id, &r.field, &target_str, form)?;
+            spans.push(locked.clone());
+            if ours.contains(&locked) {
+                ours = ours.replace(&locked, &value);
+            }
+        }
+    }
+    let hunks = crate::merge::diff_hunks(&base, &theirs, &ours, &spans);
+    Ok(MergePreview {
+        target: target.to_owned(),
+        trailing_newline: base.ends_with('\n'),
+        hunks,
+    })
+}
+
+pub fn apply_merge(
+    uv: &glyx_store::UnlockedVault,
+    target: &Path,
+    picks: &BTreeMap<usize, crate::merge::Pick>,
+) -> Result<String, AgentError> {
+    let preview = preview_merge(uv, target)?;
+    let merged = crate::merge::apply_hunks(&preview.hunks, picks, preview.trailing_newline)
+        .map_err(|idx| AgentError::Tamper(format!("hunk {idx} needs a pick")))?;
+    let conn = open_db()?;
+    let row = list_injects(&conn)?
+        .into_iter()
+        .find(|r| r.target.as_path() == target)
+        .ok_or_else(|| AgentError::Tamper(format!("{} not tracked", target.display())))?;
+    let form = parse_form(&row.form)?;
+    let target_str = target.to_string_lossy().into_owned();
+    let mut refs: Vec<RefInfo> = serde_json::from_str(&row.refs_json).unwrap_or_default();
+    for (id, field) in scan_refs(&merged) {
+        if refs.iter().any(|r| r.item_id == id && r.field == field) {
+            continue;
+        }
+        let locked = uv.render_locked(&id, &field, &target_str, form)?;
+        refs.push(RefInfo {
+            item_id: id,
+            field,
+            locked,
+        });
+    }
+    std::fs::write(target, merged.as_bytes())?;
+    let meta = std::fs::metadata(target)?;
+    conn.execute(
+        "UPDATE injects SET refs_json = ?1, unlocked_hash = ?2, mtime = ?3, size = ?4 WHERE target = ?5",
+        rusqlite::params![
+            serde_json::to_string(&refs).unwrap_or_default(),
+            blake_hex(merged.as_bytes()),
+            meta.modified().ok().and_then(|t| t
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs().cast_signed())),
+            meta.len().cast_signed(),
+            target.to_string_lossy(),
+        ],
+    )?;
+    Ok(merged)
+}
+
+#[cfg(test)]
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
+    use super::ENV_LOCK;
     use super::*;
     use crate::ledger::{register_export, register_inject};
 
     #[test]
     fn full_cycle_file_and_inject() {
+        let _env = ENV_LOCK.lock().expect("lock");
         let runtime = tempfile::tempdir().expect("tempdir");
         std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
         let work = tempfile::tempdir().expect("tempdir");
@@ -365,7 +489,7 @@ mod tests {
             cipher: glyx_core::Cipher::Xchacha20poly1305,
             params: glyx_core::KdfParams::mobile(),
         };
-        glyx_store::Vault::init(&vpath, suite, b"pw", &[1u8; 32]).expect("init");
+        glyx_store::Vault::init(&vpath, suite, b"pw", Some(&[1u8; 32])).expect("init");
         let vault = glyx_store::Vault::open(&vpath).expect("open");
         let mut uv = vault.unlock(b"pw", &[1u8; 32]).expect("unlock");
         let hlc = uv.next_hlc().expect("tick");
@@ -462,5 +586,113 @@ mod tests {
         let refs = scan_refs(&text);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].1, "password");
+    }
+}
+
+#[cfg(test)]
+mod merge_e2e {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn vault_with_secret(dir: &std::path::Path) -> (glyx_store::Vault, Uuid) {
+        let vpath = dir.join("v.glyx");
+        let suite = glyx_core::CipherSuiteConfig {
+            kdf: glyx_core::KdfId::Argon2id,
+            cipher: glyx_core::Cipher::Xchacha20poly1305,
+            params: glyx_core::KdfParams::mobile(),
+        };
+        glyx_store::Vault::init(&vpath, suite, b"pw", Some(&[1u8; 32])).expect("init");
+        let vault = glyx_store::Vault::open(&vpath).expect("open");
+        let mut uv = vault.unlock(b"pw", &[1u8; 32]).expect("unlock");
+        let hlc = uv.next_hlc().expect("tick");
+        let node = uv.device_node();
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "password".to_owned(),
+            glyx_core::Field {
+                value: glyx_core::SecretString::new("s3cret".to_owned()),
+                field_hlc: hlc,
+            },
+        );
+        let item = glyx_core::Item {
+            id: Uuid::now_v7(),
+            item_type: glyx_core::ItemType::Login,
+            name: "x".to_owned(),
+            folder: String::new(),
+            tags: Vec::new(),
+            fields,
+            hlc,
+            rev: 1,
+            deleted: false,
+            updated_by: node,
+        };
+        let id = item.id;
+        uv.put_item(&item).expect("put");
+        (glyx_store::Vault::open(&vpath).expect("open"), id)
+    }
+
+    #[test]
+    fn drift_merges_with_picks() {
+        let _env = ENV_LOCK.lock().expect("lock");
+        let runtime = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
+        let work = tempfile::tempdir().expect("tempdir");
+        let (vault, id) = vault_with_secret(work.path());
+        let mut uv = vault.unlock(b"pw", &[1u8; 32]).expect("unlock");
+        let target = work.path().join("app.env");
+        let original = format!("user=bob\n# stays\npass={{{{glyx:{id}/password}}}}\nnote=keep\n");
+        std::fs::write(&target, &original).expect("write");
+        let conn = open_db().expect("db");
+        crate::ledger::register_inject(&conn, &target, "ref").expect("register");
+        drop(conn);
+        materialize_all(&mut uv, false).expect("materialize");
+        assert_eq!(teardown_all(&uv).expect("teardown").restored, 1);
+        std::fs::write(
+            &target,
+            "user=alice\n# stays\npass={{glyx:PLACEHOLDER}}\nnote=keep\n",
+        )
+        .expect("drift");
+        let preview = preview_merge(&uv, &target).expect("preview");
+        let conflicts = crate::merge::conflict_indexes(&preview.hunks);
+        assert!(!conflicts.is_empty());
+        let mut picks = BTreeMap::new();
+        for idx in &conflicts {
+            picks.insert(*idx, crate::merge::Pick::Ours);
+        }
+        let merged = apply_merge(&uv, &target, &picks).expect("apply");
+        assert!(merged.contains("user=alice"));
+        assert!(merged.contains("s3cret"));
+        assert!(merged.contains("note=keep"));
+        assert!(!merged.contains("<<<<<<<"));
+        let preview2 = preview_merge(&uv, &target).expect("preview");
+        assert!(crate::merge::conflict_indexes(&preview2.hunks).is_empty());
+    }
+
+    #[test]
+    fn clean_drift_auto_applies() {
+        let _env = ENV_LOCK.lock().expect("lock");
+        let runtime = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
+        let work = tempfile::tempdir().expect("tempdir");
+        let (vault, id) = vault_with_secret(work.path());
+        let mut uv = vault.unlock(b"pw", &[1u8; 32]).expect("unlock");
+        let target = work.path().join("app.env");
+        std::fs::write(
+            &target,
+            format!("pass={{{{glyx:{id}/password}}}}\n# tail\n"),
+        )
+        .expect("write");
+        let conn = open_db().expect("db");
+        crate::ledger::register_inject(&conn, &target, "ref").expect("register");
+        drop(conn);
+        materialize_all(&mut uv, false).expect("materialize");
+        teardown_all(&uv).expect("teardown");
+        let locked = std::fs::read_to_string(&target).expect("locked");
+        std::fs::write(&target, format!("{locked}extra=1\n")).expect("drift");
+        let preview = preview_merge(&uv, &target).expect("preview");
+        assert!(crate::merge::conflict_indexes(&preview.hunks).is_empty());
+        let merged = apply_merge(&uv, &target, &BTreeMap::new()).expect("apply");
+        assert!(merged.contains("extra=1"));
+        assert!(merged.contains("s3cret"));
     }
 }
