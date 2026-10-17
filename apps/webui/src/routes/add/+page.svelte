@@ -1,33 +1,49 @@
 <script>
   import { api } from '$lib/api.js';
-  import { renderMarkdown } from '$lib/markdown.js';
   import { goto } from '$app/navigation';
+  import { onMount } from 'svelte';
+  import ItemForm from '$lib/ItemForm.svelte';
+
+  let templates = [];
   let item_type = 'login';
   let name = '';
   let folder = '';
-  let rows = [{ k: 'username', v: '' }];
-  let body = '';
   let error = '';
+  let busy = false;
 
-  function addRow() {
-    rows = [...rows, { k: '', v: '' }];
-  }
-  async function submit() {
-    error = '';
+  onMount(async () => {
     try {
-      const fields = {};
-      if (item_type === 'note') {
-        fields.body = body;
-      } else {
-        for (const r of rows) if (r.k) fields[r.k] = r.v;
-      }
-      const res = await api.create({ type: item_type, name, folder, fields });
-      goto(`/items/${res.id}`);
+      templates = await api.templates();
     } catch (e) {
       error = e.message;
     }
+  });
+
+  async function save(payload) {
+    error = '';
+    busy = true;
+    try {
+      const res = await api.create(payload);
+      goto(`/items/${res.id}`);
+    } catch (e) {
+      error = e.message;
+    } finally {
+      busy = false;
+    }
   }
-  $: bodyPreview = renderMarkdown(body);
+
+  async function genSsh() {
+    error = '';
+    busy = true;
+    try {
+      const res = await api.sshGen({ name: name || 'ssh key', folder });
+      goto(`/items/${res.id}`);
+    } catch (e) {
+      error = e.message;
+    } finally {
+      busy = false;
+    }
+  }
 </script>
 
 <nav>
@@ -36,36 +52,26 @@
   <a href="/conflicts">Conflicts</a>
   <a href="/exports">Exports</a>
   <a href="/settings">Settings</a>
+  <a href="/onboarding">Vaults</a>
+  <span style="flex: 1"></span>
 </nav>
 <main>
   <h2>Add item</h2>
   {#if error}<p style="color: var(--danger)">{error}</p>{/if}
-  <label>Type
-    <select bind:value={item_type}>
-      {#each ['login', 'passkey', 'totp', 'identity', 'card', 'note', 'file', 'ssh_key', 'generic_key'] as t}
-        <option value={t}>{t}</option>
-      {/each}
-    </select>
-  </label>
-  <label>Name<input bind:value={name} /></label>
-  <label>Folder<input bind:value={folder} /></label>
-  {#if item_type === 'note'}
-    <label>Note (markdown)
-      <textarea bind:value={body} rows="12"></textarea>
-    </label>
-    <div class="card note">{@html bodyPreview}</div>
-  {:else}
-    {#each rows as row}
-      <div class="row">
-        <input bind:value={row.k} placeholder="field" />
-        <input bind:value={row.v} placeholder="value" style="flex: 1" />
+  {#if templates.length}
+    <ItemForm
+      {templates}
+      bind:item_type
+      bind:name
+      bind:folder
+      submitLabel="Create"
+      {busy}
+      onsubmit={save}
+    />
+    {#if item_type === 'ssh_key'}
+      <div class="row" style="margin-top: 12px">
+        <button on:click={genSsh} disabled={busy}>Generate SSH key pair</button>
       </div>
-    {/each}
-    <div class="row" style="margin-top: 8px">
-      <button on:click={addRow}>Field</button>
-    </div>
+    {/if}
   {/if}
-  <div class="row" style="margin-top: 8px">
-    <button class="primary" on:click={submit}>Save</button>
-  </div>
 </main>
