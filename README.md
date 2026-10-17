@@ -2,6 +2,8 @@
 
 Local-first password manager for Linux, Windows, and Android. CLI, WebUI, and desktop app on one Rust core. No accounts, no telemetry, your vault stays yours.
 
+Full feature guide for every frontend, with examples: **[docs.md](docs.md)**.
+
 > Status: M5.2 vault onboarding, optional keyfiles, and a self-starting desktop app work. Android support arrives in M6. This README is a living user guide and grows with each milestone.
 
 ## What glyx will do
