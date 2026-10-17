@@ -5,6 +5,8 @@
   let report = null;
   let error = '';
   let settings = null;
+  let notice = '';
+  let rekey = { password: '', keyfile: '', no_keyfile: false, cipher: '', preset: '' };
 
   async function load() {
     try {
@@ -19,6 +21,47 @@
     error = '';
     try {
       settings = await api.saveSettings({ daemon_on_exit: value });
+    } catch (e) {
+      error = e.message;
+    }
+  }
+  async function setAuto(value) {
+    error = '';
+    try {
+      settings = await api.saveSettings({ auto_materialize: value });
+    } catch (e) {
+      error = e.message;
+    }
+  }
+  async function setMode(value) {
+    error = '';
+    try {
+      settings = await api.saveSettings({ mode: value });
+    } catch (e) {
+      error = e.message;
+    }
+  }
+  async function saveTtl() {
+    error = '';
+    try {
+      settings = await api.saveSettings({ session_ttl_min: Number(settings.session_ttl_min) });
+    } catch (e) {
+      error = e.message;
+    }
+  }
+  async function doRekey() {
+    error = '';
+    notice = '';
+    try {
+      const body = {};
+      if (rekey.password) body.password = rekey.password;
+      if (rekey.keyfile) body.keyfile = rekey.keyfile;
+      if (rekey.no_keyfile) body.no_keyfile = true;
+      if (rekey.cipher) body.cipher = rekey.cipher;
+      if (rekey.preset) body.preset = rekey.preset;
+      await api.rekey(body);
+      notice = 'Credentials rotated. Unlock again to confirm.';
+      rekey = { password: '', keyfile: '', no_keyfile: false, cipher: '', preset: '' };
     } catch (e) {
       error = e.message;
     }
@@ -78,6 +121,59 @@
         </button>
       </div>
       <p class="dim">Stopping on exit is more private; keeping it running keeps the browser, Git, and SSH agent working.</p>
+    </div>
+    <div class="card">
+      <div>On unlock:</div>
+      <div class="row">
+        <button class:selected={settings.auto_materialize} on:click={() => setAuto(true)}>
+          Materialize all tracked files
+        </button>
+        <button class:selected={!settings.auto_materialize} on:click={() => setAuto(false)}>
+          Lock until I unlock each
+        </button>
+      </div>
+      <p class="dim">With auto off, unlock writes no secrets to disk; use the Exports page (or CLI) to unlock individual targets.</p>
+    </div>
+    <div class="card">
+      <div>Session</div>
+      <div class="row">
+        <button class:selected={settings.mode === 'oneshot'} on:click={() => setMode('oneshot')}>
+          One-shot
+        </button>
+        <button class:selected={settings.mode === 'session'} on:click={() => setMode('session')}>
+          Session
+        </button>
+      </div>
+      <div class="row">
+        <label class="row">TTL minutes
+          <input type="number" min="1" max="480" bind:value={settings.session_ttl_min} />
+        </label>
+        <button on:click={saveTtl}>Save TTL</button>
+      </div>
+      <p class="dim">Session mode stores the data key under 0600 in the runtime dir until the TTL expires; one-shot prompts every time.</p>
+    </div>
+    <div class="card">
+      <div>Rotate credentials (vault must be unlocked)</div>
+      <label>New password<input type="password" bind:value={rekey.password} /></label>
+      <div class="row">
+        <label class="row"><input type="checkbox" bind:checked={rekey.no_keyfile} /> drop keyfile</label>
+        <input bind:value={rekey.keyfile} placeholder="keyfile path (or new)" style="flex: 1" />
+      </div>
+      <div class="row">
+        <select bind:value={rekey.cipher}>
+          <option value="">cipher: keep</option>
+          <option value="xchacha">xchacha</option>
+          <option value="aesgcm">aesgcm</option>
+        </select>
+        <select bind:value={rekey.preset}>
+          <option value="">preset: keep</option>
+          <option value="balanced">balanced</option>
+          <option value="hardened">hardened</option>
+          <option value="mobile">mobile</option>
+        </select>
+        <button class="primary" on:click={doRekey}>Rotate</button>
+      </div>
+      {#if notice}<p class="dim">{notice}</p>{/if}
     </div>
   {/if}
   <div class="row">
