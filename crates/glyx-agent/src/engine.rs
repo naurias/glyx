@@ -5,14 +5,16 @@ use rusqlite::Connection;
 use uuid::Uuid;
 
 use crate::ledger::{
-    blake_hex, list_exports, list_injects, open_db, parse_form, recall_target as ledger_recall,
-    scan_refs, shred_file, AgentError, ExportRow, InjectRow, RefInfo,
+    blake_hex, expand_inject_roots, list_exports, list_injects, open_db, parse_form,
+    recall_target as ledger_recall, scan_refs, shred_file, AgentError, ExpandReport, ExportRow,
+    InjectRow, RefInfo,
 };
 
 #[derive(Debug, Clone, Default)]
 pub struct MaterializeReport {
     pub files: usize,
     pub injected: usize,
+    pub scanned: usize,
     pub skipped: Vec<String>,
 }
 
@@ -252,6 +254,9 @@ pub fn materialize_all(
 ) -> Result<MaterializeReport, AgentError> {
     let conn = open_db()?;
     let mut report = MaterializeReport::default();
+    if let Ok(expanded) = expand_inject_roots(&conn) {
+        report.scanned = expanded.files;
+    }
     for row in list_exports(&conn)? {
         materialize_export(uv, &row)?;
         report.files += 1;
@@ -268,6 +273,11 @@ pub fn materialize_all(
         }
     }
     Ok(report)
+}
+
+pub fn scan_inject_roots() -> Result<ExpandReport, AgentError> {
+    let conn = open_db()?;
+    expand_inject_roots(&conn)
 }
 
 pub fn enforce_all(
@@ -537,7 +547,7 @@ mod tests {
             format!("user=bob\npass={{{{glyx:{id}/password}}}}\n"),
         )
         .expect("write");
-        register_inject(&conn, &env_file, "encrypted-pointer").expect("register");
+        register_inject(&conn, &env_file, "encrypted-pointer", None).expect("register");
         drop(conn);
         let rep = materialize_all(&mut uv, false).expect("materialize");
         assert_eq!(rep.files, 1);
@@ -643,7 +653,7 @@ mod merge_e2e {
         let original = format!("user=bob\n# stays\npass={{{{glyx:{id}/password}}}}\nnote=keep\n");
         std::fs::write(&target, &original).expect("write");
         let conn = open_db().expect("db");
-        crate::ledger::register_inject(&conn, &target, "ref").expect("register");
+        crate::ledger::register_inject(&conn, &target, "ref", None).expect("register");
         drop(conn);
         materialize_all(&mut uv, false).expect("materialize");
         assert_eq!(teardown_all(&uv).expect("teardown").restored, 1);
@@ -683,7 +693,7 @@ mod merge_e2e {
         )
         .expect("write");
         let conn = open_db().expect("db");
-        crate::ledger::register_inject(&conn, &target, "ref").expect("register");
+        crate::ledger::register_inject(&conn, &target, "ref", None).expect("register");
         drop(conn);
         materialize_all(&mut uv, false).expect("materialize");
         teardown_all(&uv).expect("teardown");

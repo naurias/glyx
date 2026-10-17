@@ -62,6 +62,11 @@ pub fn open_db() -> Result<Connection, AgentError> {
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path)?;
+    ensure_schema(&conn)?;
+    Ok(conn)
+}
+
+pub fn ensure_schema(conn: &Connection) -> Result<(), AgentError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS exports(
            id TEXT PRIMARY KEY, target TEXT UNIQUE NOT NULL, kind TEXT NOT NULL,
@@ -70,9 +75,13 @@ pub fn open_db() -> Result<Connection, AgentError> {
          CREATE TABLE IF NOT EXISTS injects(
            target TEXT PRIMARY KEY, form TEXT NOT NULL DEFAULT 'encrypted-pointer',
            refs_json TEXT NOT NULL DEFAULT '[]', locked_text TEXT,
-           locked_hash TEXT, unlocked_hash TEXT, mtime INTEGER, size INTEGER);",
+           locked_hash TEXT, unlocked_hash TEXT, mtime INTEGER, size INTEGER, root TEXT);
+         CREATE TABLE IF NOT EXISTS inject_roots(
+           root TEXT PRIMARY KEY, glob TEXT NOT NULL DEFAULT '*.md',
+           form TEXT NOT NULL DEFAULT 'ref');",
     )?;
-    Ok(conn)
+    let _ = conn.execute("ALTER TABLE injects ADD COLUMN root TEXT", []);
+    Ok(())
 }
 
 #[must_use]
@@ -176,14 +185,173 @@ pub fn register_export(conn: &Connection, spec: &ExportSpec) -> Result<String, A
     Ok(id)
 }
 
-pub fn register_inject(conn: &Connection, target: &Path, form: &str) -> Result<(), AgentError> {
+pub fn register_inject(
+    conn: &Connection,
+    target: &Path,
+    form: &str,
+    root: Option<&Path>,
+) -> Result<(), AgentError> {
     parse_form(form)?;
     conn.execute(
-        "INSERT INTO injects(target, form) VALUES (?1, ?2)
-         ON CONFLICT(target) DO UPDATE SET form=excluded.form",
-        rusqlite::params![target.to_string_lossy(), form],
+        "INSERT INTO injects(target, form, root) VALUES (?1, ?2, ?3)
+         ON CONFLICT(target) DO UPDATE SET form=excluded.form, root=excluded.root",
+        rusqlite::params![
+            target.to_string_lossy(),
+            form,
+            root.map(|r| r.to_string_lossy().into_owned()),
+        ],
     )?;
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct InjectRoot {
+    pub root: PathBuf,
+    pub glob: String,
+    pub form: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExpandReport {
+    pub roots: usize,
+    pub files: usize,
+    pub removed: usize,
+    pub skipped: usize,
+}
+
+pub const MAX_INJECT_BYTES: u64 = 5 * 1024 * 1024;
+
+pub fn register_inject_root(
+    conn: &Connection,
+    root: &Path,
+    glob: &str,
+    form: &str,
+) -> Result<(), AgentError> {
+    parse_form(form)?;
+    conn.execute(
+        "INSERT INTO inject_roots(root, glob, form) VALUES (?1, ?2, ?3)
+         ON CONFLICT(root) DO UPDATE SET glob=excluded.glob, form=excluded.form",
+        rusqlite::params![root.to_string_lossy(), glob, form],
+    )?;
+    Ok(())
+}
+
+pub fn list_inject_roots(conn: &Connection) -> Result<Vec<InjectRoot>, AgentError> {
+    let mut stmt = conn.prepare("SELECT root, glob, form FROM inject_roots ORDER BY root")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(InjectRoot {
+            root: PathBuf::from(r.get::<_, String>(0)?),
+            glob: r.get(1)?,
+            form: r.get(2)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(AgentError::from)
+}
+
+pub fn forget_inject_root(conn: &Connection, root: &Path) -> Result<bool, AgentError> {
+    let key = root.to_string_lossy().into_owned();
+    let removed = conn.execute("DELETE FROM inject_roots WHERE root = ?1", [&key])? > 0;
+    conn.execute("DELETE FROM injects WHERE root = ?1", [&key])?;
+    Ok(removed)
+}
+
+#[must_use]
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    if !pattern.contains('*') {
+        return name == pattern;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let last = parts.len() - 1;
+    let mut idx = 0usize;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            if !name.starts_with(part) {
+                return false;
+            }
+            idx = part.len();
+        } else if i == last {
+            return name.len() >= idx + part.len() && name.ends_with(part);
+        } else {
+            match name[idx..].find(part) {
+                Some(pos) => idx += pos + part.len(),
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+fn collect_matching(root: &Path, pattern: &str, out: &mut Vec<PathBuf>, skipped: &mut usize) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_matching(&path, pattern, out, skipped);
+            continue;
+        }
+        if !glob_match(pattern, &name) {
+            continue;
+        }
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.len() <= MAX_INJECT_BYTES => {}
+            Ok(_) => {
+                *skipped += 1;
+                continue;
+            }
+            Err(_) => continue,
+        }
+        match std::fs::read(&path) {
+            Ok(bytes) if std::str::from_utf8(&bytes).is_ok() => out.push(path),
+            _ => *skipped += 1,
+        }
+    }
+}
+
+pub fn expand_inject_roots(conn: &Connection) -> Result<ExpandReport, AgentError> {
+    let roots = list_inject_roots(conn)?;
+    let mut report = ExpandReport {
+        roots: roots.len(),
+        ..ExpandReport::default()
+    };
+    for root in &roots {
+        let mut files = Vec::new();
+        collect_matching(&root.root, &root.glob, &mut files, &mut report.skipped);
+        let mut keep = std::collections::HashSet::new();
+        for file in &files {
+            keep.insert(file.to_string_lossy().into_owned());
+            register_inject(conn, file, &root.form, Some(&root.root))?;
+            report.files += 1;
+        }
+        let key = root.root.to_string_lossy().into_owned();
+        let mut stmt = conn.prepare("SELECT target FROM injects WHERE root = ?1")?;
+        let existing: Vec<String> = stmt
+            .query_map([&key], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+        for target in existing {
+            if !keep.contains(&target) {
+                conn.execute("DELETE FROM injects WHERE target = ?1", [&target])?;
+                report.removed += 1;
+            }
+        }
+    }
+    Ok(report)
 }
 
 pub fn list_exports(conn: &Connection) -> Result<Vec<ExportRow>, AgentError> {
@@ -241,4 +409,49 @@ pub fn recall_target(conn: &Connection, target: &Path) -> Result<bool, AgentErro
         removed = true;
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_matches_simple_patterns() {
+        assert!(glob_match("*.md", "note.md"));
+        assert!(!glob_match("*.md", "note.txt"));
+        assert!(glob_match("note.md", "note.md"));
+        assert!(!glob_match("note.md", "notes.md"));
+        assert!(glob_match("*.sync-conflict-*", "a.sync-conflict-1.md"));
+        assert!(glob_match("*.md", "a.md") && !glob_match("*.md", "a.MD"));
+    }
+
+    #[test]
+    fn expands_roots_and_tracks_new_and_removed_files() {
+        let conn = Connection::open_in_memory().expect("db");
+        ensure_schema(&conn).expect("schema");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir(root.join("sub")).expect("sub");
+        std::fs::write(root.join("a.md"), "a").expect("a");
+        std::fs::write(root.join("b.txt"), "b").expect("b");
+        std::fs::write(root.join(".hidden.md"), "h").expect("h");
+        std::fs::write(root.join("sub/c.md"), "c").expect("c");
+        register_inject_root(&conn, root, "*.md", "ref").expect("root");
+        let rep = expand_inject_roots(&conn).expect("expand");
+        assert_eq!(rep.files, 2, "a.md and sub/c.md only");
+        assert_eq!(list_injects(&conn).expect("list").len(), 2);
+
+        std::fs::write(root.join("d.md"), "d").expect("d");
+        let rep = expand_inject_roots(&conn).expect("expand");
+        assert_eq!(rep.files, 3);
+
+        std::fs::remove_file(root.join("sub/c.md")).expect("rm");
+        let rep = expand_inject_roots(&conn).expect("expand");
+        assert_eq!(rep.files, 2);
+        assert_eq!(rep.removed, 1);
+        assert_eq!(list_injects(&conn).expect("list").len(), 2);
+
+        assert!(forget_inject_root(&conn, root).expect("forget"));
+        assert!(list_injects(&conn).expect("list").is_empty());
+    }
 }
