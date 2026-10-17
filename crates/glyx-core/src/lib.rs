@@ -13,7 +13,7 @@ pub use ids::DeviceId;
 pub use item::{Field, Item, ItemType};
 pub use locked::{masked_fallback, ref_placeholder, LockedForm};
 pub use secret::SecretString;
-pub use template::{parse_type, FieldSpec};
+pub use template::{parse_type, FieldSpec, ALL_TYPES};
 pub use vault_spec::{Cipher, CipherSuiteConfig, KdfId, KdfParams, VaultConfig};
 
 #[must_use]

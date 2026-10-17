@@ -182,6 +182,18 @@ pub fn spec(item_type: ItemType) -> &'static [FieldSpec] {
     }
 }
 
+pub const ALL_TYPES: [ItemType; 9] = [
+    ItemType::Login,
+    ItemType::Passkey,
+    ItemType::Totp,
+    ItemType::Identity,
+    ItemType::Card,
+    ItemType::Note,
+    ItemType::File,
+    ItemType::SshKey,
+    ItemType::GenericKey,
+];
+
 pub fn parse_type(text: &str) -> Result<ItemType, super::CoreError> {
     match text {
         "login" => Ok(ItemType::Login),

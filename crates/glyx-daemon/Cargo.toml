@@ -27,6 +27,7 @@ glyx-core = { path = "../glyx-core" }
 glyx-store = { path = "../glyx-store" }
 glyx-crypto = { path = "../glyx-crypto" }
 glyx-agent = { path = "../glyx-agent" }
+glyx-autofill = { path = "../glyx-autofill" }
 
 [dev-dependencies]
 tower.workspace = true
