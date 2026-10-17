@@ -7,6 +7,7 @@
   let target = '';
   let form = 'encrypted-pointer';
   let glob = '*.md';
+  let exp = { target: '', kind: 'field', item: '', field: 'password', blob: '', ssh: '', keep: false };
   let merging = null;
   let hunks = [];
   let picks = {};
@@ -48,6 +49,51 @@
   async function scan() {
     try {
       await api.scanInjects();
+      await load();
+    } catch (e) {
+      error = e.message;
+    }
+  }
+  async function tUnlock(t) {
+    try {
+      await api.targetUnlock(t);
+      await load();
+    } catch (e) {
+      error = e.message;
+    }
+  }
+  async function tLock(t) {
+    try {
+      await api.targetLock(t);
+      await load();
+    } catch (e) {
+      error = e.message;
+    }
+  }
+  async function tMove(t) {
+    const nu = prompt(`New path for ${t}`, t);
+    if (!nu || nu === t) return;
+    try {
+      await api.targetMove(t, nu);
+      await load();
+    } catch (e) {
+      error = e.message;
+    }
+  }
+  async function addExport() {
+    error = '';
+    try {
+      const body = { target: exp.target, kind: exp.kind, keep: exp.keep };
+      if (exp.kind === 'field') {
+        body.item = exp.item;
+        body.field = exp.field;
+      } else if (exp.kind === 'blob') {
+        body.blob = exp.blob;
+      } else {
+        body.ssh = exp.ssh;
+      }
+      await api.addExport(body);
+      exp.target = '';
       await load();
     } catch (e) {
       error = e.message;
@@ -132,6 +178,9 @@
       <span>{r.root}</span>
       <span class="dim">{r.glob} · {r.form}</span>
       <span style="flex: 1"></span>
+      <button on:click={() => tUnlock(r.root)}>Unlock</button>
+      <button on:click={() => tLock(r.root)}>Lock</button>
+      <button on:click={() => tMove(r.root)}>Move</button>
       <button class="danger" on:click={() => recall(r.root)}>Forget</button>
     </div>
   {/each}
@@ -144,6 +193,9 @@
       <span>{e.target}</span>
       <span class="dim">{e.kind}{e.keep ? ' · keep' : ''}</span>
       <span style="flex: 1"></span>
+      <button on:click={() => tUnlock(e.target)}>Unlock</button>
+      <button on:click={() => tLock(e.target)}>Lock</button>
+      <button on:click={() => tMove(e.target)}>Move</button>
       <button class="danger" on:click={() => recall(e.target)}>Recall</button>
     </div>
   {/each}
@@ -153,6 +205,9 @@
       <span>{i.target}</span>
       <span class="dim">{i.form}</span>
       <span style="flex: 1"></span>
+      <button on:click={() => tUnlock(i.target)}>Unlock</button>
+      <button on:click={() => tLock(i.target)}>Lock</button>
+      <button on:click={() => tMove(i.target)}>Move</button>
       <button on:click={() => preview(i.target)}>Merge</button>
       <button class="danger" on:click={() => recall(i.target)}>Recall</button>
     </div>
@@ -170,6 +225,25 @@
       <option value="ref">ref</option>
     </select>
     <button class="primary" on:click={track}>Track</button>
+  </div>
+  <h3>Add a full-file export</h3>
+  <div class="row">
+    <input bind:value={exp.target} placeholder="/path/to/target" style="flex: 1" />
+    <select bind:value={exp.kind}>
+      <option value="field">field</option>
+      <option value="blob">blob</option>
+      <option value="ssh">ssh</option>
+    </select>
+    {#if exp.kind === 'field'}
+      <input bind:value={exp.item} placeholder="item" />
+      <input bind:value={exp.field} placeholder="field" />
+    {:else if exp.kind === 'blob'}
+      <input bind:value={exp.blob} placeholder="blob address" />
+    {:else}
+      <input bind:value={exp.ssh} placeholder="ssh key item" />
+    {/if}
+    <label class="row"><input type="checkbox" bind:checked={exp.keep} /> keep on lock</label>
+    <button class="primary" on:click={addExport}>Add export</button>
   </div>
   <div class="row" style="margin-top: 12px">
     <button on:click={() => enforce(false)}>Enforce now</button>
