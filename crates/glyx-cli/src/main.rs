@@ -4,6 +4,7 @@ mod exports;
 mod extension;
 mod gitcred;
 mod items;
+mod select;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,7 +27,7 @@ struct Cli {
     #[arg(long, global = true, help = "Ignore sessions, always prompt")]
     no_session: bool,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -178,6 +179,8 @@ enum Cmd {
 
 #[derive(Debug, Subcommand)]
 enum VaultCmd {
+    #[command(about = "Choose the active vault (interactive)")]
+    Select,
     #[command(about = "Create a fresh vault directory")]
     Init {
         #[arg(help = "New vault directory (must not exist)")]
@@ -186,13 +189,18 @@ enum VaultCmd {
         preset: Preset,
         #[arg(long, value_enum, default_value = "xchacha", help = "Payload cipher")]
         cipher: CipherOpt,
-        #[arg(long, help = "Keyfile path; generated when missing")]
-        keyfile: PathBuf,
+        #[arg(
+            long,
+            help = "Keyfile path, generated when missing; omit for password-only"
+        )]
+        keyfile: Option<PathBuf>,
     },
     #[command(about = "Rotate password, keyfile, KDF params, or cipher")]
     Rekey {
         #[arg(long, help = "New keyfile path; generated when missing")]
         new_keyfile: Option<PathBuf>,
+        #[arg(long, help = "Drop the keyfile, keep password only")]
+        no_keyfile: bool,
         #[arg(long, help = "Read new password from this env var")]
         new_password_env: Option<String>,
         #[arg(long, value_enum, help = "New payload cipher")]
@@ -322,6 +330,19 @@ enum ExportCmd {
     },
     #[command(about = "Show tamper findings")]
     Tamper,
+    #[command(about = "Three-way merge a drifted file")]
+    Merge {
+        #[arg(help = "Target path")]
+        target: PathBuf,
+        #[arg(long, help = "Take on-disk side for all conflicts")]
+        theirs: bool,
+        #[arg(long, help = "Take vault side for all conflicts")]
+        ours: bool,
+        #[arg(long, help = "Pick per hunk as N:theirs|ours|custom (repeatable)")]
+        pick: Vec<String>,
+        #[arg(long, help = "Walk conflicts interactively")]
+        interactive: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -422,7 +443,10 @@ fn main() -> Result<()> {
         password_env,
         no_session,
     };
-    dispatch(&ctx, cmd)
+    match cmd {
+        Some(cmd) => dispatch(&ctx, cmd),
+        None => select::cmd_select(ctx.json),
+    }
 }
 
 fn git_credential_main() -> Result<()> {
@@ -592,6 +616,26 @@ fn dispatch_export(ctx: &Ctx, cmd: ExportCmd) -> Result<()> {
             exports::cmd_enforce(&mut uv, force, ctx.json)
         }
         ExportCmd::Tamper => exports::cmd_tamper(ctx.vault.as_ref(), ctx.json),
+        ExportCmd::Merge {
+            target,
+            theirs,
+            ours,
+            pick,
+            interactive,
+        } => {
+            let uv = ctx.unlocked()?;
+            exports::cmd_merge(
+                &uv,
+                &target,
+                exports::MergeOpts {
+                    theirs,
+                    ours,
+                    interactive,
+                },
+                &pick,
+                ctx.json,
+            )
+        }
     }
 }
 
@@ -605,10 +649,13 @@ fn dispatch_inject(ctx: &Ctx, cmd: InjectCmd) -> Result<()> {
 fn dispatch_daemon(ctx: &Ctx, cmd: DaemonCmd) -> Result<()> {
     match cmd {
         DaemonCmd::Start { idle_lock_min } => {
-            daemon::cmd_start(&ctx.vault_path()?, idle_lock_min, ctx.json)
+            daemon::cmd_start(ctx.vault.as_deref(), idle_lock_min, ctx.json)
         }
-        DaemonCmd::Stop => daemon::cmd_stop(&ctx.vault_path()?, ctx.json),
-        DaemonCmd::Status => daemon::cmd_status(&ctx.vault_path()?, ctx.json),
+        DaemonCmd::Stop => daemon::cmd_stop(ctx.json),
+        DaemonCmd::Status => {
+            daemon::cmd_status(ctx.json);
+            Ok(())
+        }
     }
 }
 
@@ -634,14 +681,16 @@ fn dispatch_git(ctx: &Ctx, cmd: GitCmd) -> Result<()> {
 
 fn dispatch_vault(ctx: &Ctx, cmd: VaultCmd) -> Result<()> {
     match cmd {
+        VaultCmd::Select => select::cmd_select(ctx.json),
         VaultCmd::Init {
             path,
             preset,
             cipher,
             keyfile,
-        } => vault_init(ctx, &path, preset, cipher, &keyfile),
+        } => vault_init(ctx, &path, preset, cipher, keyfile.as_deref()),
         VaultCmd::Rekey {
             new_keyfile,
+            no_keyfile,
             new_password_env,
             cipher,
             preset,
@@ -649,6 +698,7 @@ fn dispatch_vault(ctx: &Ctx, cmd: VaultCmd) -> Result<()> {
         } => vault_rekey(
             ctx,
             new_keyfile.as_ref(),
+            no_keyfile,
             new_password_env.as_deref(),
             cipher,
             preset,
@@ -662,16 +712,26 @@ fn vault_init(
     path: &Path,
     preset: Preset,
     cipher: CipherOpt,
-    keyfile: &Path,
+    keyfile: Option<&Path>,
 ) -> Result<()> {
     let password = auth::read_password(ctx.password_env.as_deref())?;
-    let kf = auth::load_or_create_keyfile(keyfile)?;
+    let kf = keyfile.map(auth::load_or_create_keyfile).transpose()?;
     let suite = glyx_core::CipherSuiteConfig {
         kdf: glyx_core::KdfId::Argon2id,
         cipher: cipher_of(cipher),
         params: preset_params(preset),
     };
-    let vault = glyx_store::Vault::init(path, suite, &password, &kf)?;
+    let vault = glyx_store::Vault::init(path, suite, &password, kf.as_ref())?;
+    let mut cfg = auth::load_config();
+    cfg.register(glyx_store::config::VaultEntry {
+        path: path.to_path_buf(),
+        name: None,
+        vault_id: Some(vault.config().vault_id),
+        keyfile: keyfile.map(Path::to_path_buf),
+        last_used_ms: 0,
+    });
+    cfg.select(path);
+    auth::save_config(&cfg)?;
     if ctx.json {
         println!(
             "{}",
@@ -679,11 +739,20 @@ fn vault_init(
                 "ok": true,
                 "vault_id": vault.config().vault_id,
                 "path": path,
+                "keyfile_required": vault.keyfile_required(),
             })
         );
     } else {
         println!("vault created: {}", path.display());
         println!("vault id: {}", vault.config().vault_id);
+        println!(
+            "protection: {}",
+            if vault.keyfile_required() {
+                "password + keyfile"
+            } else {
+                "password only"
+            }
+        );
     }
     Ok(())
 }
@@ -691,27 +760,44 @@ fn vault_init(
 fn vault_rekey(
     ctx: &Ctx,
     new_keyfile: Option<&PathBuf>,
+    no_keyfile: bool,
     new_password_env: Option<&str>,
     cipher: Option<CipherOpt>,
     preset: Option<Preset>,
     keep_old_slots: bool,
 ) -> Result<()> {
+    if new_keyfile.is_some() && no_keyfile {
+        bail!("pass only one of --new-keyfile or --no-keyfile");
+    }
     let vault_path = ctx.vault_path()?;
     let vault = glyx_store::Vault::open(&vault_path)?;
     let mut uv = auth::full_unlock(&vault, ctx.keyfile.as_deref(), ctx.password_env.as_deref())?;
     let old_slots: Vec<Uuid> = uv.list_slots()?.into_iter().map(|(id, _)| id).collect();
-    if new_keyfile.is_none() && new_password_env.is_none() && cipher.is_none() && preset.is_none() {
-        bail!("nothing to rotate: pass --new-keyfile, --new-password-env, --cipher, or --preset");
+    if new_keyfile.is_none()
+        && !no_keyfile
+        && new_password_env.is_none()
+        && cipher.is_none()
+        && preset.is_none()
+    {
+        bail!("nothing to rotate: pass --new-keyfile, --no-keyfile, --new-password-env, --cipher, or --preset");
     }
-    let rotated = new_keyfile.is_some() || new_password_env.is_some();
+    let rotate_keyfile = new_keyfile.is_some() || no_keyfile;
+    let rotated = rotate_keyfile || new_password_env.is_some();
     if rotated {
-        let kf_path = new_keyfile.context("--new-keyfile is required to rotate credentials")?;
-        let new_kf = auth::load_or_create_keyfile(kf_path)?;
+        let (new_kf, required) = if no_keyfile {
+            (glyx_crypto::ZERO_KEYFILE, false)
+        } else {
+            let p = new_keyfile.context("--new-keyfile is required to rotate credentials")?;
+            (auth::load_or_create_keyfile(p)?, true)
+        };
         let new_pw = auth::read_password(new_password_env)?;
         let params = preset.map_or(vault.config().cipher_suite.params, preset_params);
         let id = uv.add_slot_with_params(&new_pw, &new_kf, params)?;
         if !vault.verify_slot(&id, &new_pw, &new_kf)? {
             bail!("new keyslot failed verification");
+        }
+        if rotate_keyfile {
+            uv.set_keyfile_required(required)?;
         }
         if !ctx.json {
             println!("new keyslot verified: {id}");
@@ -1139,12 +1225,12 @@ fn cmd_sync(
     let mut blobs = 0usize;
     if let Some(other_path) = other {
         let other_vault = glyx_store::Vault::open(other_path)?;
-        let kf = other_keyfile
-            .or(ctx.keyfile.as_ref())
-            .context("other vault needs --other-keyfile or --keyfile")?;
+        let kf_bytes = auth::resolve_keyfile(
+            &other_vault,
+            other_keyfile.or(ctx.keyfile.as_ref()).map(PathBuf::as_path),
+        )?;
         let pw_env = other_password_env.or(ctx.password_env.as_deref());
         let pw = auth::read_password(pw_env)?;
-        let kf_bytes = auth::read_keyfile(kf)?;
         let other_uv = other_vault.unlock(&pw, &kf_bytes)?;
         let rep = uv.sync_from(&other_uv)?;
         adopted = rep.adopted;
@@ -1465,8 +1551,7 @@ fn doctor(
         report["rebuilt_index"] = serde_json::json!(n);
     }
     if with_unlock {
-        let kf_path = keyfile.context("--keyfile is required with --with-unlock")?;
-        let kf = auth::read_keyfile(kf_path)?;
+        let kf = auth::resolve_keyfile(&vault, keyfile)?;
         let password = auth::read_password(password_env)?;
         let unlocked = vault.unlock(&password, &kf)?;
         let mut items_ok = 0;

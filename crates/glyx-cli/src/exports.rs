@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 pub struct ExportAdd {
     pub target: PathBuf,
@@ -111,6 +112,152 @@ pub fn cmd_enforce(uv: &mut glyx_store::UnlockedVault, force: bool, as_json: boo
         );
         for s in &rep.skipped {
             println!("skipped: {s} (use --force)");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub struct MergeOpts {
+    pub theirs: bool,
+    pub ours: bool,
+    pub interactive: bool,
+}
+
+pub fn cmd_merge(
+    uv: &glyx_store::UnlockedVault,
+    target: &std::path::Path,
+    opts: MergeOpts,
+    pick: &[String],
+    as_json: bool,
+) -> Result<()> {
+    use std::collections::BTreeMap;
+    let preview = glyx_agent::engine::preview_merge(uv, target).map_err(|e| anyhow::anyhow!(e))?;
+    let conflicts = glyx_agent::merge::conflict_indexes(&preview.hunks);
+    if conflicts.is_empty() {
+        let merged = glyx_agent::engine::apply_merge(uv, target, &BTreeMap::new())
+            .map_err(|e| anyhow::anyhow!(e))?;
+        if as_json {
+            println!("{}", serde_json::json!({"ok": true, "conflicts": 0}));
+        } else {
+            println!(
+                "merged {} ({} bytes, no conflicts)",
+                target.display(),
+                merged.len()
+            );
+        }
+        return Ok(());
+    }
+    let mut picks = BTreeMap::new();
+    if opts.theirs {
+        for idx in &conflicts {
+            picks.insert(*idx, glyx_agent::merge::Pick::Theirs);
+        }
+    } else if opts.ours {
+        for idx in &conflicts {
+            picks.insert(*idx, glyx_agent::merge::Pick::Ours);
+        }
+    }
+    for spec in pick {
+        let (idx, choice) = spec
+            .split_once(':')
+            .context("pick looks like N:theirs|ours")?;
+        let idx: usize = idx.parse().context("pick index must be a number")?;
+        if !conflicts.contains(&idx) {
+            bail!("hunk {idx} is not a conflict");
+        }
+        picks.insert(
+            idx,
+            match choice {
+                "theirs" => glyx_agent::merge::Pick::Theirs,
+                "ours" => glyx_agent::merge::Pick::Ours,
+                custom => glyx_agent::merge::Pick::Custom(custom.to_owned()),
+            },
+        );
+    }
+    if picks.len() < conflicts.len() {
+        if !opts.interactive {
+            bail!(
+                "{} conflict(s) need picks ({}); pass --theirs, --ours, --pick, or --interactive",
+                conflicts.len(),
+                conflicts
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+        walkthrough(&preview, &conflicts, &mut picks)?;
+    }
+    let merged =
+        glyx_agent::engine::apply_merge(uv, target, &picks).map_err(|e| anyhow::anyhow!(e))?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::json!({"ok": true, "conflicts": conflicts.len(), "bytes": merged.len()})
+        );
+    } else {
+        println!(
+            "merged {} ({} conflict(s) resolved)",
+            target.display(),
+            conflicts.len()
+        );
+    }
+    Ok(())
+}
+
+fn walkthrough(
+    preview: &glyx_agent::engine::MergePreview,
+    conflicts: &[usize],
+    picks: &mut BTreeMap<usize, glyx_agent::merge::Pick>,
+) -> Result<()> {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() {
+        bail!("no TTY: pass --theirs, --ours, or --pick");
+    }
+    println!(
+        "{} conflict(s) in {}",
+        conflicts.len(),
+        preview.target.display()
+    );
+    for idx in conflicts {
+        if picks.contains_key(idx) {
+            continue;
+        }
+        let hunk = &preview.hunks[*idx];
+        println!(
+            "--- hunk {idx}{} ---",
+            if hunk.secret { " [secret]" } else { "" }
+        );
+        for line in &hunk.base {
+            println!("  base   | {line}");
+        }
+        for line in &hunk.theirs {
+            println!("  theirs | {line}");
+        }
+        for line in &hunk.ours {
+            println!("  ours   | {line}");
+        }
+        let choice = inquire::Select::new("resolve", vec!["theirs", "ours", "custom", "quit"])
+            .prompt()
+            .map_err(|e| anyhow::anyhow!(e))?;
+        match choice {
+            "theirs" => {
+                picks.insert(*idx, glyx_agent::merge::Pick::Theirs);
+            }
+            "ours" => {
+                picks.insert(*idx, glyx_agent::merge::Pick::Ours);
+            }
+            "custom" => {
+                let text = inquire::Text::new("replacement lines (\\n separated)")
+                    .prompt()
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                picks.insert(
+                    *idx,
+                    glyx_agent::merge::Pick::Custom(text.replace("\\n", "\n")),
+                );
+            }
+            _ => bail!("aborted, file untouched"),
         }
     }
     Ok(())
