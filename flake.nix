@@ -164,6 +164,8 @@
           cargoBuildFlags = [
             "--bin"
             "glyx-tauri"
+            "--bin"
+            "glyx-daemon"
           ];
           cargoTestFlags = [
             "-p"

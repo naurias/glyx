@@ -1869,6 +1869,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "similar",
  "ssh-key",
  "tempfile",
  "thiserror 1.0.69",
@@ -1896,6 +1897,7 @@ dependencies = [
  "glyx-autofill",
  "glyx-core",
  "glyx-crypto",
+ "glyx-daemon",
  "glyx-store",
  "inquire",
  "rpassword",
@@ -1970,7 +1972,7 @@ dependencies = [
  "glyx-store",
  "serde",
  "serde_json",
- "uuid",
+ "toml 0.8.2",
 ]
 
 [[package]]
@@ -2009,6 +2011,9 @@ dependencies = [
 name = "glyx-tauri"
 version = "0.1.0"
 dependencies = [
+ "glyx-core",
+ "glyx-daemon",
+ "glyx-store",
  "tauri",
  "tauri-build",
  "tauri-plugin-global-shortcut",
@@ -4399,6 +4404,12 @@ name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "siphasher"
