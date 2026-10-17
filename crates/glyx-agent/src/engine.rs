@@ -320,6 +320,41 @@ pub fn enforce_all(
     materialize_all(uv, force)
 }
 
+pub fn materialize_target(
+    uv: &mut glyx_store::UnlockedVault,
+    target: &Path,
+    force: bool,
+) -> Result<MaterializeReport, AgentError> {
+    let conn = open_db()?;
+    let mut report = MaterializeReport::default();
+    if target.is_dir() {
+        if let Ok(expanded) = expand_inject_roots(&conn) {
+            report.scanned = expanded.files;
+        }
+    }
+    for row in list_exports(&conn)? {
+        if row.target.as_path() == target {
+            materialize_export(uv, &row)?;
+            report.files += 1;
+        }
+    }
+    for row in list_injects(&conn)? {
+        if !in_scope(Some(target), &row.target) {
+            continue;
+        }
+        match materialize_inject(uv, &conn, &row, force) {
+            Ok(n) => report.injected += n,
+            Err(AgentError::Tamper(detail)) if !force => {
+                report
+                    .skipped
+                    .push(format!("{}: {detail}", row.target.display()));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(report)
+}
+
 pub fn recall_target(target: &Path) -> Result<bool, AgentError> {
     let conn = open_db()?;
     ledger_recall(&conn, target)
@@ -339,10 +374,17 @@ pub fn forget_target(target: &Path) -> Result<bool, AgentError> {
 }
 
 pub fn teardown_all(uv: &glyx_store::UnlockedVault) -> Result<TeardownReport, AgentError> {
+    teardown_targets(uv, None)
+}
+
+pub fn teardown_targets(
+    uv: &glyx_store::UnlockedVault,
+    target: Option<&Path>,
+) -> Result<TeardownReport, AgentError> {
     let conn = open_db()?;
     let mut report = TeardownReport::default();
     for row in list_exports(&conn)? {
-        if row.keep_on_lock {
+        if row.keep_on_lock || !in_scope(target, &row.target) {
             continue;
         }
         if row.target.exists() {
@@ -351,6 +393,9 @@ pub fn teardown_all(uv: &glyx_store::UnlockedVault) -> Result<TeardownReport, Ag
         }
     }
     for row in list_injects(&conn)? {
+        if !in_scope(target, &row.target) {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(&row.target) else {
             continue;
         };
@@ -400,6 +445,86 @@ pub fn teardown_all(uv: &glyx_store::UnlockedVault) -> Result<TeardownReport, Ag
         report.restored += 1;
     }
     Ok(report)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RelocateReport {
+    pub exports: usize,
+    pub roots: usize,
+    pub injects: usize,
+}
+
+pub fn relocate_target(
+    uv: &glyx_store::UnlockedVault,
+    old: &Path,
+    new: &Path,
+) -> Result<RelocateReport, AgentError> {
+    let conn = open_db()?;
+    let mut report = RelocateReport::default();
+    let old_str = old.to_string_lossy().into_owned();
+    let new_str = new.to_string_lossy().into_owned();
+    report.exports = conn.execute(
+        "UPDATE exports SET target = ?1 WHERE target = ?2",
+        rusqlite::params![new_str, old_str],
+    )?;
+    if old.is_dir() {
+        report.roots = conn.execute(
+            "UPDATE inject_roots SET root = ?1 WHERE root = ?2",
+            rusqlite::params![new_str, old_str],
+        )?;
+    }
+    for row in list_injects(&conn)? {
+        let row_str = row.target.to_string_lossy().into_owned();
+        let under_root = old.is_dir() && row.target.starts_with(old);
+        if row_str != old_str && !under_root {
+            continue;
+        }
+        let new_target = if row_str == old_str {
+            new.to_path_buf()
+        } else {
+            let rel = row
+                .target
+                .strip_prefix(old)
+                .unwrap_or_else(|_| Path::new(""));
+            new.join(rel)
+        };
+        let new_target_str = new_target.to_string_lossy().into_owned();
+        let form = parse_form(&row.form)?;
+        let mut refs: Vec<RefInfo> = serde_json::from_str(&row.refs_json).unwrap_or_default();
+        let existing = std::fs::read_to_string(&new_target).ok();
+        let mut rewritten = existing.clone();
+        for r in &mut refs {
+            let new_locked = uv.render_locked(&r.item_id, &r.field, &new_target_str, form)?;
+            if let Some(text) = rewritten.as_mut() {
+                if text.contains(&r.locked) {
+                    *text = text.replace(&r.locked, &new_locked);
+                }
+            }
+            r.locked = new_locked;
+        }
+        if let (Some(before), Some(after)) = (existing, rewritten.as_ref()) {
+            if before != *after {
+                std::fs::write(&new_target, after.as_bytes())?;
+            }
+        }
+        conn.execute(
+            "UPDATE injects SET target = ?1, refs_json = ?2 WHERE target = ?3",
+            rusqlite::params![
+                new_target_str,
+                serde_json::to_string(&refs).unwrap_or_default(),
+                row_str,
+            ],
+        )?;
+        report.injects += 1;
+    }
+    Ok(report)
+}
+
+fn in_scope(target: Option<&Path>, candidate: &Path) -> bool {
+    match target {
+        None => true,
+        Some(t) => candidate == t || (t.is_dir() && candidate.starts_with(t)),
+    }
 }
 
 pub fn crash_replay(uv: &glyx_store::UnlockedVault) -> Result<TeardownReport, AgentError> {
@@ -520,13 +645,8 @@ mod tests {
     use super::*;
     use crate::ledger::{register_export, register_inject};
 
-    #[test]
-    fn full_cycle_file_and_inject() {
-        let _env = ENV_LOCK.lock().expect("lock");
-        let runtime = tempfile::tempdir().expect("tempdir");
-        std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
-        let work = tempfile::tempdir().expect("tempdir");
-        let vpath = work.path().join("v.glyx");
+    fn login_vault(work: &std::path::Path) -> (glyx_store::UnlockedVault, Uuid) {
+        let vpath = work.join("v.glyx");
         let suite = glyx_core::CipherSuiteConfig {
             kdf: glyx_core::KdfId::Argon2id,
             cipher: glyx_core::Cipher::Xchacha20poly1305,
@@ -559,6 +679,16 @@ mod tests {
         };
         let id = item.id;
         uv.put_item(&item).expect("put");
+        (uv, id)
+    }
+
+    #[test]
+    fn full_cycle_file_and_inject() {
+        let _env = ENV_LOCK.lock().expect("lock");
+        let runtime = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
+        let work = tempfile::tempdir().expect("tempdir");
+        let (mut uv, id) = login_vault(work.path());
         let conn = open_db().expect("db");
         let target = work.path().join("out.txt");
         register_export(
@@ -637,39 +767,7 @@ mod tests {
         let runtime = tempfile::tempdir().expect("tempdir");
         std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
         let work = tempfile::tempdir().expect("tempdir");
-        let vpath = work.path().join("v.glyx");
-        let suite = glyx_core::CipherSuiteConfig {
-            kdf: glyx_core::KdfId::Argon2id,
-            cipher: glyx_core::Cipher::Xchacha20poly1305,
-            params: glyx_core::KdfParams::mobile(),
-        };
-        glyx_store::Vault::init(&vpath, suite, b"pw", Some(&[1u8; 32])).expect("init");
-        let vault = glyx_store::Vault::open(&vpath).expect("open");
-        let mut uv = vault.unlock(b"pw", &[1u8; 32]).expect("unlock");
-        let hlc = uv.next_hlc().expect("tick");
-        let node = uv.device_node();
-        let mut fields = BTreeMap::new();
-        fields.insert(
-            "password".to_owned(),
-            glyx_core::Field {
-                value: glyx_core::SecretString::new("s3cret".to_owned()),
-                field_hlc: hlc,
-            },
-        );
-        let item = glyx_core::Item {
-            id: Uuid::now_v7(),
-            item_type: glyx_core::ItemType::Login,
-            name: "x".to_owned(),
-            folder: String::new(),
-            tags: Vec::new(),
-            fields,
-            hlc,
-            rev: 1,
-            deleted: false,
-            updated_by: node,
-        };
-        let id = item.id;
-        uv.put_item(&item).expect("put");
+        let (uv, id) = login_vault(work.path());
 
         let target = work.path().join("public.env");
         let target_str = target.to_string_lossy().into_owned();
@@ -725,6 +823,90 @@ mod tests {
         assert_eq!(n, 0);
         let untouched = std::fs::read_to_string(&other).expect("read");
         assert!(untouched.contains(&pointer), "{untouched}");
+    }
+
+    #[test]
+    fn relocate_reseals_pointers_and_scopes_targets() {
+        let _env = ENV_LOCK.lock().expect("lock");
+        let runtime = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
+        let work = tempfile::tempdir().expect("tempdir");
+        let (mut uv, id) = login_vault(work.path());
+
+        let conn = open_db().expect("db");
+        let old = work.path().join("public.env");
+        let other = work.path().join("other.env");
+        std::fs::write(&old, format!("password = {{{{glyx:{id}/password}}}}\n")).expect("write");
+        std::fs::write(&other, format!("password = {{{{glyx:{id}/password}}}}\n")).expect("write");
+        register_inject(&conn, &old, "encrypted-pointer", None).expect("register old");
+        register_inject(&conn, &other, "encrypted-pointer", None).expect("register other");
+
+        let row = list_injects(&conn)
+            .expect("list")
+            .into_iter()
+            .find(|r| r.target == old)
+            .expect("row");
+        materialize_inject(&uv, &conn, &row, false).expect("materialize");
+        assert!(std::fs::read_to_string(&old)
+            .expect("read")
+            .contains("s3cret"));
+
+        teardown_targets(&uv, Some(&old)).expect("lock target");
+        let locked_old = std::fs::read_to_string(&old).expect("read");
+        assert!(locked_old.contains("__GLYXENC:V1:"), "{locked_old}");
+        let refs_old: Vec<RefInfo> = serde_json::from_str(
+            &list_injects(&conn)
+                .expect("list")
+                .into_iter()
+                .find(|r| r.target == old)
+                .expect("row")
+                .refs_json,
+        )
+        .expect("refs");
+        let old_token = refs_old[0].locked.clone();
+
+        let new = work.path().join("moved.env");
+        std::fs::rename(&old, &new).expect("rename");
+        let rep = relocate_target(&uv, &old, &new).expect("relocate");
+        assert_eq!(rep.injects, 1);
+        assert!(list_injects(&conn)
+            .expect("list")
+            .iter()
+            .any(|r| r.target == new));
+        assert!(!list_injects(&conn)
+            .expect("list")
+            .iter()
+            .any(|r| r.target == old));
+
+        let row_new = list_injects(&conn)
+            .expect("list")
+            .into_iter()
+            .find(|r| r.target == new)
+            .expect("row new");
+        let refs_new: Vec<RefInfo> = serde_json::from_str(&row_new.refs_json).expect("refs");
+        assert_ne!(
+            refs_new[0].locked, old_token,
+            "pointer resealed for new path"
+        );
+        let locked_new = std::fs::read_to_string(&new).expect("read");
+        assert!(locked_new.contains(&refs_new[0].locked), "{locked_new}");
+
+        let other_text = std::fs::read_to_string(&other).expect("read");
+        assert!(
+            other_text.contains(&format!("{{{{glyx:{id}/password}}}}")),
+            "other target untouched: {other_text}"
+        );
+
+        let rep2 = materialize_target(&mut uv, &new, false).expect("materialize new");
+        assert_eq!(rep2.injected, 1);
+        assert!(std::fs::read_to_string(&new)
+            .expect("read")
+            .contains("s3cret"));
+
+        teardown_targets(&uv, Some(&new)).expect("relock");
+        assert!(std::fs::read_to_string(&new)
+            .expect("read")
+            .contains(&refs_new[0].locked));
     }
 }
 
