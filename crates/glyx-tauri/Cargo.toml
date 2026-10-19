@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "glyx_tauri"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
 [[bin]]
 name = "glyx-tauri"
 path = "src/main.rs"
@@ -17,6 +21,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-global-shortcut = { version = "2" }
+tokio.workspace = true
 glyx-core = { path = "../glyx-core" }
+glyx-crypto = { path = "../glyx-crypto" }
 glyx-store = { path = "../glyx-store" }
 glyx-daemon = { path = "../glyx-daemon" }
