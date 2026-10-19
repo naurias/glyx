@@ -10,6 +10,7 @@ enum Action {
     Use(PathBuf),
     AddCustom,
     CreateNew,
+    RemovePicker,
 }
 
 struct Item {
@@ -114,6 +115,10 @@ fn wizard() -> Result<()> {
         label: "Create and configure new vault".to_owned(),
         action: Action::CreateNew,
     });
+    items.push(Item {
+        label: "Remove a vault from the list".to_owned(),
+        action: Action::RemovePicker,
+    });
     let choice = Select::new("Select a vault:", items).prompt()?;
     match choice.action {
         Action::Use(path) => {
@@ -124,7 +129,37 @@ fn wizard() -> Result<()> {
         }
         Action::AddCustom => add_custom()?,
         Action::CreateNew => create_new()?,
+        Action::RemovePicker => remove_vault()?,
     }
+    Ok(())
+}
+
+fn remove_vault() -> Result<()> {
+    let cfg = auth::load_config();
+    if cfg.vaults.is_empty() {
+        println!("no vaults registered");
+        return Ok(());
+    }
+    let items: Vec<Item> = cfg
+        .vaults
+        .iter()
+        .map(|e| Item {
+            label: format!("{}  {}", e.label(), e.path.display()),
+            action: Action::Use(e.path.clone()),
+        })
+        .collect();
+    let choice = Select::new("Remove which vault (files untouched):", items).prompt()?;
+    let Action::Use(path) = choice.action else {
+        return Ok(());
+    };
+    let mut cfg = auth::load_config();
+    let entry = cfg.find(&path).cloned();
+    cfg.remove(&path);
+    auth::save_config(&cfg)?;
+    if let Some(id) = entry.and_then(|e| e.vault_id) {
+        glyx_store::session::wipe_ticket(&id);
+    }
+    println!("removed {} from the list (files untouched)", path.display());
     Ok(())
 }
 

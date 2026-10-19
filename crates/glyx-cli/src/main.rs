@@ -102,6 +102,12 @@ enum Cmd {
         delete_field: Vec<String>,
         #[arg(long, help = "Read the note body from a file")]
         body_file: Option<PathBuf>,
+        #[arg(long, help = "Move to a folder (empty string clears)")]
+        folder: Option<String>,
+        #[arg(long, help = "Add a tag (repeatable)")]
+        tag: Vec<String>,
+        #[arg(long, help = "Remove a tag (repeatable)")]
+        remove_tag: Vec<String>,
         #[arg(long, help = "Prompt for fields")]
         interactive: bool,
     },
@@ -186,6 +192,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GitCmd,
     },
+    #[command(about = "Show or change app settings")]
+    Config {
+        #[command(subcommand)]
+        cmd: Option<ConfigCmd>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -220,6 +231,24 @@ enum VaultCmd {
         preset: Option<Preset>,
         #[arg(long, help = "Keep old keyslots")]
         keep_old_slots: bool,
+    },
+    #[command(about = "Remove a vault from the registry (files untouched)")]
+    Forget {
+        #[arg(help = "Vault directory (defaults to the selected vault)")]
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCmd {
+    #[command(about = "Print current settings")]
+    Show,
+    #[command(about = "Change one setting")]
+    Set {
+        #[arg(help = "Key: mode, session_ttl_min, auto_materialize, daemon_on_exit")]
+        key: String,
+        #[arg(help = "New value")]
+        value: String,
     },
 }
 
@@ -555,15 +584,23 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             field,
             delete_field,
             body_file,
+            folder,
+            tag,
+            remove_tag,
             interactive,
         } => cmd_edit(
             ctx,
-            &query,
-            rename,
-            &field,
-            &delete_field,
-            body_file.as_ref(),
-            interactive,
+            EditInput {
+                query,
+                rename,
+                field,
+                delete_field,
+                body_file,
+                folder,
+                tag,
+                remove_tag,
+                interactive,
+            },
         ),
         Cmd::Rm { query } => cmd_rm(ctx, &query),
         Cmd::Totp { query } => cmd_totp(ctx, &query),
@@ -629,6 +666,7 @@ fn dispatch_grouped(ctx: &Ctx, cmd: Cmd) -> Result<()> {
         Cmd::Daemon { cmd } => dispatch_daemon(ctx, cmd),
         Cmd::Extension { cmd } => dispatch_extension(ctx, cmd),
         Cmd::Git { cmd } => dispatch_git(ctx, cmd),
+        Cmd::Config { cmd } => cmd_config(ctx, cmd),
         Cmd::Ls { .. }
         | Cmd::Show { .. }
         | Cmd::Add { .. }
@@ -793,7 +831,98 @@ fn dispatch_vault(ctx: &Ctx, cmd: VaultCmd) -> Result<()> {
             preset,
             keep_old_slots,
         ),
+        VaultCmd::Forget { path } => vault_forget(ctx, path.as_deref()),
     }
+}
+
+fn vault_forget(ctx: &Ctx, path: Option<&Path>) -> Result<()> {
+    let target = match path {
+        Some(p) => glyx_store::config::normalize(p),
+        None => ctx.vault_path()?,
+    };
+    let mut cfg = auth::load_config();
+    let Some(entry) = cfg.find(&target).cloned() else {
+        bail!("not registered: {}", target.display());
+    };
+    cfg.remove(&target);
+    auth::save_config(&cfg)?;
+    if let Some(id) = entry.vault_id {
+        glyx_store::session::wipe_ticket(&id);
+    }
+    if ctx.json {
+        println!("{}", serde_json::json!({"ok": true, "forgotten": target}));
+    } else {
+        println!("forgot {} (vault files untouched)", target.display());
+    }
+    Ok(())
+}
+
+fn cmd_config(ctx: &Ctx, cmd: Option<ConfigCmd>) -> Result<()> {
+    use glyx_store::config::{DaemonExit, SessionMode};
+    let mut cfg = auth::load_config();
+    match cmd {
+        None | Some(ConfigCmd::Show) => {
+            if ctx.json {
+                println!("{}", serde_json::to_string(&cfg)?);
+            } else {
+                let mode = match cfg.mode {
+                    SessionMode::Oneshot => "oneshot",
+                    SessionMode::Session => "session",
+                };
+                let exit = match cfg.daemon_on_exit {
+                    DaemonExit::Stop => "stop",
+                    DaemonExit::Keep => "keep",
+                };
+                println!("mode = {mode}");
+                println!("session_ttl_min = {}", cfg.session_ttl_min);
+                println!("auto_materialize = {}", cfg.auto_materialize);
+                println!("daemon_on_exit = {exit}");
+                println!(
+                    "current_vault = {}",
+                    cfg.current_vault
+                        .as_ref()
+                        .map_or_else(|| "-".to_owned(), |p| p.display().to_string())
+                );
+            }
+        }
+        Some(ConfigCmd::Set { key, value }) => {
+            match key.as_str() {
+                "mode" => {
+                    cfg.mode = match value.as_str() {
+                        "session" => SessionMode::Session,
+                        "oneshot" => SessionMode::Oneshot,
+                        other => bail!("mode must be oneshot or session, got {other}"),
+                    };
+                }
+                "session_ttl_min" => {
+                    let parsed: u64 = value.parse().context("session_ttl_min must be a number")?;
+                    cfg.session_ttl_min = parsed.clamp(1, glyx_store::session::SESSION_TTL_MAX_MIN);
+                }
+                "auto_materialize" => {
+                    cfg.auto_materialize = match value.as_str() {
+                        "true" | "1" | "yes" | "on" => true,
+                        "false" | "0" | "no" | "off" => false,
+                        other => bail!("auto_materialize must be true or false, got {other}"),
+                    };
+                }
+                "daemon_on_exit" => {
+                    cfg.daemon_on_exit = match value.as_str() {
+                        "keep" => DaemonExit::Keep,
+                        "stop" => DaemonExit::Stop,
+                        other => bail!("daemon_on_exit must be stop or keep, got {other}"),
+                    };
+                }
+                other => bail!("unknown setting {other}"),
+            }
+            auth::save_config(&cfg)?;
+            if ctx.json {
+                println!("{}", serde_json::json!({"ok": true, "key": key}));
+            } else {
+                println!("set {key} = {value}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn vault_init(
@@ -1108,6 +1237,18 @@ struct AddInput {
     interactive: bool,
 }
 
+struct EditInput {
+    query: String,
+    rename: Option<String>,
+    field: Vec<String>,
+    delete_field: Vec<String>,
+    body_file: Option<PathBuf>,
+    folder: Option<String>,
+    tag: Vec<String>,
+    remove_tag: Vec<String>,
+    interactive: bool,
+}
+
 fn cmd_add(ctx: &Ctx, input: AddInput) -> Result<()> {
     let mut uv = ctx.unlocked()?;
     let parsed =
@@ -1143,27 +1284,42 @@ fn cmd_add(ctx: &Ctx, input: AddInput) -> Result<()> {
     Ok(())
 }
 
-fn cmd_edit(
-    ctx: &Ctx,
-    query: &str,
-    rename: Option<String>,
-    field: &[String],
-    delete_field: &[String],
-    body_file: Option<&PathBuf>,
-    interactive: bool,
-) -> Result<()> {
+fn cmd_edit(ctx: &Ctx, input: EditInput) -> Result<()> {
+    let EditInput {
+        query,
+        rename,
+        field,
+        delete_field,
+        body_file,
+        folder,
+        tag,
+        remove_tag,
+        interactive,
+    } = input;
     let mut uv = ctx.unlocked()?;
-    let mut item = items::resolve_query(&uv, query)?;
+    let mut item = items::resolve_query(&uv, &query)?;
     let renamed = rename.is_some();
     if let Some(name) = rename {
         item.name = name;
     }
+    let folder_set = folder.is_some();
+    if let Some(folder) = folder {
+        item.folder = folder;
+    }
+    for t in &tag {
+        if !item.tags.contains(t) {
+            item.tags.push(t.clone());
+        }
+    }
+    for t in &remove_tag {
+        item.tags.retain(|x| x != t);
+    }
     let mut values = BTreeMap::new();
-    for pair in field {
+    for pair in &field {
         let (k, v) = items::split_field(pair)?;
         values.insert(k, v);
     }
-    if let Some(path) = body_file {
+    if let Some(path) = &body_file {
         let body = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read {}", path.display()))?;
         values.insert("body".to_owned(), body);
@@ -1171,11 +1327,19 @@ fn cmd_edit(
     if interactive {
         items::wizard_fill(item.item_type, &mut values, Some(&item))?;
     }
-    for k in delete_field {
+    for k in &delete_field {
         item.fields.remove(k);
     }
     items::apply_fields(&mut uv, &mut item, values)?;
-    if !field.is_empty() || !delete_field.is_empty() || renamed || interactive {
+    let changed = !field.is_empty()
+        || !delete_field.is_empty()
+        || renamed
+        || body_file.is_some()
+        || interactive
+        || folder_set
+        || !tag.is_empty()
+        || !remove_tag.is_empty();
+    if changed {
         uv.put_item(&item)?;
     }
     if ctx.json {

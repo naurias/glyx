@@ -22,6 +22,14 @@ enum Screen {
     Help,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    None,
+    Quit,
+    Lock,
+    Vault,
+}
+
 struct FieldInput {
     name: String,
     value: String,
@@ -33,6 +41,7 @@ struct Form {
     kind: glyx_core::ItemType,
     name: String,
     folder: String,
+    tags: String,
     fields: Vec<FieldInput>,
     focus: usize,
 }
@@ -46,10 +55,11 @@ struct App {
     screen: Screen,
     detail: Option<glyx_core::Item>,
     reveal: bool,
+    render: bool,
     form: Option<Form>,
     status: String,
-    quit: bool,
-    want_vault: bool,
+    exit: Exit,
+    pending_clear: Option<(String, std::time::Instant)>,
 }
 
 fn build_fields(kind: glyx_core::ItemType) -> Vec<FieldInput> {
@@ -63,6 +73,16 @@ fn build_fields(kind: glyx_core::ItemType) -> Vec<FieldInput> {
         .collect()
 }
 
+fn parse_tags(text: &str) -> Vec<String> {
+    let mut tags: Vec<String> = text
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    tags.dedup();
+    tags
+}
+
 impl App {
     fn new(uv: glyx_store::UnlockedVault) -> Result<Self> {
         let mut app = Self {
@@ -74,10 +94,11 @@ impl App {
             screen: Screen::List,
             detail: None,
             reveal: false,
+            render: false,
             form: None,
             status: String::new(),
-            quit: false,
-            want_vault: false,
+            exit: Exit::None,
+            pending_clear: None,
         };
         app.reload()?;
         Ok(app)
@@ -119,6 +140,7 @@ impl App {
         };
         self.detail = self.uv.get_item(&row.id)?;
         self.reveal = false;
+        self.render = false;
         self.screen = Screen::Detail;
         Ok(())
     }
@@ -135,10 +157,33 @@ impl App {
         };
         match field {
             Some((name, value)) => match glyx_autofill::clipboard::copy(&value) {
-                Ok(()) => self.status = format!("{name} copied to clipboard"),
+                Ok(()) => {
+                    self.status = format!("{name} copied (clears in 15s)");
+                    self.pending_clear = Some((
+                        value,
+                        std::time::Instant::now() + std::time::Duration::from_secs(15),
+                    ));
+                }
                 Err(_) => "clipboard unavailable".clone_into(&mut self.status),
             },
             None => "no secret field on this item".clone_into(&mut self.status),
+        }
+    }
+
+    fn flush_clipboard(&mut self) {
+        if let Some((value, _)) = self.pending_clear.take() {
+            let _ = glyx_autofill::clipboard::clear_if_ours(&value);
+        }
+    }
+
+    fn clear_expired_clipboard(&mut self) {
+        let due = self
+            .pending_clear
+            .as_ref()
+            .is_some_and(|(_, deadline)| std::time::Instant::now() >= *deadline);
+        if due {
+            self.flush_clipboard();
+            "clipboard cleared".clone_into(&mut self.status);
         }
     }
 
@@ -164,6 +209,7 @@ impl App {
             kind,
             name: String::new(),
             folder: String::new(),
+            tags: String::new(),
             fields: build_fields(kind),
             focus: 1,
         });
@@ -171,7 +217,7 @@ impl App {
     }
 
     fn start_edit(&mut self) {
-        let (id, kind, name, folder, values) = {
+        let (id, kind, name, folder, tags, values) = {
             let Some(item) = self.detail.as_ref() else {
                 return;
             };
@@ -180,6 +226,7 @@ impl App {
                 item.item_type,
                 item.name.clone(),
                 item.folder.clone(),
+                item.tags.join(", "),
                 item.fields
                     .iter()
                     .map(|(k, f)| (k.clone(), f.value.expose().to_owned()))
@@ -197,6 +244,7 @@ impl App {
             kind,
             name,
             folder,
+            tags,
             fields,
             focus: 1,
         });
@@ -231,6 +279,7 @@ impl App {
                 .ok_or_else(|| anyhow::anyhow!("item vanished"))?;
             item.name.clone_from(&form.name);
             item.folder.clone_from(&form.folder);
+            item.tags = parse_tags(&form.tags);
             glyx_store::present::apply_fields(&mut self.uv, &mut item, values)?;
             self.uv.put_item(&item)?;
             self.detail = Some(item);
@@ -242,7 +291,7 @@ impl App {
                 form.kind,
                 form.name.clone(),
                 form.folder.clone(),
-                Vec::new(),
+                parse_tags(&form.tags),
                 values,
             )?;
             let id = item.id;
@@ -330,20 +379,31 @@ fn draw_detail(f: &mut Frame, app: &App) {
         )),
         Line::from(""),
     ];
-    for (k, f) in &item.fields {
-        let show = glyx_store::present::display_value(item.item_type, k, app.reveal);
-        lines.push(Line::from(format!(
-            "{k}: {}",
-            if show {
-                f.value.expose().to_owned()
-            } else {
-                "\u{2022}\u{2022}\u{2022}\u{2022}".to_owned()
+    if item.item_type == glyx_core::ItemType::Note && app.render {
+        match glyx_store::present::note_rendered(&app.uv, item, app.reveal) {
+            Ok(text) => {
+                for line in text.lines() {
+                    lines.push(Line::from(line.to_owned()));
+                }
             }
-        )));
+            Err(e) => lines.push(Line::from(format!("render error: {e}"))),
+        }
+    } else {
+        for (k, f) in &item.fields {
+            let show = glyx_store::present::display_value(item.item_type, k, app.reveal);
+            lines.push(Line::from(format!(
+                "{k}: {}",
+                if show {
+                    f.value.expose().to_owned()
+                } else {
+                    "\u{2022}\u{2022}\u{2022}\u{2022}".to_owned()
+                }
+            )));
+        }
     }
     lines.push(Line::from(""));
     lines.push(Line::from(
-        "r reveal  c copy secret  t totp  e edit  d delete  Esc back",
+        "r reveal  c copy secret  t totp  m render  e edit  d delete  Esc back",
     ));
     let para = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("Item"))
@@ -368,6 +428,7 @@ fn draw_form(f: &mut Frame, app: &App) {
     lines.push(Line::from(type_line));
     lines.push(Line::from(format!("Name: {}", form.name)));
     lines.push(Line::from(format!("Folder: {}", form.folder)));
+    lines.push(Line::from(format!("Tags: {}", form.tags)));
     for field in &form.fields {
         lines.push(Line::from(format!(
             "{}: {}",
@@ -376,12 +437,14 @@ fn draw_form(f: &mut Frame, app: &App) {
         )));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from("Tab move  Enter save  Esc cancel"));
-    let focus = form.focus.min(2 + form.fields.len());
+    lines.push(Line::from(
+        "Tab move  Ctrl+G generate  Enter save  Esc cancel",
+    ));
+    let focus = form.focus.min(4 + form.fields.len());
     let mut para =
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Edit"));
-    if focus >= 3 {
-        para = para.scroll((u16::try_from(focus - 2).unwrap_or(0), 0));
+    if focus >= 4 {
+        para = para.scroll((u16::try_from(focus - 3).unwrap_or(0), 0));
     }
     f.render_widget(para, f.area());
 }
@@ -395,8 +458,8 @@ fn draw_help(f: &mut Frame) {
         Line::from(""),
         Line::from("List:  type to search, Up/Down move, Enter open"),
         Line::from("       a add, v vaults, l lock & quit, q quit, ? help"),
-        Line::from("Item:  r reveal, c copy secret, t totp, e edit, d delete"),
-        Line::from("Form:  Tab/Up/Down move, Enter save, Esc cancel"),
+        Line::from("Item:  r reveal, c copy secret, t totp, m render, e edit, d delete"),
+        Line::from("Form:  Tab/Up/Down move, Ctrl+G generate, Enter save, Esc cancel"),
         Line::from(""),
         Line::from("Press any key to return"),
     ];
@@ -433,7 +496,20 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let Some(form) = app.form.as_mut() else {
         return Ok(());
     };
-    let last_focus = 2 + form.fields.len();
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
+        if form.focus >= 4 {
+            let idx = form.focus - 4;
+            if let Some(field) = form.fields.get_mut(idx) {
+                if field.secret {
+                    if let Ok(pw) = glyx_crypto::pass::generate_password(24) {
+                        field.value = pw;
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+    let last_focus = 4 + form.fields.len();
     match key.code {
         KeyCode::Esc => {
             app.form = None;
@@ -467,8 +543,11 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
             2 => {
                 form.folder.pop();
             }
+            3 => {
+                form.tags.pop();
+            }
             n => {
-                if let Some(field) = form.fields.get_mut(n - 3) {
+                if let Some(field) = form.fields.get_mut(n - 4) {
                     field.value.pop();
                 }
             }
@@ -477,8 +556,9 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
             0 => {}
             1 => form.name.push(c),
             2 => form.folder.push(c),
+            3 => form.tags.push(c),
             n => {
-                if let Some(field) = form.fields.get_mut(n - 3) {
+                if let Some(field) = form.fields.get_mut(n - 4) {
                     field.value.push(c);
                 }
             }
@@ -490,7 +570,7 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        app.quit = true;
+        app.exit = Exit::Quit;
         return Ok(());
     }
     match app.screen {
@@ -508,6 +588,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 KeyCode::Char('r') => app.reveal = !app.reveal,
                 KeyCode::Char('c') => app.copy_first_secret(),
                 KeyCode::Char('t') => app.show_totp(),
+                KeyCode::Char('m') => app.render = !app.render,
                 KeyCode::Char('e') => app.start_edit(),
                 KeyCode::Char('d') => app.delete_current()?,
                 _ => {}
@@ -517,17 +598,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         Screen::List => {}
     }
     match key.code {
-        KeyCode::Char('q') => app.quit = true,
+        KeyCode::Char('q') => app.exit = Exit::Quit,
         KeyCode::Char('?') => app.screen = Screen::Help,
         KeyCode::Char('a') => app.start_add(),
-        KeyCode::Char('l') => {
-            app.quit = true;
-            "locking on exit".clone_into(&mut app.status);
-        }
-        KeyCode::Char('v') => {
-            app.quit = true;
-            app.want_vault = true;
-        }
+        KeyCode::Char('l') => app.exit = Exit::Lock,
+        KeyCode::Char('v') => app.exit = Exit::Vault,
         KeyCode::Up => app.selected = app.selected.saturating_sub(1),
         KeyCode::Down => {
             if app.selected + 1 < app.filtered.len() {
@@ -551,7 +626,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|f| draw(f, app))?;
-        if app.quit {
+        if app.exit != Exit::None {
             return Ok(());
         }
         if event::poll(std::time::Duration::from_millis(250))? {
@@ -559,6 +634,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 handle_key(app, key)?;
             }
         }
+        app.clear_expired_clipboard();
     }
 }
 
@@ -574,9 +650,14 @@ pub fn cmd_tui(ctx: &crate::Ctx) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+    app.flush_clipboard();
     result?;
-    if app.want_vault {
-        crate::select::cmd_select(false)?;
+    let exit = app.exit;
+    drop(app);
+    match exit {
+        Exit::Lock => crate::cmd_lock(ctx)?,
+        Exit::Vault => crate::select::cmd_select(false)?,
+        Exit::None | Exit::Quit => {}
     }
     Ok(())
 }
