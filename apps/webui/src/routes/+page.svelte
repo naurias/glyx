@@ -7,6 +7,8 @@
   let password = '';
   let keyfile = '';
   let pin = '';
+  let newPin = '';
+  let setPin = false;
   let error = '';
   let mode = 'password';
   let desktop = false;
@@ -46,9 +48,15 @@
       const locked = await loadStatus();
       if (!locked) return;
       if (mode === 'pin') await api.unlockPin(pin);
-      else await api.unlock(password, needsKeyfile && keyfile ? keyfile : undefined);
+      else
+        await api.unlock(
+          password,
+          needsKeyfile && keyfile ? keyfile : undefined,
+          setPin && newPin ? newPin : undefined
+        );
       password = '';
       pin = '';
+      newPin = '';
       goto('/items');
     } catch (e) {
       error = e.message;
@@ -79,6 +87,12 @@
     <label>Password<input type="password" bind:value={password} /></label>
     {#if needsKeyfile}
       <label>Keyfile path<input bind:value={keyfile} placeholder="/path/to/keyfile" /></label>
+    {/if}
+    <div class="row">
+      <button class:selected={setPin} on:click={() => (setPin = !setPin)}>Also set a PIN</button>
+    </div>
+    {#if setPin}
+      <label>New PIN (min 4)<input type="password" bind:value={newPin} /></label>
     {/if}
   {:else}
     <label>PIN<input type="password" bind:value={pin} /></label>

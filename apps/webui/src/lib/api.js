@@ -35,7 +35,8 @@ async function req(method, path, body) {
 export const api = {
   status: () => req('GET', '/v1/status'),
   templates: () => req('GET', '/v1/templates'),
-  unlock: (password, keyfile) => req('POST', '/v1/unlock', { password, keyfile }),
+  unlock: (password, keyfile, newPin) =>
+    req('POST', '/v1/unlock', { password, keyfile, new_pin: newPin }),
   unlockPin: (pin) => req('POST', '/v1/unlock', { pin }),
   lock: () => req('POST', '/v1/lock'),
   items: (params = {}) => {
@@ -57,7 +58,10 @@ export const api = {
   conflict: (id, reveal = false) => req('GET', `/v1/conflicts/${id}?reveal=${reveal}`),
   resolve: (id, body) => req('POST', `/v1/conflicts/${id}/resolve`, body),
   gc: (body) => req('POST', '/v1/gc', body),
-  doctor: () => req('GET', '/v1/doctor'),
+  doctor: (params = {}) => {
+    const q = new URLSearchParams(params).toString();
+    return req('GET', '/v1/doctor' + (q ? `?${q}` : ''));
+  },
   exports: () => req('GET', '/v1/exports'),
   recall: (target) => req('DELETE', `/v1/exports?target=${encodeURIComponent(target)}`),
   enforce: (force) => req('POST', '/v1/exports/enforce', { force }),
