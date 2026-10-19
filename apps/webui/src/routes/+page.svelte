@@ -9,6 +9,9 @@
   let pin = '';
   let newPin = '';
   let setPin = false;
+  let advanced = false;
+  let ttlMin = '';
+  let materialize = 'default';
   let error = '';
   let mode = 'password';
   let desktop = false;
@@ -47,16 +50,22 @@
     try {
       const locked = await loadStatus();
       if (!locked) return;
-      if (mode === 'pin') await api.unlockPin(pin);
+      const options = {};
+      if (ttlMin) options.ttl_min = Number(ttlMin);
+      if (materialize !== 'default') options.materialize = materialize === 'yes';
+      if (mode === 'pin') await api.unlockPin(pin, options);
       else
         await api.unlock(
           password,
           needsKeyfile && keyfile ? keyfile : undefined,
-          setPin && newPin ? newPin : undefined
+          setPin && newPin ? newPin : undefined,
+          options
         );
       password = '';
       pin = '';
       newPin = '';
+      ttlMin = '';
+      materialize = 'default';
       goto('/items');
     } catch (e) {
       error = e.message;
@@ -96,6 +105,25 @@
     {/if}
   {:else}
     <label>PIN<input type="password" bind:value={pin} /></label>
+  {/if}
+  <div class="row">
+    <button class:selected={advanced} on:click={() => (advanced = !advanced)}>Advanced</button>
+  </div>
+  {#if advanced}
+    <div class="card">
+      {#if mode === 'password'}
+        <label>Session TTL minutes (optional)
+          <input type="number" min="1" max="480" bind:value={ttlMin} placeholder="default" />
+        </label>
+      {/if}
+      <label>Materialize tracked exports
+        <select bind:value={materialize}>
+          <option value="default">use setting</option>
+          <option value="yes">yes</option>
+          <option value="no">no</option>
+        </select>
+      </label>
+    </div>
   {/if}
   <div class="row">
     <button class="primary" on:click={connect}>Unlock</button>

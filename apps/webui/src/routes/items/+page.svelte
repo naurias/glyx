@@ -9,6 +9,7 @@
   let tag = '';
   let showDeleted = false;
   let error = '';
+  let timer;
 
   async function load() {
     error = '';
@@ -17,6 +18,7 @@
       if (type) params.type = type;
       if (folder) params.folder = folder;
       if (tag) params.tag = tag;
+      if (q) params.q = q;
       if (showDeleted) params.all = true;
       items = await api.items(params);
     } catch (e) {
@@ -24,9 +26,10 @@
     }
   }
   onMount(load);
-  $: filtered = items.filter(
-    (i) => !q || i.name.toLowerCase().includes(q.toLowerCase()) || i.type.includes(q.toLowerCase())
-  );
+  function debounced() {
+    clearTimeout(timer);
+    timer = setTimeout(load, 200);
+  }
   async function lock() {
     await api.lock();
     goto('/');
@@ -45,7 +48,7 @@
 </nav>
 <main>
   <div class="row">
-    <input bind:value={q} autofocus placeholder="Search name or type" style="flex: 1" />
+    <input bind:value={q} on:input={debounced} autofocus placeholder="Search name, folder, tags, fields" style="flex: 1" />
     <input bind:value={type} placeholder="type" />
     <input bind:value={folder} placeholder="folder" />
     <input bind:value={tag} placeholder="tag" />
@@ -53,7 +56,7 @@
     <button on:click={load}>Apply</button>
   </div>
   {#if error}<p style="color: var(--danger)">{error}</p>{/if}
-  {#each filtered as item (item.id)}
+  {#each items as item (item.id)}
     <div class="card row">
       <span class="dim">{item.type}</span>
       <a href={`/items/${item.id}`}>{item.name}</a>
@@ -62,5 +65,5 @@
       <span class="dim">rev {item.rev}</span>
     </div>
   {/each}
-  {#if !filtered.length}<p class="dim">No items. <a href="/add">Add one</a>.</p>{/if}
+  {#if !items.length}<p class="dim">No items. <a href="/add">Add one</a>.</p>{/if}
 </main>

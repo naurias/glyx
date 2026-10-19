@@ -4,10 +4,21 @@
   let data = { exports: [], injects: [], roots: [] };
   let tamper = [];
   let error = '';
+  let notice = '';
   let target = '';
   let form = 'encrypted-pointer';
   let glob = '*.md';
-  let exp = { target: '', kind: 'field', item: '', field: 'password', blob: '', ssh: '', keep: false };
+  let exp = {
+    target: '',
+    kind: 'field',
+    item: '',
+    field: 'password',
+    blob: '',
+    ssh: '',
+    keep: false,
+    perm: '600'
+  };
+  let ssh = { item: '', to: '', perm: '600' };
   let merging = null;
   let hunks = [];
   let picks = {};
@@ -83,7 +94,12 @@
   async function addExport() {
     error = '';
     try {
-      const body = { target: exp.target, kind: exp.kind, keep: exp.keep };
+      const body = {
+        target: exp.target,
+        kind: exp.kind,
+        keep: exp.keep,
+        perm: parseInt(exp.perm || '600', 8)
+      };
       if (exp.kind === 'field') {
         body.item = exp.item;
         body.field = exp.field;
@@ -94,6 +110,21 @@
       }
       await api.addExport(body);
       exp.target = '';
+      await load();
+    } catch (e) {
+      error = e.message;
+    }
+  }
+  async function exportSsh() {
+    error = '';
+    notice = '';
+    try {
+      const body = { item: ssh.item, perm: parseInt(ssh.perm || '600', 8) };
+      if (ssh.to) body.to = ssh.to;
+      const result = await api.sshExport(body);
+      notice = `ssh key written to ${result.target}`;
+      ssh.item = '';
+      ssh.to = '';
       await load();
     } catch (e) {
       error = e.message;
@@ -139,6 +170,7 @@
 <main>
   <h2>Exports</h2>
   {#if error}<p style="color: var(--danger)">{error}</p>{/if}
+  {#if notice}<p class="dim">{notice}</p>{/if}
   {#if tamper.length}
     <div class="card">
       <strong>Tamper detected</strong>
@@ -249,7 +281,15 @@
       <input bind:value={exp.ssh} placeholder="ssh key item" />
     {/if}
     <label class="row"><input type="checkbox" bind:checked={exp.keep} /> keep on lock</label>
+    <label class="row">perm <input bind:value={exp.perm} style="width: 4.5rem" /></label>
     <button class="primary" on:click={addExport}>Add export</button>
+  </div>
+  <h3>Export an SSH key</h3>
+  <div class="row">
+    <input bind:value={ssh.item} placeholder="ssh key item" />
+    <input bind:value={ssh.to} placeholder="target path (default ~/.ssh/glyx_<name>)" style="flex: 1" />
+    <label class="row">perm <input bind:value={ssh.perm} style="width: 4.5rem" /></label>
+    <button class="primary" on:click={exportSsh} disabled={!ssh.item}>Export key</button>
   </div>
   <div class="row" style="margin-top: 12px">
     <button on:click={() => enforce(false)}>Enforce now</button>
