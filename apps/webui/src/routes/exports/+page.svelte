@@ -143,9 +143,15 @@
     <div class="card">
       <strong>Tamper detected</strong>
       {#each tamper as t}
-        <div class="row"><span>{t}</span></div>
+        {@const tgt = typeof t === 'string' ? t : t.target || ''}
+        <div class="row">
+          <span>{typeof t === 'string' ? t : `${t.target} (${t.kind})`}</span>
+        </div>
         <div class="row">
           <button on:click={() => enforce(true)}>Force re-materialize</button>
+          {#if tgt}
+            <button class="danger" on:click={() => resolve(tgt, 'keep')}>Keep (stop tracking)</button>
+          {/if}
         </div>
       {/each}
     </div>

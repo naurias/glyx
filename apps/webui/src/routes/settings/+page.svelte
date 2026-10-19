@@ -7,6 +7,10 @@
   let settings = null;
   let notice = '';
   let rekey = { password: '', keyfile: '', no_keyfile: false, cipher: '', preset: '' };
+  let peer = { path: '', keyfile: '', password: '' };
+  let gcDays = 30;
+  let rebuildIndex = false;
+  let sshSock = '';
 
   async function load() {
     try {
@@ -75,10 +79,33 @@
       error = e.message;
     }
   }
+  async function syncPeer() {
+    error = '';
+    notice = '';
+    try {
+      const body = { other: peer.path };
+      if (peer.keyfile) body.other_keyfile = peer.keyfile;
+      if (peer.password) body.other_password = peer.password;
+      report = await api.sync(body);
+      await load();
+    } catch (e) {
+      error = e.message;
+    }
+  }
+  async function loadSshEnv() {
+    error = '';
+    try {
+      const r = await api.sshEnv();
+      sshSock = r.sock;
+    } catch (e) {
+      sshSock = '';
+      error = e.message;
+    }
+  }
   async function gc(dry) {
     error = '';
     try {
-      report = await api.gc({ dry_run: dry });
+      report = await api.gc({ dry_run: dry, older_than_ms: Number(gcDays) * 86400000 });
     } catch (e) {
       error = e.message;
     }
@@ -86,7 +113,7 @@
   async function doctor() {
     error = '';
     try {
-      report = await api.doctor();
+      report = await api.doctor(rebuildIndex ? { rebuild_index: true } : {});
     } catch (e) {
       error = e.message;
     }
@@ -176,11 +203,36 @@
       {#if notice}<p class="dim">{notice}</p>{/if}
     </div>
   {/if}
-  <div class="row">
-    <button on:click={sync}>Sync now</button>
-    <button on:click={() => gc(true)}>GC dry run</button>
-    <button on:click={() => gc(false)}>GC 30d</button>
-    <button on:click={doctor}>Doctor</button>
+  <div class="card">
+    <div>Sync and maintenance</div>
+    <div class="row">
+      <button on:click={sync}>Sync now</button>
+      <button on:click={() => gc(true)}>GC dry run</button>
+      <button on:click={() => gc(false)}>GC purge</button>
+      <label class="row">window days<input type="number" min="1" bind:value={gcDays} style="width: 5rem" /></label>
+      <label class="row"><input type="checkbox" bind:checked={rebuildIndex} /> rebuild index</label>
+      <button on:click={doctor}>Doctor</button>
+    </div>
+    <p class="dim">Rebuild index needs the vault locked; lock from Items, run Doctor, then unlock.</p>
+  </div>
+  <div class="card">
+    <div>Pairwise sync with another vault copy</div>
+    <label>Other vault path<input bind:value={peer.path} placeholder="/path/to/other.glyx" /></label>
+    <div class="row">
+      <input bind:value={peer.keyfile} placeholder="other keyfile (if required)" style="flex: 1" />
+      <input type="password" bind:value={peer.password} placeholder="other password" style="flex: 1" />
+    </div>
+    <div class="row">
+      <button on:click={syncPeer} disabled={!peer.path}>Sync with other vault</button>
+    </div>
+  </div>
+  <div class="card">
+    <div>SSH agent</div>
+    <div class="row">
+      <button on:click={loadSshEnv}>Show agent socket</button>
+      {#if sshSock}<code style="flex: 1">{sshSock}</code>{/if}
+    </div>
+    <p class="dim">In a shell run <code>eval $(glyx ssh agent-env)</code>. The socket exists only while the vault is unlocked.</p>
   </div>
   {#if report}<pre class="card">{JSON.stringify(report, null, 2)}</pre>{/if}
 </main>

@@ -4,11 +4,21 @@
   import { onMount } from 'svelte';
   let items = [];
   let q = '';
+  let type = '';
+  let folder = '';
+  let tag = '';
+  let showDeleted = false;
   let error = '';
 
   async function load() {
+    error = '';
     try {
-      items = await api.items();
+      const params = {};
+      if (type) params.type = type;
+      if (folder) params.folder = folder;
+      if (tag) params.tag = tag;
+      if (showDeleted) params.all = true;
+      items = await api.items(params);
     } catch (e) {
       error = e.message;
     }
@@ -35,7 +45,12 @@
 </nav>
 <main>
   <div class="row">
-    <input bind:value={q} autofocus placeholder="Search name or type" />
+    <input bind:value={q} autofocus placeholder="Search name or type" style="flex: 1" />
+    <input bind:value={type} placeholder="type" />
+    <input bind:value={folder} placeholder="folder" />
+    <input bind:value={tag} placeholder="tag" />
+    <label class="row"><input type="checkbox" bind:checked={showDeleted} /> deleted</label>
+    <button on:click={load}>Apply</button>
   </div>
   {#if error}<p style="color: var(--danger)">{error}</p>{/if}
   {#each filtered as item (item.id)}
