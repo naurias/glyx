@@ -44,13 +44,15 @@
         };
         androidSdk = pkgsAndroid.androidenv.composeAndroidPackages {
           platformVersions = [ "36" "37.0" ];
-          buildToolsVersions = [ "36.0.0" ];
+          buildToolsVersions = [ "35.0.0" "36.0.0" ];
           includeNDK = true;
         };
         androidFhsEnv = pkgsAndroid.buildFHSEnv {
           name = "glyx-android-env";
           targetPkgs = pkgs: [
             pkgs.rustup
+            pkgs.cargo-tauri
+            pkgs.cargo-ndk
             pkgs.stdenv.cc
             pkgs.pkg-config
             pkgs.jdk17
@@ -71,10 +73,18 @@
             export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
             export JAVA_HOME="${pkgsAndroid.jdk17}/lib/openjdk"
             export RUSTUP_HOME="$HOME/.rustup-glyx"
-            export PATH="$ANDROID_HOME/platform-tools:$PATH"
+            export CARGO_HOME="$HOME/.cargo-glyx"
+            rustup toolchain install stable --profile minimal \
+              --target aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android \
+              >/dev/null 2>&1 || echo "rustup android targets: run install manually (offline?)"
+            export PATH="/usr/bin:/usr/sbin:$CARGO_HOME/bin:$ANDROID_HOME/platform-tools:$PATH"
             echo "glyx Android FHS shell (standard loader contract; exit leaves nix develop)"
             echo "Android SDK: $ANDROID_HOME"
-            exec bash
+            aapt2_override="ORG_GRADLE_PROJECT_android.aapt2FromMavenOverride=$ANDROID_HOME/build-tools/36.0.0/aapt2"
+            if [ "$#" -gt 0 ]; then
+              exec env "$aapt2_override" "$@"
+            fi
+            exec env "$aapt2_override" bash
           '';
         };
 
@@ -281,22 +291,28 @@
         devShells.android = pkgsAndroid.mkShell {
           buildInputs = with pkgsAndroid; [
             rustup
+            cargo-tauri
+            cargo-ndk
             jdk17
             gradle
             androidSdk.androidsdk
             androidSdk.platform-tools
             nodejs_22
             pnpm
-            cargo-ndk
           ];
           ANDROID_HOME = "${androidSdk.androidsdk}/libexec/android-sdk";
           ANDROID_SDK_ROOT = "${androidSdk.androidsdk}/libexec/android-sdk";
           shellHook = ''
             export RUSTUP_HOME="$HOME/.rustup-glyx"
+            export CARGO_HOME="$HOME/.cargo-glyx"
             export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk-bundle"
             export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
-            export PATH="$ANDROID_HOME/platform-tools:$PATH"
+            rustup toolchain install stable --profile minimal \
+              --target aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android \
+              >/dev/null 2>&1 || echo "rustup android targets: run install manually (offline?)"
+            export PATH="$CARGO_HOME/bin:$ANDROID_HOME/platform-tools:$PATH"
             echo "Android SDK: $ANDROID_HOME"
+            echo "Android Rust targets + tauri-cli (cargo-tauri) available."
             echo "Note: APK assembly needs the FHS shell (nix develop .#android-fhs);"
             echo "this shell is for Rust/JS builds, scripts, and sdkmanager only."
           '';
@@ -307,7 +323,7 @@
         devShells.android-fhs = pkgs.mkShell {
           buildInputs = [ androidFhsEnv ];
           shellHook = ''
-            exec ${androidFhsEnv}/bin/glyx-android-env
+            exec ${androidFhsEnv}/bin/glyx-android-env "$@"
           '';
         };
 
