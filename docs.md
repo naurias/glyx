@@ -100,7 +100,12 @@ Commands find the vault in this order:
 
 ### Register and forget
 
-The picker registers custom vaults. The GUI onboarding page has the same actions, including Forget (which only removes the entry, not the files).
+The picker registers custom vaults and can also remove one ("Remove a vault from the list"). The GUI onboarding page has the same actions, including Forget. Forgetting only removes the registry entry and wipes any session ticket; the vault files are untouched.
+
+```sh
+glyx vault forget                 # forget the selected vault
+glyx vault forget ~/vaults/old.glyx
+```
 
 ### Rekey
 
@@ -177,6 +182,7 @@ A full-screen interface for the most common work. All normal CLI commands remain
 - `r` show or hide secret values
 - `c` copy the first secret field to the clipboard (auto-clears in 15 seconds)
 - `t` show a TOTP code
+- `m` render a note (`{{glyx:...}}` references resolved, secrets masked)
 - `e` edit
 - `d` delete (tombstone, sync-safe)
 - Esc back
@@ -184,6 +190,8 @@ A full-screen interface for the most common work. All normal CLI commands remain
 **Add or edit form**
 
 - Tab/Up/Down move between fields, Left/Right change the item type (when adding)
+- Tags are comma separated; folder moves the item
+- Ctrl+G generates a password into the focused secret field
 - type to edit, Enter on the last field to save, Esc to cancel
 - optional keyfile and daemon requirements are the same as the CLI
 
@@ -219,6 +227,7 @@ glyx show github
 glyx show github --reveal
 glyx show server --render
 glyx edit github --rename work-github --field url=https://github.com
+glyx edit github --folder work --tag important --remove-tag old
 glyx edit server --body-file server.md
 glyx edit github --delete-field notes
 glyx rm github
@@ -228,7 +237,7 @@ glyx rm github
 
 ### GUI
 
-- `/items` lists items with search; Lock is in the top bar
+- `/items` lists items with search plus type, folder, and tag filters and a deleted (tombstone) toggle; Lock is in the top bar
 - `/items/<id>` shows fields. Edit opens the same form used for adding, with per-field Generate for secret fields. Copy copies a field to the clipboard through the daemon.
 - `/add` chooses a type and renders that type's fields
 - notes render markdown and support secret references (see section 8)
@@ -297,7 +306,7 @@ eval $(glyx ssh agent-env)
 ssh-add -L
 ```
 
-The agent socket lives only while the daemon is unlocked. Private material never touches disk through the agent path. GUI: choose the `ssh_key` type on the Add page and press Generate SSH key pair. Copy the public key from the item.
+The agent socket lives only while the daemon is unlocked. Private material never touches disk through the agent path. GUI: choose the `ssh_key` type on the Add page and press Generate SSH key pair. Copy the public key from the item. Settings can show the current agent socket path (the same value as `glyx ssh agent-env`).
 
 ---
 
@@ -317,7 +326,7 @@ glyx export tamper
 
 Files without `--keep` are shredded on lock and re-created on unlock. `--force` overwrites a file that changed since the last unlock. `export tamper` lists findings.
 
-GUI: the Exports page adds exports (field, blob, or SSH), lists them, and has Unlock, Lock, Move, and Recall per target.
+GUI: the Exports page adds exports (field, blob, or SSH), lists them, and has Unlock, Lock, Move, and Recall per target. When tamper is detected it offers Force re-materialize and Keep (stop tracking without wiping).
 
 ---
 
@@ -418,7 +427,7 @@ Rules: the newer field wins, tombstones win over edits, and true same-field race
 
 GC purges old tombstones. A device offline longer than the GC window can resurrect a deleted item on its next sync.
 
-GUI: Conflicts lists races, shows mine versus theirs, and resolves. Settings has Sync now, GC, and Doctor. Pairwise sync accepts another vault path plus its keyfile or password.
+GUI: Conflicts lists races, shows mine versus theirs, and resolves. Settings has Sync now, GC (with a configurable window), Doctor (with an optional index rebuild while locked), and pairwise sync where you enter the other vault path plus its keyfile or password.
 
 ---
 
@@ -472,7 +481,7 @@ glyx daemon stop
 
 The daemon serves the GUI on loopback with token auth. Open the printed URL, enter the token from `daemon.json`, and use the pages:
 
-- `/` unlock with password, keyfile, or PIN
+- `/` unlock with password, keyfile, or PIN; when unlocking with a password you can also set a PIN
 - `/items` and `/items/<id>` browse, reveal, copy, edit, delete, TOTP
 - `/add` create any item type
 - `/conflicts` compare and resolve
@@ -517,6 +526,18 @@ last_used_ms = 1790000000000
 ```
 
 Only the keyfile path is stored, never key bytes.
+
+Change these from the CLI:
+
+```sh
+glyx config                        # show current settings
+glyx config set mode session
+glyx config set session_ttl_min 30
+glyx config set auto_materialize false
+glyx config set daemon_on_exit keep
+```
+
+The GUI Settings page edits the same values.
 
 Runtime directory: `GLYX_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/glyx`, else a temp directory. It holds session tickets, `daemon.json`, the SSH socket, and the local agent ledger (`agent-ledger.sqlite`, never synced).
 
