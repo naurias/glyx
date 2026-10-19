@@ -1,18 +1,32 @@
 # glyx
 
-Local-first password manager for Linux, Windows, and Android. CLI, WebUI, and desktop app on one Rust core. No accounts, no telemetry, your vault stays yours.
+Local-first password manager for Linux, Windows, and Android. CLI, full-screen TUI, WebUI, desktop app, and an Android shell (in progress) on one Rust core. No accounts, no telemetry, your vault stays yours.
 
-Full feature guide for every frontend, with examples: **[docs.md](docs.md)**.
+Full feature guide for every frontend, with examples: **[docs.md](docs.md)**. The frontend capability summary is under **[Frontends at a glance](docs.md#frontends-at-a-glance)**.
 
-> Status: M5.4 complete. CLI, full-screen TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, and a self-starting desktop app. Android support arrives in M6. This README is a living user guide and grows with each milestone.
+> Status: M5.4 complete. CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, and a self-starting desktop app. M6c Android is in progress: the Tauri-mobile shell, Android scaffold, and a debug APK build work; AutofillService and biometric unlock remain.
 
 ## What glyx will do
 
-- Store and autofill passwords, passkeys, TOTPs, identities, and cards.
+- Store and autofill logins and TOTPs in the browser; store passkeys, identities, and cards (autofill for those is not implemented yet).
 - Store files, manage SSH and other keys, and keep Markdown notes.
 - Project secrets into files or folders while unlocked, wipe them on lock.
 - Inject secrets inside tracked files (for example `.env` or compose files) and restore placeholders on lock.
 - Stay sync-safe when two devices edit the same vault offline, with smart merge and no silent loss.
+
+## Frontends
+
+| Frontend | What it is |
+|---|---|
+| CLI | `glyx`: full vault, item, sync, export, SSH, daemon, extension, and Git control |
+| TUI | `glyx tui`: focused item browser/editor (add/edit, notes, TOTP, first-secret copy) |
+| WebUI | Browser pages served by the local daemon on loopback |
+| Desktop | `glyx-tauri`: the WebUI plus daemon autostart, auto-connect, and `Ctrl+Shift+G` |
+| Android | `glyx-tauri` mobile: in-process daemon plus the WebUI (M6c in progress) |
+| Extension | Chrome/Firefox search, login/TOTP fill, and lock; requires an unlocked daemon |
+| Git | `git-credential-glyx`: HTTPS credential `get/store/erase` |
+
+The detailed matrix, including known gaps, lives in `local/feature-parity.md` (local only).
 
 ## Install on NixOS (flake)
 
@@ -53,7 +67,7 @@ cargo test                 # tests (fallback)
 cargo clippy -- -D warnings
 cargo audit
 nix build .#default        # CLI package
-nix build .#glyx-desktop   # desktop package (real Tauri binary lands in M3)
+nix build .#glyx-desktop   # desktop package
 ```
 
 ## Quickstart
@@ -246,7 +260,9 @@ glyx fill github --field username --timeout 30
 glyx fill github --dry-run
 ```
 
-The desktop app also registers Ctrl+Shift+G to pop up the vault search. Fill never auto-submits web forms.
+The extension requires the daemon to already be unlocked; it has no unlock screen. Its Fill and TOTP buttons fill the page through input events and never auto-submit. The Git helper matches the URL host to a login item (`store` creates one when missing), and `erase` tombstones it.
+
+The desktop app also registers Ctrl+Shift+G to pop up the vault search.
 
 ## Configuration
 
@@ -273,16 +289,16 @@ crates/
   glyx-agent     Export/inject ledger, shred, tamper, SSH agent socket
   glyx-autofill  Clipboard backend + fill helpers (no Secret Service by design)
   glyx-daemon    Axum /v1 API + embedded WebUI, vault onboarding, token auth, idle auto-lock
-  glyx-tauri     Tauri desktop shell: autostarts the daemon, hosts the built WebUI
+  glyx-tauri     Tauri desktop + mobile shell; desktop autostarts the daemon, mobile serves it in-process
   glyx-nm        NativeMessaging stdio bridge proxying to the daemon
   glyx-cli       Full CLI: items, sessions, rekey, sync, conflicts, gc, fill, git, extension
-apps/            webui, desktop, android, extension (fill in M3+)
+apps/            webui, extension; Android scaffold lives in crates/glyx-tauri/gen/android
 local/           Agent and developer docs (gitignored, local only)
 ```
 
 ## Roadmap
 
-Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 browser/Git/clipboard fill (done), M5 file agent plus SSH (done), M5.1 three-way file merge (done), M5.2 vault onboarding plus optional keyfiles plus self-starting desktop (done), M5.3 frontend parity plus CLI TUI (done), M5.4 parity gap closure (done), M6a notes, M6b external Markdown folders (done), M6c Android, M7 hardening and installers.
+Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 browser/Git/clipboard fill (done), M5 file agent plus SSH (done), M5.1 three-way file merge (done), M5.2 vault onboarding plus optional keyfiles plus self-starting desktop (done), M5.3 frontend parity plus CLI TUI (done), M5.4 parity gap closure (done), M6a notes, M6b external Markdown folders (done), M6c Android shell/scaffold/APK build (done; AutofillService and biometric unlock pending), M7 hardening and installers.
 
 ## License
 

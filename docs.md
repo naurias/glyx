@@ -2,13 +2,39 @@
 
 glyx is a local-first password manager. Your vault is a directory of encrypted files that you own and can sync with any tool you trust. There is no account, no telemetry, and no network service outside your machine.
 
-This guide covers the three frontends:
+This guide covers the user-facing frontends:
 
 - **CLI** (`glyx`), including a full-screen TUI (`glyx tui`)
-- **GUI** (the WebUI served by the local daemon)
-- **Desktop** (`glyx-tauri`, the GUI plus automatic daemon start and a global quick-copy shortcut)
+- **WebUI** (pages served by the local daemon)
+- **Desktop** (`glyx-tauri`, the WebUI plus automatic daemon start and a global quick-copy shortcut)
+- **Android** (`glyx-tauri` mobile, M6c in progress)
+- **Browser extension** (search, login/TOTP fill, and lock; requires an unlocked daemon)
+- **Git credential helper** (`git-credential-glyx`)
 
-The browser extension, the Git credential helper, and clipboard fill are also covered.
+### Frontends at a glance
+
+| Capability | CLI | TUI | WebUI | Desktop | Android | Ext | Git |
+|---|---|---|---|---|---|---|---|
+| Vault create/select/rekey | Yes | Partial | Yes | Inherited | Partial | No | Partial |
+| Unlock/lock/PIN | Yes | Partial | Yes | Inherited | Inherited | Partial* | Partial |
+| Item create/edit/delete | Yes | Yes | Yes | Inherited | Inherited | No | Partial |
+| Notes/TOTP | Yes | Yes | Yes | Inherited | Inherited | Partial | No |
+| Clipboard copy | Yes | Partial | Partial | Inherited | No | No | No |
+| Web form fill | No | No | No | No | Planned | Yes | No |
+| SSH keys/agent | Yes | No | Partial | Inherited | Partial | No | No |
+| Exports/injection | Yes | No | Yes | Inherited | Inherited | No | No |
+| Sync/conflicts/GC/doctor | Yes | No | Partial | Inherited | Inherited | No | No |
+| Desktop extras | No | No | No | Yes | No | No | No |
+| OS autofill/biometrics | No | No | No | No | Planned | No | No |
+| Extension/Git setup | Yes | No | No | No | No | No | No |
+
+`Inherited` means Desktop and Android reuse the WebUI pages (Android currently
+lacks clipboard, autofill, and biometrics). `Partial` details, known gaps, and
+code anchors live in `local/feature-parity.md` (local only).
+
+`*` The extension can Lock but cannot unlock; it requires the daemon to already
+be unlocked. The Git helper uses `GLYX_*` env vars or an active session and has
+no lock/PIN UI.
 
 ---
 
@@ -165,7 +191,7 @@ Threat model: session mode stores the data key under `0600` in your runtime dire
 glyx tui
 ```
 
-A full-screen interface for the most common work. All normal CLI commands remain available.
+A full-screen interface for the most common work. All normal CLI commands remain available outside the TUI. The TUI intentionally omits exports, injections, sync, conflicts, SSH generation, doctor, and settings; use the CLI or WebUI for those.
 
 **Item list**
 
@@ -206,14 +232,18 @@ Supported types:
 | Type | Fields |
 |------|--------|
 | `login` | username, password, url, notes |
-| `passkey` | credential id, public key, relying party, username |
+| `passkey` | relying_party, user_handle, credential_id, private_key |
 | `totp` | seed or `otpauth://` URI, period, digits |
-| `identity` | name, email, phone, address, and related fields |
-| `card` | cardholder, number, expiry, cvc |
+| `identity` | full_name, email, phone, address |
+| `card` | number, holder, expiry, cvc |
 | `note` | markdown body |
-| `file` | blob address, filename, mime |
-| `ssh_key` | private, public, kind, comment |
-| `generic_key` | key, value, notes |
+| `file` | blob address, filename |
+| `ssh_key` | private, public, comment (plus `kind` from `ssh gen`) |
+| `generic_key` | material, kind |
+
+These are template suggestions. `--field key=value` can add extra fields, and
+the TUI/WebUI forms show the same template. File items store an existing blob
+address; no frontend uploads a blob yet.
 
 ### CLI
 
@@ -244,10 +274,11 @@ glyx rm github
 
 ### Desktop
 
-The desktop app is the same GUI with two extras:
+The desktop app is the same GUI plus platform glue:
 
-- it starts the daemon automatically for the selected vault
-- `Ctrl+Shift+G` opens a quick-search palette. Type to filter, Enter copies the password, Esc closes.
+- it starts the daemon automatically for the selected vault and stops it on exit by default
+- `Ctrl+Shift+G` opens a quick-search palette. Type to filter, Enter copies the password, Esc closes
+- Settings controls whether closing the app stops or keeps the daemon
 
 ---
 
@@ -326,7 +357,7 @@ glyx export tamper
 
 Files without `--keep` are shredded on lock and re-created on unlock. `--force` overwrites a file that changed since the last unlock. `export tamper` lists findings.
 
-GUI: the Exports page adds exports (field, blob, or SSH), lists them, and has Unlock, Lock, Move, and Recall per target. When tamper is detected it offers Force re-materialize and Keep (stop tracking without wiping).
+GUI: the Exports page adds exports (field, blob, or SSH), lists them, and has Unlock, Lock, Move, and Recall per target. It does not expose the CLI's `--perm` option. When tamper is detected it offers Force re-materialize and Keep (stop tracking without wiping).
 
 ---
 
@@ -427,13 +458,15 @@ Rules: the newer field wins, tombstones win over edits, and true same-field race
 
 GC purges old tombstones. A device offline longer than the GC window can resurrect a deleted item on its next sync.
 
+Health checks: `glyx doctor` reports vault state; `--rebuild-index` rebuilds the SQLite index from envelope headers (the vault must be locked), and `--with-unlock` additionally decrypts every item and blob. GUI Settings has Doctor with an index-rebuild toggle.
+
 GUI: Conflicts lists races, shows mine versus theirs, and resolves. Settings has Sync now, GC (with a configurable window), Doctor (with an optional index rebuild while locked), and pairwise sync where you enter the other vault path plus its keyfile or password.
 
 ---
 
 ## 13. Browser extension
 
-The extension needs a running daemon.
+The extension needs a running daemon with an unlocked vault. It has no unlock screen of its own.
 
 ```sh
 glyx extension install              # Chrome manifests
@@ -442,7 +475,14 @@ glyx extension allow <extension-id> # Chrome id from chrome://extensions
 glyx extension status
 ```
 
-Load `apps/extension` in the browser. The extension ranks candidates by registrable domain and fills forms through input events. It never auto-submits. Its native host reads the selected vault and the daemon record.
+Load `apps/extension` in the browser. The popup searches items (ranking
+candidates by registrable domain), has a Fill button for username/password, a
+TOTP button, and a Lock button. Filling sets input values and dispatches
+`input`/`change` events; it never auto-submits a form.
+
+The native host exposes only `status`, `search`, `fill`, `totp`, and `lock`.
+The extension cannot unlock the vault, create/edit/delete/reveal items, or
+manage vaults, exports, sync, or SSH.
 
 ---
 
@@ -453,7 +493,17 @@ glyx git setup
 glyx git status
 ```
 
-`git setup` symlinks `git-credential-glyx` and sets `credential.helper`. Credentials come from `GLYX_VAULT` and `GLYX_KEYFILE`/`GLYX_PASSWORD`, or from an active session. Host matching is exact or subdomain, case-insensitive.
+`git setup` symlinks `git-credential-glyx` and sets `credential.helper`. The
+helper opens the vault directly, not through the daemon: credentials come from
+`GLYX_VAULT` and `GLYX_KEYFILE`/`GLYX_PASSWORD`, or from an active session.
+
+- `get` matches a `login` item by URL host (exact or subdomain, case-insensitive)
+  and optional username, then prints `username=` and `password=`.
+- `store` updates the matching login's password, or creates a new login item
+  named after the host.
+- `erase` tombstones the matching login.
+
+It has no UI and does not expose any other vault operations.
 
 ---
 
@@ -466,6 +516,10 @@ glyx fill github --dry-run
 ```
 
 The value is copied and cleared after the timeout if it is still on the clipboard. `--dry-run` resolves without touching the clipboard. In the GUI, item detail has Copy buttons that use the daemon's clipboard. The desktop quick palette (`Ctrl+Shift+G`) copies the password with auto-clear.
+
+On Android, clipboard access is unavailable in the current shell; Copy/Fill
+return an error until the `AutofillService` integration lands. The extension
+does not use the clipboard: it fills page inputs directly.
 
 ---
 
@@ -487,7 +541,7 @@ The daemon serves the GUI on loopback with token auth. Open the printed URL, ent
 - `/conflicts` compare and resolve
 - `/exports` exports, injections, folders, per-target lock/unlock/move, merge
 - `/onboarding` select, add, create, or forget vaults
-- `/settings` session mode and TTL, auto-materialize, daemon behavior, rekey, sync, GC, doctor
+- `/settings` session mode and TTL, auto-materialize, daemon behavior, rekey, sync, GC, doctor, pairwise sync, and the SSH agent socket
 
 Secrets are kept in memory only and never written to `localStorage`.
 
@@ -561,6 +615,10 @@ Runtime directory: `GLYX_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/glyx`, else a temp
 
 **Clipboard unavailable**: install a clipboard backend for your session (`wl-clipboard` or X11 tools). `glyx doctor` reports the backend.
 
+**Android Copy/Fill fails**: expected in the current M6c shell; the Android clipboard backend is intentionally unavailable until `AutofillService` lands.
+
+**Android APK build fails**: use `nix develop .#android-fhs` (not the plain `.#android` shell). The FHS shell sets the AAPT2 override and `/usr/bin`; build arm64 only with `-t aarch64` unless the disk has several GB free.
+
 ---
 
 ## 20. Security notes
@@ -573,3 +631,44 @@ Runtime directory: `GLYX_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/glyx`, else a temp
 - Session files hold the data key under `0600` until the TTL expires. Use one-shot mode or short TTLs if that tradeoff is not acceptable.
 - Commit only locked forms (`__GLYXENC:...__` or `ENC[...]`), never unresolved values. Review files before committing.
 - Back up the vault and your keyfile separately. Without them, recovery is impossible by design.
+
+---
+
+## 21. Android (M6c in progress)
+
+The Android app is the Tauri-mobile shell from `crates/glyx-tauri` plus the same
+WebUI. It is not feature-complete yet.
+
+What works today:
+
+- the app starts an in-process daemon on loopback with a random token and injects
+  the URL/token into the WebView, so the normal WebUI pages open without manual
+  configuration
+- vault onboarding, item browsing/editing, notes, TOTP display, exports,
+  injection, sync, conflicts, GC, and doctor through the WebUI
+- a debug APK builds successfully (arm64); `adb install` is the remaining device step
+
+Known limitations:
+
+- clipboard Copy/Fill is unavailable; `AutofillService` is not implemented yet
+- no biometric/Keystore unlock yet
+- no storage-access-framework picker; vault and export paths are typed text
+- no lock-on-background yet
+- the browser extension and Git helper are desktop-only
+
+Build from the repository:
+
+```sh
+nix develop .#android-fhs
+cd crates/glyx-tauri
+cargo tauri android build --debug --apk -t aarch64
+adb install -r gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+```
+
+Omitting `-t aarch64` builds all four ABIs and needs several GB of disk space.
+The Android scaffold lives in `crates/glyx-tauri/gen/android`; do not re-run
+`cargo tauri android init` or the pinned Build-Tools/Gradle settings are lost.
+
+Next milestones: `AutofillService` (map app/domain to items), biometric unlock
+via an Android Keystore keyslot, then mobile polish (lock on background, safe
+areas, icons, file picker).
