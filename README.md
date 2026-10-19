@@ -4,7 +4,7 @@ Local-first password manager for Linux, Windows, and Android. CLI, WebUI, and de
 
 Full feature guide for every frontend, with examples: **[docs.md](docs.md)**.
 
-> Status: M5.2 vault onboarding, optional keyfiles, and a self-starting desktop app work. Android support arrives in M6. This README is a living user guide and grows with each milestone.
+> Status: M5.4 complete. CLI, full-screen TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, and a self-starting desktop app. Android support arrives in M6. This README is a living user guide and grows with each milestone.
 
 ## What glyx will do
 
@@ -282,7 +282,7 @@ local/           Agent and developer docs (gitignored, local only)
 
 ## Roadmap
 
-Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 browser/Git/clipboard fill (done), M5 file agent plus SSH (done), M5.2 vault onboarding plus optional keyfiles plus self-starting desktop (done), M6 Android plus notes, M7 hardening and installers.
+Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 browser/Git/clipboard fill (done), M5 file agent plus SSH (done), M5.1 three-way file merge (done), M5.2 vault onboarding plus optional keyfiles plus self-starting desktop (done), M5.3 frontend parity plus CLI TUI (done), M5.4 parity gap closure (done), M6a notes, M6b external Markdown folders (done), M6c Android, M7 hardening and installers.
 
 ## License
 

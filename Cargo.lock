@@ -2078,11 +2078,13 @@ name = "glyx-tauri"
 version = "0.1.0"
 dependencies = [
  "glyx-core",
+ "glyx-crypto",
  "glyx-daemon",
  "glyx-store",
  "tauri",
  "tauri-build",
  "tauri-plugin-global-shortcut",
+ "tokio",
 ]
 
 [[package]]
