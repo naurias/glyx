@@ -35,9 +35,9 @@ async function req(method, path, body) {
 export const api = {
   status: () => req('GET', '/v1/status'),
   templates: () => req('GET', '/v1/templates'),
-  unlock: (password, keyfile, newPin) =>
-    req('POST', '/v1/unlock', { password, keyfile, new_pin: newPin }),
-  unlockPin: (pin) => req('POST', '/v1/unlock', { pin }),
+  unlock: (password, keyfile, newPin, options = {}) =>
+    req('POST', '/v1/unlock', { password, keyfile, new_pin: newPin, ...options }),
+  unlockPin: (pin, options = {}) => req('POST', '/v1/unlock', { pin, ...options }),
   lock: () => req('POST', '/v1/lock'),
   items: (params = {}) => {
     const q = new URLSearchParams(params).toString();
@@ -50,9 +50,15 @@ export const api = {
   remove: (id) => req('DELETE', `/v1/items/${id}`),
   totp: (id) => req('GET', `/v1/items/${id}/totp`),
   fill: (id, field, timeout = 15) => req('POST', `/v1/items/${id}/fill`, { field, timeout }),
+  history: (id) => req('GET', `/v1/items/${id}/history`),
+  historyItem: (id, file) =>
+    req('GET', `/v1/items/${id}/history/${encodeURIComponent(file)}`),
+  restoreHistory: (id, file) =>
+    req('POST', `/v1/items/${id}/history/${encodeURIComponent(file)}`),
   rekey: (body) => req('POST', '/v1/vaults/rekey', body),
   addExport: (body) => req('POST', '/v1/exports', body),
   sshGen: (body) => req('POST', '/v1/ssh-gen', body),
+  sshExport: (body) => req('POST', '/v1/ssh/export', body),
   sync: (body = {}) => req('POST', '/v1/sync', body),
   conflicts: () => req('GET', '/v1/conflicts'),
   conflict: (id, reveal = false) => req('GET', `/v1/conflicts/${id}?reveal=${reveal}`),

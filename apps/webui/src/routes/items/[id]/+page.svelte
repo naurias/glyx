@@ -16,15 +16,47 @@
   let editing = false;
   let editValues = {};
   let busy = false;
+  let fillTimeout = 15;
+  let history = [];
+  let historyOpen = false;
+  let historyPreview = null;
   $: id = $page.params.id;
 
   async function load() {
     try {
       item = await api.show(id, reveal);
       code = '';
+      historyPreview = null;
       if (item.type === 'note') {
         rendered = (await api.rendered(id, reveal)).body;
       }
+      history = (await api.history(id)).items || [];
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  function fmtTime(hlc) {
+    return hlc && hlc.wall_ms ? new Date(hlc.wall_ms).toLocaleString() : '';
+  }
+
+  async function previewHistory(entry) {
+    error = '';
+    try {
+      historyPreview = (await api.historyItem(id, entry.file)).item;
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  async function restoreHistory(entry) {
+    if (!confirm(`Restore revision ${entry.rev}? This creates a new revision.`)) return;
+    error = '';
+    notice = '';
+    try {
+      await api.restoreHistory(id, entry.file);
+      notice = `restored revision ${entry.rev}`;
+      await load();
     } catch (e) {
       error = e.message;
     }
@@ -56,8 +88,9 @@
     error = '';
     notice = '';
     try {
-      await api.fill(id, field);
-      notice = `${field} copied (clears in 15s)`;
+      const timeout = Number(fillTimeout) || 15;
+      await api.fill(id, field, timeout);
+      notice = `${field} copied (clears in ${timeout}s)`;
     } catch (e) {
       error = e.message;
     }
@@ -149,10 +182,52 @@
       <div class="row">
         <button on:click={startEdit}>Edit</button>
         <button on:click={toggle}>{reveal ? 'Mask' : 'Reveal'}</button>
-        {#if item.type === 'totp'}<button on:click={totp}>TOTP code</button>{/if}
+        {#if item.type === 'totp' || item.fields.seed !== undefined}
+          <button on:click={totp}>TOTP code</button>
+        {/if}
+        <label class="row">clipboard clear
+          <input type="number" min="0" max="600" bind:value={fillTimeout} style="width: 5rem" />s
+        </label>
         <button class="danger" on:click={remove}>Delete</button>
       </div>
       {#if code}<p>Code: <strong>{code}</strong></p>{/if}
     {/if}
+    <div class="card">
+      <div class="row">
+        <strong>History</strong>
+        <span class="dim">({history.length})</span>
+        <span style="flex: 1"></span>
+        <button on:click={() => (historyOpen = !historyOpen)}>
+          {historyOpen ? 'Hide' : 'Show'}
+        </button>
+      </div>
+      {#if historyOpen}
+        {#if !history.length}
+          <p class="dim">No earlier revisions.</p>
+        {/if}
+        {#each history as entry (entry.file)}
+          <div class="row">
+            <span>rev {entry.rev} · {fmtTime(entry.hlc)}{entry.deleted ? ' [deleted]' : ''}</span>
+            <span class="dim">{entry.file}</span>
+            <span style="flex: 1"></span>
+            <button on:click={() => previewHistory(entry)}>Preview</button>
+            <button on:click={() => restoreHistory(entry)}>Restore</button>
+          </div>
+        {/each}
+        {#if historyPreview}
+          <div class="card">
+            <div class="row">
+              <strong>{historyPreview.name}</strong>
+              <span class="dim">rev {historyPreview.rev}</span>
+              <span style="flex: 1"></span>
+              <button on:click={() => (historyPreview = null)}>Close</button>
+            </div>
+            {#each Object.entries(historyPreview.fields) as [k, v]}
+              <div class="row"><strong>{k}</strong><span>{v}</span></div>
+            {/each}
+          </div>
+        {/if}
+      {/if}
+    </div>
   {/if}
 </main>

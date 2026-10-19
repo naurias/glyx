@@ -6,16 +6,26 @@
   let error = '';
   let settings = null;
   let notice = '';
-  let rekey = { password: '', keyfile: '', no_keyfile: false, cipher: '', preset: '' };
+  let rekey = {
+    password: '',
+    keyfile: '',
+    no_keyfile: false,
+    cipher: '',
+    preset: '',
+    keep_old_slots: false
+  };
   let peer = { path: '', keyfile: '', password: '' };
   let gcDays = 30;
   let rebuildIndex = false;
+  let withUnlock = false;
   let sshSock = '';
+  let idleLockMin = '';
 
   async function load() {
     try {
       status = await api.status();
       settings = await api.settings();
+      idleLockMin = settings.idle_lock_min ?? 15;
     } catch (e) {
       error = e.message;
     }
@@ -53,6 +63,14 @@
       error = e.message;
     }
   }
+  async function saveIdleLock() {
+    error = '';
+    try {
+      settings = await api.saveSettings({ idle_lock_min: Number(idleLockMin) || 0 });
+    } catch (e) {
+      error = e.message;
+    }
+  }
   async function doRekey() {
     error = '';
     notice = '';
@@ -63,9 +81,17 @@
       if (rekey.no_keyfile) body.no_keyfile = true;
       if (rekey.cipher) body.cipher = rekey.cipher;
       if (rekey.preset) body.preset = rekey.preset;
+      if (rekey.keep_old_slots) body.keep_old_slots = true;
       await api.rekey(body);
       notice = 'Credentials rotated. Unlock again to confirm.';
-      rekey = { password: '', keyfile: '', no_keyfile: false, cipher: '', preset: '' };
+      rekey = {
+        password: '',
+        keyfile: '',
+        no_keyfile: false,
+        cipher: '',
+        preset: '',
+        keep_old_slots: false
+      };
     } catch (e) {
       error = e.message;
     }
@@ -113,7 +139,10 @@
   async function doctor() {
     error = '';
     try {
-      report = await api.doctor(rebuildIndex ? { rebuild_index: true } : {});
+      const params = {};
+      if (rebuildIndex) params.rebuild_index = true;
+      if (withUnlock) params.with_unlock = true;
+      report = await api.doctor(params);
     } catch (e) {
       error = e.message;
     }
@@ -177,6 +206,12 @@
         </label>
         <button on:click={saveTtl}>Save TTL</button>
       </div>
+      <div class="row">
+        <label class="row">Idle auto-lock minutes (0 disables)
+          <input type="number" min="0" bind:value={idleLockMin} style="width: 5rem" />
+        </label>
+        <button on:click={saveIdleLock}>Save idle lock</button>
+      </div>
       <p class="dim">Session mode stores the data key under 0600 in the runtime dir until the TTL expires; one-shot prompts every time.</p>
     </div>
     <div class="card">
@@ -198,6 +233,7 @@
           <option value="hardened">hardened</option>
           <option value="mobile">mobile</option>
         </select>
+        <label class="row"><input type="checkbox" bind:checked={rekey.keep_old_slots} /> keep old slots</label>
         <button class="primary" on:click={doRekey}>Rotate</button>
       </div>
       {#if notice}<p class="dim">{notice}</p>{/if}
@@ -211,6 +247,7 @@
       <button on:click={() => gc(false)}>GC purge</button>
       <label class="row">window days<input type="number" min="1" bind:value={gcDays} style="width: 5rem" /></label>
       <label class="row"><input type="checkbox" bind:checked={rebuildIndex} /> rebuild index</label>
+      <label class="row"><input type="checkbox" bind:checked={withUnlock} /> with unlock</label>
       <button on:click={doctor}>Doctor</button>
     </div>
     <p class="dim">Rebuild index needs the vault locked; lock from Items, run Doctor, then unlock.</p>
