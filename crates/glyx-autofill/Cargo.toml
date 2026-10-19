@@ -9,6 +9,8 @@ workspace = true
 
 [dependencies]
 uuid.workspace = true
-arboard.workspace = true
 thiserror.workspace = true
 glyx-core = { path = "../glyx-core" }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard.workspace = true
