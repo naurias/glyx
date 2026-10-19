@@ -174,11 +174,14 @@ Global flags:
 
 PIN sessions: `unlock --with-pin` prompts for a PIN (minimum 4 characters) and stores the data key under a PIN-derived key. Later commands prompt for the PIN instead of the full password.
 
+The WebUI unlock page has an **Advanced** section for a per-unlock TTL and for overriding materialization (`use setting`, `yes`, `no`). These map to the daemon `ttl_min` and `materialize` fields; the CLI equivalents are `--ttl` and `--no-materialize`.
+
 Session TTL and mode are configurable in the GUI Settings page or in the config file:
 
 ```toml
 mode = "session"        # "oneshot" or "session"
 session_ttl_min = 15
+idle_lock_min = 15      # daemon idle auto-lock; 0 disables
 ```
 
 Threat model: session mode stores the data key under `0600` in your runtime directory, similar to how `ssh-agent` holds keys in memory. One-shot mode does not write session material; `unlock` you run explicitly still writes it for its TTL.
@@ -253,9 +256,13 @@ glyx add note --name server --body-file server.md
 glyx add login --name github --interactive
 glyx ls
 glyx ls --type login --tag work
+glyx ls --query github
+glyx gen --length 32
 glyx show github
 glyx show github --reveal
 glyx show server --render
+glyx history github
+glyx restore github --rev 1
 glyx edit github --rename work-github --field url=https://github.com
 glyx edit github --folder work --tag important --remove-tag old
 glyx edit server --body-file server.md
@@ -265,10 +272,14 @@ glyx rm github
 
 `--generate name[:length]` creates a strong random value. `--json` returns machine-readable output; JSON always includes values, so be careful with logs.
 
+`ls --query` searches names, folders, tags, and non-secret fields. `history` lists earlier revisions (newest first) and `restore` brings one back as a new revision, so past revisions are never rewritten. `gen` prints a standalone password and does not touch the vault.
+
 ### GUI
 
-- `/items` lists items with search plus type, folder, and tag filters and a deleted (tombstone) toggle; Lock is in the top bar
-- `/items/<id>` shows fields. Edit opens the same form used for adding, with per-field Generate for secret fields. Copy copies a field to the clipboard through the daemon.
+- `/items` lists items with server-side search plus type, folder, and tag filters and a deleted (tombstone) toggle; Lock is in the top bar
+- `/items/<id>` shows fields. Edit opens the same form used for adding, with per-field Generate for secret fields. Copy copies a field to the clipboard through the daemon; the clear timeout is configurable on the item page.
+- **History** on the item page lists earlier revisions with Preview and Restore. Restoring always creates a new revision.
+- TOTP code is available for any item that has a `seed` field, not only `totp` items.
 - `/add` chooses a type and renders that type's fields
 - notes render markdown and support secret references (see section 8)
 
@@ -291,7 +302,7 @@ glyx add totp --name github --field seed=otpauth://totp/GitHub:you?secret=...&is
 glyx totp github
 ```
 
-TOTP uses SHA1, 30 second steps, and 6 digits by default. The code is printed (or returned as JSON). GUI: open the item and press TOTP code. TUI: press `t` in the item detail.
+TOTP uses SHA1, 30 second steps, and 6 digits by default. The code is printed (or returned as JSON). GUI: open any item with a `seed` field and press TOTP code. TUI: press `t` in the item detail.
 
 ---
 
@@ -357,7 +368,7 @@ glyx export tamper
 
 Files without `--keep` are shredded on lock and re-created on unlock. `--force` overwrites a file that changed since the last unlock. `export tamper` lists findings.
 
-GUI: the Exports page adds exports (field, blob, or SSH), lists them, and has Unlock, Lock, Move, and Recall per target. It does not expose the CLI's `--perm` option. When tamper is detected it offers Force re-materialize and Keep (stop tracking without wiping).
+GUI: the Exports page adds exports (field, blob, or SSH) with a `perm` field, has a dedicated **Export an SSH key** form (item, target, perm), and lists tracked targets with Unlock, Lock, Move, and Recall. When tamper is detected it offers Force re-materialize and Keep (stop tracking without wiping).
 
 ---
 
@@ -458,9 +469,9 @@ Rules: the newer field wins, tombstones win over edits, and true same-field race
 
 GC purges old tombstones. A device offline longer than the GC window can resurrect a deleted item on its next sync.
 
-Health checks: `glyx doctor` reports vault state; `--rebuild-index` rebuilds the SQLite index from envelope headers (the vault must be locked), and `--with-unlock` additionally decrypts every item and blob. GUI Settings has Doctor with an index-rebuild toggle.
+Health checks: `glyx doctor` reports vault state; `--rebuild-index` rebuilds the SQLite index from envelope headers (the vault must be locked), and `--with-unlock` additionally decrypts every item and blob. GUI Settings has Doctor with index-rebuild and with-unlock toggles.
 
-GUI: Conflicts lists races, shows mine versus theirs, and resolves. Settings has Sync now, GC (with a configurable window), Doctor (with an optional index rebuild while locked), and pairwise sync where you enter the other vault path plus its keyfile or password.
+GUI: Conflicts lists races, shows mine versus theirs, and resolves. Settings has Sync now, GC (with a configurable window), Doctor (with optional index-rebuild and with-unlock), pairwise sync where you enter the other vault path plus its keyfile or password, and the idle auto-lock interval.
 
 ---
 
@@ -531,17 +542,17 @@ glyx daemon status
 glyx daemon stop
 ```
 
-`daemon start` reuses a live daemon or starts one. It does not need a vault argument; it uses the selected vault, or starts empty for onboarding. The record is `daemon.json` in the runtime directory (port, pid, token, selected vault), readable only by you.
+`daemon start` reuses a live daemon or starts one. It does not need a vault argument; it uses the selected vault, or starts empty for onboarding. `--idle-lock-min` overrides the persisted `idle_lock_min` setting for that daemon instance. The record is `daemon.json` in the runtime directory (port, pid, token, selected vault), readable only by you.
 
 The daemon serves the GUI on loopback with token auth. Open the printed URL, enter the token from `daemon.json`, and use the pages:
 
-- `/` unlock with password, keyfile, or PIN; when unlocking with a password you can also set a PIN
-- `/items` and `/items/<id>` browse, reveal, copy, edit, delete, TOTP
+- `/` unlock with password, keyfile, or PIN, with an Advanced section for per-unlock TTL and materialization; when unlocking with a password you can also set a PIN
+- `/items` and `/items/<id>` browse, search, reveal, copy, edit, delete, TOTP, and restore history
 - `/add` create any item type
 - `/conflicts` compare and resolve
-- `/exports` exports, injections, folders, per-target lock/unlock/move, merge
+- `/exports` exports with perm, SSH key export, injections, folders, per-target lock/unlock/move, merge
 - `/onboarding` select, add, create, or forget vaults
-- `/settings` session mode and TTL, auto-materialize, daemon behavior, rekey, sync, GC, doctor, pairwise sync, and the SSH agent socket
+- `/settings` session mode and TTL, idle auto-lock, auto-materialize, daemon behavior, rekey (including keeping old slots), sync, GC, doctor (rebuild + with-unlock), pairwise sync, and the SSH agent socket
 
 Secrets are kept in memory only and never written to `localStorage`.
 
@@ -589,6 +600,7 @@ glyx config set mode session
 glyx config set session_ttl_min 30
 glyx config set auto_materialize false
 glyx config set daemon_on_exit keep
+glyx config set idle_lock_min 15
 ```
 
 The GUI Settings page edits the same values.
