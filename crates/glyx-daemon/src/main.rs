@@ -1,5 +1,3 @@
-mod api;
-
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -46,11 +44,11 @@ async fn main() -> anyhow::Result<()> {
         use std::fmt::Write as _;
         write!(token, "{b:02x}").expect("hex formatting");
     }
-    let config = api::DaemonConfig {
+    let config = glyx_daemon::api::DaemonConfig {
         vault,
         idle_lock_ms: args.idle_lock_min.saturating_mul(60_000),
     };
-    let (addr, handle) = api::serve(config, token).await?;
+    let (addr, handle) = glyx_daemon::api::serve(config, token).await?;
     println!("glyx-daemon on 127.0.0.1:{}", addr.port());
     handle.await?;
     Ok(())

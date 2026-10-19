@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+pub mod api;
 pub mod runtime;
 
 #[derive(Debug)]

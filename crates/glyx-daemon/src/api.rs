@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::{middleware, Router};
 use serde::Deserialize;
+#[derive(Debug)]
 pub struct AppState {
     pub active: Mutex<Option<PathBuf>>,
     pub vault: Mutex<Option<glyx_store::UnlockedVault>>,
@@ -46,7 +47,7 @@ impl AppState {
             .port
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = glyx_daemon::runtime::write_record(&glyx_daemon::runtime::DaemonRecord {
+        let _ = crate::runtime::write_record(&crate::runtime::DaemonRecord {
             port,
             pid: std::process::id(),
             token: self.token.clone(),
@@ -262,18 +263,30 @@ struct UnlockBody {
     password: Option<String>,
     keyfile: Option<String>,
     pin: Option<String>,
+    new_pin: Option<String>,
 }
 
 async fn unlock(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UnlockBody>,
 ) -> impl IntoResponse {
+    if let Some(pin) = body.new_pin.as_ref() {
+        if body.pin.is_none() && pin.chars().count() < 4 {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "PIN must be at least 4 characters"})),
+            )
+                .into_response();
+        }
+    }
     let vault = match state.active_vault() {
         Ok((_, v)) => v,
         Err(e) => return store_error(&e).into_response(),
     };
     let vault_id = vault.config().vault_id;
     let keyfile_required = vault.keyfile_required();
+    let via_pin = body.pin.is_some();
+    let new_pin = body.new_pin.clone();
     let result = tokio::task::spawn_blocking(move || {
         if let Some(pin) = body.pin {
             return vault.open_session(Some(pin.as_bytes())).and_then(|opt| {
@@ -300,8 +313,15 @@ async fn unlock(
     .await;
     match result {
         Ok(Ok(mut uv)) => {
-            let auto = glyx_store::config::load().auto_materialize;
-            let agent_report = if auto {
+            let cfg = glyx_store::config::load();
+            if !via_pin {
+                if let Some(pin) = new_pin.as_deref() {
+                    if let Err(e) = uv.seal_pin_session(pin.as_bytes(), cfg.session_ttl_min) {
+                        return store_error(&e).into_response();
+                    }
+                }
+            }
+            let agent_report = if cfg.auto_materialize {
                 glyx_agent::enforce_all(&mut uv, false)
                     .map(|r| r.skipped)
                     .unwrap_or_default()
@@ -974,7 +994,16 @@ async fn gc(State(state): State<Arc<AppState>>, Json(body): Json<GcBody>) -> imp
     }
 }
 
-async fn doctor(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+#[derive(Deserialize)]
+struct DoctorQuery {
+    rebuild_index: Option<bool>,
+    with_unlock: Option<bool>,
+}
+
+async fn doctor(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<DoctorQuery>,
+) -> impl IntoResponse {
     let guard = state
         .vault
         .lock()
@@ -999,6 +1028,22 @@ async fn doctor(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             }
         }
         report["decrypted_items"] = serde_json::json!(ok);
+    }
+    if params.with_unlock == Some(true) {
+        report["with_unlock"] = serde_json::json!(guard.is_some());
+    }
+    if params.rebuild_index == Some(true) {
+        if guard.is_some() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "lock the vault before rebuilding the index"})),
+            )
+                .into_response();
+        }
+        match vault.rebuild_index() {
+            Ok(n) => report["rebuilt_index"] = serde_json::json!(n),
+            Err(e) => return store_error(&e).into_response(),
+        }
     }
     Json(report).into_response()
 }
@@ -2006,6 +2051,7 @@ pub async fn serve(
     Ok((addr, handle))
 }
 
+#[derive(Debug)]
 pub struct DaemonConfig {
     pub vault: Option<PathBuf>,
     pub idle_lock_ms: u64,
@@ -2017,16 +2063,19 @@ mod tests {
     use axum::body::Body;
     use tower::ServiceExt;
 
-    fn test_state() -> (tempfile::TempDir, Arc<AppState>) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("t.glyx");
-        let suite = glyx_core::CipherSuiteConfig {
-            kdf: glyx_core::KdfId::Argon2id,
-            cipher: glyx_core::Cipher::Xchacha20poly1305,
-            params: glyx_core::KdfParams::mobile(),
-        };
-        glyx_store::Vault::init(&path, suite, b"pw", Some(&[1u8; 32])).expect("init");
-        let state = Arc::new(AppState {
+    fn ensure_runtime_dir() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let dir =
+                std::env::temp_dir().join(format!("glyx-daemon-tests-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).ok();
+            std::env::set_var("GLYX_RUNTIME_DIR", dir);
+        });
+    }
+
+    fn state_for(path: std::path::PathBuf) -> Arc<AppState> {
+        Arc::new(AppState {
             active: Mutex::new(Some(path)),
             vault: Mutex::new(None),
             token: "test-token".to_owned(),
@@ -2035,8 +2084,20 @@ mod tests {
             last_activity_ms: Mutex::new(now_ms()),
             agent_stop: Mutex::new(None),
             tamper: Mutex::new(Vec::new()),
-        });
-        (dir, state)
+        })
+    }
+
+    fn test_state() -> (tempfile::TempDir, Arc<AppState>) {
+        ensure_runtime_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.glyx");
+        let suite = glyx_core::CipherSuiteConfig {
+            kdf: glyx_core::KdfId::Argon2id,
+            cipher: glyx_core::Cipher::Xchacha20poly1305,
+            params: glyx_core::KdfParams::mobile(),
+        };
+        glyx_store::Vault::init(&path, suite, b"pw", Some(&[1u8; 32])).expect("init");
+        (dir, state_for(path))
     }
 
     async fn call(
@@ -2195,10 +2256,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unlock_seals_pin_session() {
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({
+                "password": "pw", "keyfile": kf_path, "new_pin": "9876",
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let path = state.active_path().expect("active");
+        *state
+            .vault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+        let fresh = state_for(path);
+        let (status, body) = call(
+            fresh,
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"pin": "9876"})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn unlock_rejects_short_new_pin() {
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state,
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({
+                "password": "pw", "keyfile": kf_path, "new_pin": "12",
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn doctor_rebuild_requires_lock() {
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": "pw", "keyfile": kf_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            state.clone(),
+            "GET",
+            "/v1/doctor?rebuild_index=true",
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = call(state.clone(), "POST", "/v1/lock", None, "test-token").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            "/v1/doctor?rebuild_index=true&with_unlock=true",
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("rebuilt_index").is_some(), "{body}");
+        assert_eq!(body["with_unlock"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
     async fn vault_management_cycle() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("GLYX_CONFIG", dir.path().join("config.toml"));
-        std::env::set_var("GLYX_RUNTIME_DIR", dir.path().join("run"));
         let (_d, state) = test_state();
 
         let (status, body) = call(state.clone(), "GET", "/v1/vaults", None, "test-token").await;
