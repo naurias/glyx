@@ -212,6 +212,14 @@ impl Vault {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HistoryEntry {
+    pub rev: u64,
+    pub hlc: glyx_core::Hlc,
+    pub deleted: bool,
+    pub file: String,
+}
+
 pub struct UnlockedVault {
     path: PathBuf,
     config: glyx_core::VaultConfig,
@@ -324,6 +332,62 @@ impl UnlockedVault {
     }
     pub fn list(&self, include_deleted: bool) -> Result<Vec<IndexRow>, StoreError> {
         index::list(&self.conn, include_deleted)
+    }
+    fn history_dir(&self, id: &Uuid) -> PathBuf {
+        self.path
+            .join(layout::HISTORY_DIR)
+            .join(id.as_simple().to_string())
+    }
+    fn history_envelope(&self, id: &Uuid, file: &str) -> Result<Envelope, StoreError> {
+        if file.is_empty() || file.contains('/') || file.contains('\\') || file.contains("..") {
+            return Err(StoreError::Corrupt("invalid history file".into()));
+        }
+        let bytes = fs::read(self.history_dir(id).join(file))?;
+        serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))
+    }
+    pub fn history(&self, id: &Uuid) -> Result<Vec<HistoryEntry>, StoreError> {
+        let dir = self.history_dir(id);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&dir)?.flatten() {
+            let path = entry.path();
+            if !has_extension(&path, "json") {
+                continue;
+            }
+            let bytes = fs::read(&path)?;
+            let env: Envelope =
+                serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            let file = path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            out.push(HistoryEntry {
+                rev: env.rev,
+                hlc: env.hlc,
+                deleted: env.deleted,
+                file,
+            });
+        }
+        out.sort_by_key(|entry| std::cmp::Reverse(entry.hlc));
+        Ok(out)
+    }
+    pub fn history_item(&self, id: &Uuid, file: &str) -> Result<glyx_core::Item, StoreError> {
+        self.history_envelope(id, file)?.open(&self.key)
+    }
+    pub fn restore_history(
+        &mut self,
+        id: &Uuid,
+        file: &str,
+    ) -> Result<glyx_core::Item, StoreError> {
+        let mut restored = self.history_item(id, file)?;
+        let current_rev = self.get_item(id)?.map_or(0, |c| c.rev);
+        restored.hlc = self.next_hlc()?;
+        restored.rev = current_rev.max(restored.rev).saturating_add(1);
+        restored.deleted = false;
+        restored.updated_by = self.node;
+        self.put_item(&restored)?;
+        Ok(restored)
     }
     pub fn next_hlc(&mut self) -> Result<glyx_core::Hlc, StoreError> {
         let last_ms: i64 = self.meta_get("hlc_ms")?.unwrap_or(0);
@@ -1189,6 +1253,36 @@ mod m1_tests {
         assert!(uv.list(false).expect("list").is_empty());
         assert_eq!(uv.list(true).expect("all").len(), 1);
         assert!(!uv.delete_item(&Uuid::now_v7()).expect("missing"));
+    }
+
+    #[test]
+    fn history_lists_and_restores() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.glyx");
+        let kf = [3u8; 32];
+        Vault::init(&path, mobile_suite(), b"pw", Some(&kf)).expect("init");
+        let vault = Vault::open(&path).expect("open");
+        let mut uv = vault.unlock(b"pw", &kf).expect("unlock");
+        let hlc = uv.next_hlc().expect("tick");
+        let mut item = login_item(uv.device_node(), hlc);
+        let id = item.id;
+        uv.put_item(&item).expect("put");
+        item.name = "renamed".to_owned();
+        item.hlc = uv.next_hlc().expect("tick");
+        item.rev = 2;
+        uv.put_item(&item).expect("overwrite");
+        let history = uv.history(&id).expect("history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].rev, 1);
+        assert_eq!(
+            uv.history_item(&id, &history[0].file).expect("snap").name,
+            "web"
+        );
+        assert!(uv.history_item(&id, "../escape").is_err());
+        let restored = uv.restore_history(&id, &history[0].file).expect("restore");
+        assert_eq!(restored.name, "web");
+        assert_eq!(restored.rev, 3);
+        assert_eq!(uv.get_item(&id).expect("get").expect("found").name, "web");
     }
 
     #[test]

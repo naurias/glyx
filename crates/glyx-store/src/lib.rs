@@ -18,4 +18,4 @@ pub use envelope::{Envelope, EnvelopeHeader};
 pub use error::StoreError;
 pub use index::IndexRow;
 pub use session::{SESSION_TTL_DEFAULT_MIN, SESSION_TTL_MAX_MIN};
-pub use vault::{UnlockedVault, Vault};
+pub use vault::{HistoryEntry, UnlockedVault, Vault};

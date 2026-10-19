@@ -7,12 +7,8 @@ use clap::Parser;
 struct Args {
     #[arg(long, help = "Vault directory; omit to use the selected vault")]
     vault: Option<PathBuf>,
-    #[arg(
-        long,
-        default_value = "15",
-        help = "Idle auto-lock minutes, 0 disables"
-    )]
-    idle_lock_min: u64,
+    #[arg(long, help = "Idle auto-lock minutes, 0 disables")]
+    idle_lock_min: Option<u64>,
 }
 
 #[tokio::main]
@@ -44,9 +40,13 @@ async fn main() -> anyhow::Result<()> {
         use std::fmt::Write as _;
         write!(token, "{b:02x}").expect("hex formatting");
     }
+    let idle_lock_min = args
+        .idle_lock_min
+        .or_else(|| glyx_store::config::load().idle_lock_min)
+        .unwrap_or(15);
     let config = glyx_daemon::api::DaemonConfig {
         vault,
-        idle_lock_ms: args.idle_lock_min.saturating_mul(60_000),
+        idle_lock_ms: idle_lock_min.saturating_mul(60_000),
     };
     let (addr, handle) = glyx_daemon::api::serve(config, token).await?;
     println!("glyx-daemon on 127.0.0.1:{}", addr.port());

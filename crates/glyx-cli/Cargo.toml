@@ -17,6 +17,7 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+chrono.workspace = true
 rpassword.workspace = true
 arboard.workspace = true
 uuid.workspace = true

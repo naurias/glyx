@@ -15,7 +15,7 @@ pub struct AppState {
     pub vault: Mutex<Option<glyx_store::UnlockedVault>>,
     pub token: String,
     pub port: Mutex<u16>,
-    pub idle_lock_ms: u64,
+    pub idle_lock_ms: std::sync::atomic::AtomicU64,
     pub last_activity_ms: Mutex<u64>,
     pub agent_stop: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
     pub tamper: Mutex<Vec<String>>,
@@ -59,6 +59,15 @@ impl AppState {
 
 fn now_ms() -> u64 {
     glyx_core::ids::wall_ms_now()
+}
+
+fn hex16(bytes: &[u8; 16]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -138,7 +147,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/items/:id/totp", get(totp_code))
         .route("/v1/items/:id/rendered", get(rendered_item))
         .route("/v1/items/:id/fill", post(fill_item))
+        .route("/v1/items/:id/history", get(item_history))
+        .route(
+            "/v1/items/:id/history/:file",
+            get(show_history_item).post(restore_history_item),
+        )
         .route("/v1/ssh-gen", post(ssh_gen))
+        .route("/v1/ssh/export", post(ssh_export))
         .route("/v1/sync", post(sync))
         .route("/v1/conflicts", get(list_conflicts))
         .route("/v1/conflicts/:id", get(show_conflict))
@@ -227,10 +242,12 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let active = state.active_path();
     let vault_info = active.as_ref().and_then(|p| {
         glyx_store::Vault::open(p).ok().map(|v| {
+            let device = v.device_id().ok().map(|d| hex16(&d.0));
             serde_json::json!({
                 "path": p,
                 "vault_id": v.config().vault_id,
                 "keyfile_required": v.keyfile_required(),
+                "device_id": device,
             })
         })
     });
@@ -264,6 +281,8 @@ struct UnlockBody {
     keyfile: Option<String>,
     pin: Option<String>,
     new_pin: Option<String>,
+    ttl_min: Option<u64>,
+    materialize: Option<bool>,
 }
 
 async fn unlock(
@@ -287,6 +306,8 @@ async fn unlock(
     let keyfile_required = vault.keyfile_required();
     let via_pin = body.pin.is_some();
     let new_pin = body.new_pin.clone();
+    let ttl_min = body.ttl_min;
+    let materialize = body.materialize;
     let result = tokio::task::spawn_blocking(move || {
         if let Some(pin) = body.pin {
             return vault.open_session(Some(pin.as_bytes())).and_then(|opt| {
@@ -316,12 +337,17 @@ async fn unlock(
             let cfg = glyx_store::config::load();
             if !via_pin {
                 if let Some(pin) = new_pin.as_deref() {
-                    if let Err(e) = uv.seal_pin_session(pin.as_bytes(), cfg.session_ttl_min) {
+                    let ttl = ttl_min.unwrap_or(cfg.session_ttl_min);
+                    if let Err(e) = uv.seal_pin_session(pin.as_bytes(), ttl) {
+                        return store_error(&e).into_response();
+                    }
+                } else if let Some(ttl) = ttl_min {
+                    if let Err(e) = uv.write_plain_session(ttl) {
                         return store_error(&e).into_response();
                     }
                 }
             }
-            let agent_report = if cfg.auto_materialize {
+            let agent_report = if materialize.unwrap_or(cfg.auto_materialize) {
                 glyx_agent::enforce_all(&mut uv, false)
                     .map(|r| r.skipped)
                     .unwrap_or_default()
@@ -422,41 +448,50 @@ async fn list_items(
         Ok(r) => r,
         Err(e) => return store_error(&e).into_response(),
     };
-    let out: Vec<_> = rows
-        .into_iter()
-        .filter(|r| q.item_type.as_ref().is_none_or(|t| &r.item_type == t))
-        .filter(|r| {
-            q.q.as_ref().is_none_or(|needle| {
-                let needle = needle.to_lowercase();
-                r.name.to_lowercase().contains(&needle)
-            })
-        })
-        .collect();
-    let out: Vec<_> = out
-        .into_iter()
-        .filter(|r| {
-            q.folder.as_ref().is_none_or(|f| {
-                uv.get_item(&r.id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|item| &item.folder == f)
-            }) && q.tag.as_ref().is_none_or(|t| {
-                uv.get_item(&r.id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|item| item.tags.iter().any(|x| x == t))
-            })
-        })
-        .map(|r| {
-            serde_json::json!({
-                "id": r.id,
-                "type": r.item_type,
-                "name": r.name,
-                "rev": r.rev,
-                "deleted": r.deleted,
-            })
-        })
-        .collect();
+    let needle = q.q.as_ref().map(|s| s.to_lowercase());
+    let mut out = Vec::new();
+    for row in rows {
+        if q.item_type.as_ref().is_some_and(|t| &row.item_type != t) {
+            continue;
+        }
+        let item = uv.get_item(&row.id).ok().flatten();
+        if let Some(needle) = needle.as_ref() {
+            let hit = row.name.to_lowercase().contains(needle)
+                || item.as_ref().is_some_and(|item| {
+                    item.folder.to_lowercase().contains(needle)
+                        || item
+                            .tags
+                            .iter()
+                            .any(|tag| tag.to_lowercase().contains(needle))
+                        || item.fields.iter().any(|(key, field)| {
+                            glyx_store::present::display_value(item.item_type, key, false)
+                                && field.value.expose().to_lowercase().contains(needle)
+                        })
+                });
+            if !hit {
+                continue;
+            }
+        }
+        if q.folder
+            .as_ref()
+            .is_some_and(|f| item.as_ref().is_none_or(|item| &item.folder != f))
+        {
+            continue;
+        }
+        if q.tag.as_ref().is_some_and(|t| {
+            item.as_ref()
+                .is_none_or(|item| !item.tags.iter().any(|x| x == t))
+        }) {
+            continue;
+        }
+        out.push(serde_json::json!({
+            "id": row.id,
+            "type": row.item_type,
+            "name": row.name,
+            "rev": row.rev,
+            "deleted": row.deleted,
+        }));
+    }
     Json(serde_json::Value::Array(out)).into_response()
 }
 
@@ -1629,6 +1664,145 @@ struct VaultCreateBody {
     keyfile: Option<String>,
 }
 
+async fn item_history(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let Ok(uuid) = id.parse::<uuid::Uuid>() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no such item"})),
+        )
+            .into_response();
+    };
+    match uv.history(&uuid) {
+        Ok(items) => Json(serde_json::json!({"items": items})).into_response(),
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+async fn show_history_item(
+    State(state): State<Arc<AppState>>,
+    Path((id, file)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let Ok(uuid) = id.parse::<uuid::Uuid>() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no such item"})),
+        )
+            .into_response();
+    };
+    match uv.history_item(&uuid, &file) {
+        Ok(item) => Json(serde_json::json!({"item": glyx_store::present::item_json(&item, false)}))
+            .into_response(),
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+async fn restore_history_item(
+    State(state): State<Arc<AppState>>,
+    Path((id, file)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return locked_error().into_response();
+    };
+    let Ok(uuid) = id.parse::<uuid::Uuid>() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no such item"})),
+        )
+            .into_response();
+    };
+    match uv.restore_history(&uuid, &file) {
+        Ok(item) => Json(serde_json::json!({"ok": true, "id": item.id})).into_response(),
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SshExportBody {
+    item: String,
+    to: Option<PathBuf>,
+    perm: Option<u32>,
+}
+
+async fn ssh_export(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SshExportBody>,
+) -> impl IntoResponse {
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return locked_error().into_response();
+    };
+    let item = match uv.resolve(&body.item) {
+        Ok(item) => item,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    let target = body.to.unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+        PathBuf::from(home)
+            .join(".ssh")
+            .join(format!("glyx_{}", item.name))
+    });
+    let conn = match glyx_agent::ledger::open_db() {
+        Ok(conn) => conn,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    if let Err(e) = glyx_agent::ledger::register_export(
+        &conn,
+        &glyx_agent::ledger::ExportSpec {
+            target: &target,
+            kind: "ssh",
+            item_id: Some(item.id),
+            field: None,
+            blob_addr: None,
+            keep_on_lock: false,
+            perm: body.perm.unwrap_or(0o600),
+        },
+    ) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    if let Err(e) = glyx_agent::engine::materialize_all(uv, false) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({"ok": true, "target": target})).into_response()
+}
+
 #[derive(Deserialize)]
 struct VaultSelectBody {
     path: PathBuf,
@@ -1645,6 +1819,7 @@ struct SettingsBody {
     mode: Option<String>,
     session_ttl_min: Option<u64>,
     auto_materialize: Option<bool>,
+    idle_lock_min: Option<u64>,
 }
 
 fn vault_json(
@@ -1821,11 +1996,12 @@ async fn get_settings(State(_state): State<Arc<AppState>>) -> impl IntoResponse 
         "mode": cfg.mode,
         "session_ttl_min": cfg.session_ttl_min,
         "auto_materialize": cfg.auto_materialize,
+        "idle_lock_min": cfg.idle_lock_min,
     }))
 }
 
 async fn set_settings(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(body): Json<SettingsBody>,
 ) -> impl IntoResponse {
     let mut cfg = glyx_store::config::load();
@@ -1847,6 +2023,13 @@ async fn set_settings(
     if let Some(auto) = body.auto_materialize {
         cfg.auto_materialize = auto;
     }
+    if let Some(min) = body.idle_lock_min {
+        cfg.idle_lock_min = Some(min);
+        state.idle_lock_ms.store(
+            min.saturating_mul(60_000),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     if let Err(e) = glyx_store::config::save(&cfg) {
         return store_error(&e).into_response();
     }
@@ -1856,6 +2039,7 @@ async fn set_settings(
         "mode": cfg.mode,
         "session_ttl_min": cfg.session_ttl_min,
         "auto_materialize": cfg.auto_materialize,
+        "idle_lock_min": cfg.idle_lock_min,
     }))
     .into_response()
 }
@@ -2021,7 +2205,7 @@ pub async fn serve(
         vault: Mutex::new(None),
         token,
         port: Mutex::new(addr.port()),
-        idle_lock_ms: config.idle_lock_ms,
+        idle_lock_ms: std::sync::atomic::AtomicU64::new(config.idle_lock_ms),
         last_activity_ms: Mutex::new(now_ms()),
         agent_stop: Mutex::new(None),
         tamper: Mutex::new(Vec::new()),
@@ -2038,7 +2222,8 @@ pub async fn serve(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
-            if idle.idle_lock_ms > 0 && idle_for >= idle.idle_lock_ms {
+            let idle_limit = idle.idle_lock_ms.load(std::sync::atomic::Ordering::Relaxed);
+            if idle_limit > 0 && idle_for >= idle_limit {
                 do_lock(&idle);
             }
         }
@@ -2080,7 +2265,7 @@ mod tests {
             vault: Mutex::new(None),
             token: "test-token".to_owned(),
             port: Mutex::new(0),
-            idle_lock_ms: 0,
+            idle_lock_ms: std::sync::atomic::AtomicU64::new(0),
             last_activity_ms: Mutex::new(now_ms()),
             agent_stop: Mutex::new(None),
             tamper: Mutex::new(Vec::new()),
@@ -2208,6 +2393,142 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let (status, _) = call(state.clone(), "GET", "/v1/items", None, "test-token").await;
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn history_restore_and_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("GLYX_CONFIG", dir.path().join("config.toml"));
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({
+                "password": "pw", "keyfile": kf_path, "ttl_min": 5,
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/items",
+            Some(serde_json::json!({
+                "type": "login", "name": "web",
+                "fields": {"username": "u", "password": "p"},
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let id = body["id"].as_str().expect("id").to_owned();
+        let (status, _) = call(
+            state.clone(),
+            "PATCH",
+            &format!("/v1/items/{id}"),
+            Some(serde_json::json!({"rename": "renamed"})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            &format!("/v1/items/{id}/history"),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let entries = body["items"].as_array().expect("history");
+        assert_eq!(entries.len(), 1);
+        let file = entries[0]["file"].as_str().expect("file").to_owned();
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            &format!("/v1/items/{id}/history/{file}"),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["item"]["name"], serde_json::json!("web"));
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            &format!("/v1/items/{id}/history/{file}"),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            &format!("/v1/items/{id}"),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["name"], serde_json::json!("web"));
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/settings",
+            Some(serde_json::json!({"idle_lock_min": 5})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["idle_lock_min"], serde_json::json!(5));
+        assert_eq!(
+            state
+                .idle_lock_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            300_000
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_export_endpoint_writes_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("GLYX_CONFIG", dir.path().join("config.toml"));
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": "pw", "keyfile": kf_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/ssh-gen",
+            Some(serde_json::json!({"name": "key"})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let target = dir.path().join("id_ed25519");
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/ssh/export",
+            Some(serde_json::json!({"item": "key", "to": target, "perm": 384})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(target.exists());
     }
 
     fn test_kf() -> String {

@@ -61,6 +61,8 @@ enum Cmd {
         item_type: Option<String>,
         #[arg(long, help = "Include tombstones")]
         all: bool,
+        #[arg(long, short, help = "Case-insensitive search")]
+        query: Option<String>,
     },
     #[command(about = "Show one item")]
     Show {
@@ -70,6 +72,25 @@ enum Cmd {
         reveal: bool,
         #[arg(long, help = "Render note refs to values")]
         render: bool,
+    },
+    #[command(about = "Generate a password")]
+    Gen {
+        #[arg(long, default_value_t = 24, help = "Length")]
+        length: usize,
+    },
+    #[command(about = "Show item history")]
+    History {
+        #[arg(help = "Id, id prefix, or exact name")]
+        query: String,
+    },
+    #[command(about = "Restore a historical revision")]
+    Restore {
+        #[arg(help = "Id, id prefix, or exact name")]
+        query: String,
+        #[arg(long, help = "Revision to restore")]
+        rev: Option<u64>,
+        #[arg(long, help = "History file name")]
+        file: Option<String>,
     },
     #[command(about = "Add an item")]
     Add {
@@ -245,7 +266,9 @@ enum ConfigCmd {
     Show,
     #[command(about = "Change one setting")]
     Set {
-        #[arg(help = "Key: mode, session_ttl_min, auto_materialize, daemon_on_exit")]
+        #[arg(
+            help = "Key: mode, session_ttl_min, auto_materialize, daemon_on_exit, idle_lock_min"
+        )]
         key: String,
         #[arg(help = "New value")]
         value: String,
@@ -544,18 +567,23 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             tag,
             item_type,
             all,
+            query,
         } => cmd_ls(
             ctx,
             folder.as_deref(),
             tag.as_deref(),
             item_type.as_deref(),
             all,
+            query.as_deref(),
         ),
         Cmd::Show {
             query,
             reveal,
             render,
         } => cmd_show(ctx, &query, reveal, render),
+        Cmd::Gen { length } => cmd_gen(ctx, length),
+        Cmd::History { query } => cmd_history(ctx, &query),
+        Cmd::Restore { query, rev, file } => cmd_restore(ctx, &query, rev, file.as_deref()),
         Cmd::Add {
             item_type,
             name,
@@ -669,6 +697,9 @@ fn dispatch_grouped(ctx: &Ctx, cmd: Cmd) -> Result<()> {
         Cmd::Config { cmd } => cmd_config(ctx, cmd),
         Cmd::Ls { .. }
         | Cmd::Show { .. }
+        | Cmd::Gen { .. }
+        | Cmd::History { .. }
+        | Cmd::Restore { .. }
         | Cmd::Add { .. }
         | Cmd::Edit { .. }
         | Cmd::Rm { .. }
@@ -878,6 +909,11 @@ fn cmd_config(ctx: &Ctx, cmd: Option<ConfigCmd>) -> Result<()> {
                 println!("auto_materialize = {}", cfg.auto_materialize);
                 println!("daemon_on_exit = {exit}");
                 println!(
+                    "idle_lock_min = {}",
+                    cfg.idle_lock_min
+                        .map_or_else(|| "-".to_owned(), |v| v.to_string())
+                );
+                println!(
                     "current_vault = {}",
                     cfg.current_vault
                         .as_ref()
@@ -911,6 +947,10 @@ fn cmd_config(ctx: &Ctx, cmd: Option<ConfigCmd>) -> Result<()> {
                         "stop" => DaemonExit::Stop,
                         other => bail!("daemon_on_exit must be stop or keep, got {other}"),
                     };
+                }
+                "idle_lock_min" => {
+                    cfg.idle_lock_min =
+                        Some(value.parse().context("idle_lock_min must be a number")?);
                 }
                 other => bail!("unknown setting {other}"),
             }
@@ -1135,12 +1175,24 @@ fn cmd_lock(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+fn item_matches(item: &glyx_core::Item, query: &str) -> bool {
+    let needle = query.to_lowercase();
+    item.name.to_lowercase().contains(&needle)
+        || item.folder.to_lowercase().contains(&needle)
+        || item.tags.iter().any(|t| t.to_lowercase().contains(&needle))
+        || item.fields.iter().any(|(key, field)| {
+            glyx_store::present::display_value(item.item_type, key, false)
+                && field.value.expose().to_lowercase().contains(&needle)
+        })
+}
+
 fn cmd_ls(
     ctx: &Ctx,
     folder: Option<&str>,
     tag: Option<&str>,
     item_type: Option<&str>,
     all: bool,
+    query: Option<&str>,
 ) -> Result<()> {
     let uv = ctx.unlocked()?;
     let rows = uv.list(all)?;
@@ -1160,7 +1212,8 @@ fn cmd_ls(
             && tag.is_none_or(|t| {
                 item.as_ref()
                     .is_some_and(|item| item.tags.iter().any(|x| x.as_str() == t))
-            });
+            })
+            && query.is_none_or(|q| item.as_ref().is_some_and(|item| item_matches(item, q)));
         if keep {
             detailed.push(row.clone());
         }
@@ -1177,6 +1230,82 @@ fn cmd_ls(
                 row.name
             );
         }
+    }
+    Ok(())
+}
+
+fn cmd_gen(ctx: &Ctx, length: usize) -> Result<()> {
+    let password = glyx_crypto::pass::generate_password(length)?;
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::json!({"password": password, "length": length})
+        );
+    } else {
+        println!("{password}");
+    }
+    Ok(())
+}
+
+fn history_time(hlc: glyx_core::Hlc) -> String {
+    let ms = i64::try_from(hlc.wall_ms).unwrap_or(i64::MAX);
+    chrono::DateTime::from_timestamp_millis(ms).map_or_else(
+        || hlc.wall_ms.to_string(),
+        |d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+}
+
+fn cmd_history(ctx: &Ctx, query: &str) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    let item = items::resolve_query(&uv, query)?;
+    let entries = uv.history(&item.id)?;
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"id": item.id, "items": entries}))?
+        );
+    } else if entries.is_empty() {
+        println!("no history for {}", item.name);
+    } else {
+        for entry in entries {
+            let deleted = if entry.deleted { " [deleted]" } else { "" };
+            println!(
+                "rev {}  {}  {}{deleted}",
+                entry.rev,
+                history_time(entry.hlc),
+                entry.file
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_restore(ctx: &Ctx, query: &str, rev: Option<u64>, file: Option<&str>) -> Result<()> {
+    let mut uv = ctx.unlocked()?;
+    let item = items::resolve_query(&uv, query)?;
+    let file = if let Some(file) = file {
+        file.to_owned()
+    } else {
+        let rev = rev.context("pass --rev or --file")?;
+        uv.history(&item.id)?
+            .into_iter()
+            .find(|entry| entry.rev == rev)
+            .map(|entry| entry.file)
+            .with_context(|| format!("no history revision {rev}"))?
+    };
+    let restored = uv.restore_history(&item.id, &file)?;
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "id": restored.id,
+                "name": restored.name,
+                "rev": restored.rev,
+            })
+        );
+    } else {
+        println!("restored {} at revision {}", restored.name, restored.rev);
     }
     Ok(())
 }
