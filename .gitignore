@@ -9,4 +9,6 @@ result-*
 node_modules/
 .svelte-kit/
 apps/webui/build/
-crates/glyx-tauri/gen/
+crates/glyx-tauri/gen/*
+!crates/glyx-tauri/gen/android
+!crates/glyx-tauri/gen/android/**
