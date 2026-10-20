@@ -270,6 +270,7 @@ mod tests {
             name: "deploy".to_owned(),
             folder: String::new(),
             tags: Vec::new(),
+            favorite: false,
             fields,
             hlc,
             rev: 1,

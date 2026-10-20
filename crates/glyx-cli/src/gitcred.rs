@@ -134,6 +134,7 @@ pub fn cmd_store(
         name: host.clone(),
         folder: String::new(),
         tags: Vec::new(),
+        favorite: false,
         fields,
         hlc,
         rev: 1,

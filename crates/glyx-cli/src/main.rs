@@ -78,10 +78,21 @@ enum Cmd {
         #[arg(long, default_value_t = 24, help = "Length")]
         length: usize,
     },
+    #[command(about = "Encrypted vault attachments")]
+    Blob {
+        #[command(subcommand)]
+        cmd: BlobCmd,
+    },
     #[command(about = "Show item history")]
     History {
         #[arg(help = "Id, id prefix, or exact name")]
         query: String,
+        #[arg(long, help = "Show a history file")]
+        show: Option<String>,
+        #[arg(long, help = "Reveal secrets in --show output")]
+        reveal: bool,
+        #[arg(long, help = "Compare a history file with the current item")]
+        compare: Option<String>,
     },
     #[command(about = "Restore a historical revision")]
     Restore {
@@ -108,6 +119,8 @@ enum Cmd {
         generate: Vec<String>,
         #[arg(long, help = "Read the note body from a file")]
         body_file: Option<PathBuf>,
+        #[arg(long, help = "Attach an encrypted file (25 MiB max)")]
+        attach: Option<PathBuf>,
         #[arg(long, help = "Prompt for missing fields")]
         interactive: bool,
     },
@@ -123,6 +136,8 @@ enum Cmd {
         delete_field: Vec<String>,
         #[arg(long, help = "Read the note body from a file")]
         body_file: Option<PathBuf>,
+        #[arg(long, help = "Replace the encrypted attachment (25 MiB max)")]
+        attach: Option<PathBuf>,
         #[arg(long, help = "Move to a folder (empty string clears)")]
         folder: Option<String>,
         #[arg(long, help = "Add a tag (repeatable)")]
@@ -253,6 +268,18 @@ enum VaultCmd {
         #[arg(long, help = "Keep old keyslots")]
         keep_old_slots: bool,
     },
+    #[command(about = "Write an encrypted-artifact backup archive")]
+    Backup {
+        #[arg(help = "Archive path (must not exist)")]
+        out: PathBuf,
+    },
+    #[command(about = "Restore a backup into a new vault directory")]
+    Restore {
+        #[arg(help = "Archive path")]
+        archive: PathBuf,
+        #[arg(help = "New vault directory (must not exist)")]
+        dest: PathBuf,
+    },
     #[command(about = "Remove a vault from the registry (files untouched)")]
     Forget {
         #[arg(help = "Vault directory (defaults to the selected vault)")]
@@ -334,6 +361,29 @@ enum GitCmd {
     Setup,
     #[command(about = "Git helper diagnostics")]
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum BlobCmd {
+    #[command(about = "Encrypt and store a file")]
+    Put {
+        #[arg(help = "File to attach")]
+        file: PathBuf,
+    },
+    #[command(about = "Decrypt an attachment to a file")]
+    Get {
+        #[arg(help = "Blob address")]
+        addr: String,
+        #[arg(long, help = "Output path")]
+        out: PathBuf,
+    },
+    #[command(about = "List stored attachments")]
+    Ls,
+    #[command(about = "Find and optionally purge unreferenced attachments")]
+    Gc {
+        #[arg(long, help = "Delete orphans instead of listing them")]
+        purge: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -582,7 +632,13 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             render,
         } => cmd_show(ctx, &query, reveal, render),
         Cmd::Gen { length } => cmd_gen(ctx, length),
-        Cmd::History { query } => cmd_history(ctx, &query),
+        Cmd::Blob { cmd } => cmd_blob(ctx, cmd),
+        Cmd::History {
+            query,
+            show,
+            reveal,
+            compare,
+        } => cmd_history(ctx, &query, show.as_deref(), reveal, compare.as_deref()),
         Cmd::Restore { query, rev, file } => cmd_restore(ctx, &query, rev, file.as_deref()),
         Cmd::Add {
             item_type,
@@ -592,6 +648,7 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             field,
             generate,
             body_file,
+            attach,
             interactive,
         } => cmd_add(
             ctx,
@@ -603,6 +660,7 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
                 field,
                 generate,
                 body_file,
+                attach,
                 interactive,
             },
         ),
@@ -612,6 +670,7 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             field,
             delete_field,
             body_file,
+            attach,
             folder,
             tag,
             remove_tag,
@@ -624,6 +683,7 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
                 field,
                 delete_field,
                 body_file,
+                attach,
                 folder,
                 tag,
                 remove_tag,
@@ -698,6 +758,7 @@ fn dispatch_grouped(ctx: &Ctx, cmd: Cmd) -> Result<()> {
         Cmd::Ls { .. }
         | Cmd::Show { .. }
         | Cmd::Gen { .. }
+        | Cmd::Blob { .. }
         | Cmd::History { .. }
         | Cmd::Restore { .. }
         | Cmd::Add { .. }
@@ -862,8 +923,58 @@ fn dispatch_vault(ctx: &Ctx, cmd: VaultCmd) -> Result<()> {
             preset,
             keep_old_slots,
         ),
+        VaultCmd::Backup { out } => cmd_vault_backup(ctx, &out),
+        VaultCmd::Restore { archive, dest } => cmd_vault_restore(ctx, &archive, &dest),
         VaultCmd::Forget { path } => vault_forget(ctx, path.as_deref()),
     }
+}
+
+fn cmd_vault_backup(ctx: &Ctx, out: &Path) -> Result<()> {
+    let path = ctx.vault_path()?;
+    let vault = glyx_store::Vault::open(&path)?;
+    let cfg = auth::load_config();
+    let keyfile = cfg
+        .find(&path)
+        .and_then(|entry| entry.keyfile.as_deref())
+        .map(Path::to_path_buf);
+    let report = glyx_store::backup::create(&vault, out, keyfile.as_deref())?;
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::json!({"ok": true, "path": out, "bytes": report.bytes})
+        );
+    } else {
+        println!("wrote {} bytes to {}", report.bytes, out.display());
+    }
+    Ok(())
+}
+
+fn cmd_vault_restore(ctx: &Ctx, archive: &Path, dest: &Path) -> Result<()> {
+    glyx_store::backup::restore(archive, dest)?;
+    let vault = glyx_store::Vault::open(dest)?;
+    let mut cfg = auth::load_config();
+    let label = dest.file_name().map_or_else(
+        || dest.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    cfg.register(glyx_store::config::VaultEntry {
+        path: dest.to_path_buf(),
+        name: Some(label),
+        vault_id: Some(vault.config().vault_id),
+        keyfile: None,
+        last_used_ms: glyx_core::ids::wall_ms_now(),
+    });
+    cfg.select(dest);
+    auth::save_config(&cfg)?;
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::json!({"ok": true, "path": dest, "vault_id": vault.config().vault_id})
+        );
+    } else {
+        println!("restored {}", dest.display());
+    }
+    Ok(())
 }
 
 fn vault_forget(ctx: &Ctx, path: Option<&Path>) -> Result<()> {
@@ -1247,6 +1358,83 @@ fn cmd_gen(ctx: &Ctx, length: usize) -> Result<()> {
     Ok(())
 }
 
+fn read_attachment(path: &Path) -> Result<Vec<u8>> {
+    let meta =
+        std::fs::metadata(path).with_context(|| format!("cannot inspect {}", path.display()))?;
+    if meta.len() > glyx_store::MAX_BLOB_BYTES as u64 {
+        bail!("attachment exceeds the 25 MiB limit");
+    }
+    let data = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    if data.len() > glyx_store::MAX_BLOB_BYTES {
+        bail!("attachment exceeds the 25 MiB limit");
+    }
+    Ok(data)
+}
+
+fn cmd_blob(ctx: &Ctx, cmd: BlobCmd) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    match cmd {
+        BlobCmd::Put { file } => {
+            let data = read_attachment(&file)?;
+            let addr = uv.put_blob(&data)?;
+            if ctx.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"ok": true, "addr": addr, "size": data.len()})
+                );
+            } else {
+                println!("{addr}");
+            }
+        }
+        BlobCmd::Get { addr, out } => {
+            let data = uv.get_blob(&addr)?;
+            glyx_store::vault::atomic_write(&out, &data)?;
+            if ctx.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"ok": true, "addr": addr, "out": out, "size": data.len()})
+                );
+            } else {
+                println!("wrote {} bytes to {}", data.len(), out.display());
+            }
+        }
+        BlobCmd::Ls => {
+            let blobs = uv.blob_addresses()?;
+            if ctx.json {
+                let rows: Vec<_> = blobs
+                    .iter()
+                    .map(|(addr, size)| serde_json::json!({"addr": addr, "size": size}))
+                    .collect();
+                println!("{}", serde_json::json!({"blobs": rows}));
+            } else {
+                for (addr, size) in blobs {
+                    println!("{addr}  {size}");
+                }
+            }
+        }
+        BlobCmd::Gc { purge } => {
+            let conn = glyx_agent::ledger::open_db()?;
+            let exports = glyx_agent::ledger::list_exports(&conn)?;
+            let refs: std::collections::HashSet<String> =
+                exports.into_iter().filter_map(|e| e.blob_addr).collect();
+            let report = uv.gc_blobs(&refs, !purge)?;
+            if ctx.json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                println!(
+                    "existing {} orphans {} ({} bytes) purged {} ({} bytes)",
+                    report.existing,
+                    report.orphans,
+                    report.orphan_bytes,
+                    report.purged,
+                    report.purged_bytes
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn history_time(hlc: glyx_core::Hlc) -> String {
     let ms = i64::try_from(hlc.wall_ms).unwrap_or(i64::MAX);
     chrono::DateTime::from_timestamp_millis(ms).map_or_else(
@@ -1255,9 +1443,80 @@ fn history_time(hlc: glyx_core::Hlc) -> String {
     )
 }
 
-fn cmd_history(ctx: &Ctx, query: &str) -> Result<()> {
+fn cmd_history(
+    ctx: &Ctx,
+    query: &str,
+    show: Option<&str>,
+    reveal: bool,
+    compare: Option<&str>,
+) -> Result<()> {
     let uv = ctx.unlocked()?;
     let item = items::resolve_query(&uv, query)?;
+    if let Some(file) = show {
+        let history = uv.history_item(&item.id, file)?;
+        if ctx.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "item": glyx_store::present::item_json(&history, reveal)
+                }))?
+            );
+        } else {
+            println!("{} [rev {}]", history.name, history.rev);
+            for (k, f) in &history.fields {
+                let value = if items::display_value(history.item_type, k, reveal) {
+                    f.value.expose().to_owned()
+                } else {
+                    "••••".to_owned()
+                };
+                println!("{k}: {value}");
+            }
+        }
+        return Ok(());
+    }
+    if let Some(file) = compare {
+        let history = uv.history_item(&item.id, file)?;
+        let current = uv
+            .get_item(&item.id)?
+            .ok_or_else(|| anyhow::anyhow!("no such item"))?;
+        let mut changed = Vec::new();
+        if current.name != history.name {
+            changed.push("name".to_owned());
+        }
+        if current.folder != history.folder {
+            changed.push("folder".to_owned());
+        }
+        if current.tags != history.tags {
+            changed.push("tags".to_owned());
+        }
+        if current.favorite != history.favorite {
+            changed.push("favorite".to_owned());
+        }
+        let keys: std::collections::BTreeSet<_> =
+            current.fields.keys().chain(history.fields.keys()).collect();
+        for key in keys {
+            if current.fields.get(key).map(|f| f.value.expose())
+                != history.fields.get(key).map(|f| f.value.expose())
+            {
+                changed.push(key.clone());
+            }
+        }
+        if ctx.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "current_rev": current.rev,
+                    "history_rev": history.rev,
+                    "changed": changed
+                })
+            );
+        } else if changed.is_empty() {
+            println!("no differences");
+        } else {
+            println!("{}", changed.join(", "));
+        }
+        return Ok(());
+    }
     let entries = uv.history(&item.id)?;
     if ctx.json {
         println!(
@@ -1363,6 +1622,7 @@ struct AddInput {
     field: Vec<String>,
     generate: Vec<String>,
     body_file: Option<PathBuf>,
+    attach: Option<PathBuf>,
     interactive: bool,
 }
 
@@ -1372,6 +1632,7 @@ struct EditInput {
     field: Vec<String>,
     delete_field: Vec<String>,
     body_file: Option<PathBuf>,
+    attach: Option<PathBuf>,
     folder: Option<String>,
     tag: Vec<String>,
     remove_tag: Vec<String>,
@@ -1388,13 +1649,18 @@ fn cmd_add(ctx: &Ctx, input: AddInput) -> Result<()> {
             .with_context(|| format!("cannot read {}", path.display()))?;
         field_pairs.push(format!("body={body}"));
     }
-    let values = items::collect_fields(
+    let mut values = items::collect_fields(
         &field_pairs,
         &input.generate,
         parsed,
         input.interactive,
         None,
     )?;
+    if let Some(path) = input.attach.as_ref() {
+        let data = read_attachment(path)?;
+        let addr = uv.put_blob(&data)?;
+        values.insert("blob".to_owned(), addr);
+    }
     let item = items::build_new(
         &mut uv,
         parsed,
@@ -1420,6 +1686,7 @@ fn cmd_edit(ctx: &Ctx, input: EditInput) -> Result<()> {
         field,
         delete_field,
         body_file,
+        attach,
         folder,
         tag,
         remove_tag,
@@ -1453,6 +1720,11 @@ fn cmd_edit(ctx: &Ctx, input: EditInput) -> Result<()> {
             .with_context(|| format!("cannot read {}", path.display()))?;
         values.insert("body".to_owned(), body);
     }
+    if let Some(path) = &attach {
+        let data = read_attachment(path)?;
+        let addr = uv.put_blob(&data)?;
+        values.insert("blob".to_owned(), addr);
+    }
     if interactive {
         items::wizard_fill(item.item_type, &mut values, Some(&item))?;
     }
@@ -1464,6 +1736,7 @@ fn cmd_edit(ctx: &Ctx, input: EditInput) -> Result<()> {
         || !delete_field.is_empty()
         || renamed
         || body_file.is_some()
+        || attach.is_some()
         || interactive
         || folder_set
         || !tag.is_empty()

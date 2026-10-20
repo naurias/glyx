@@ -33,6 +33,8 @@ pub struct Item {
     pub name: String,
     pub folder: String,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub favorite: bool,
     pub fields: BTreeMap<String, Field>,
     pub hlc: Hlc,
     pub rev: u64,
@@ -95,6 +97,7 @@ mod tests {
             name: "example".to_owned(),
             folder: "web".to_owned(),
             tags: vec!["a".to_owned()],
+            favorite: false,
             fields,
             hlc: Hlc {
                 wall_ms: 1,
