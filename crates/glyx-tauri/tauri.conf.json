@@ -11,8 +11,16 @@
   },
   "app": {
     "windows": [],
+    "withGlobalTauri": true,
     "security": {
       "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:*"
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["glyx"]
+      }
     }
   },
   "bundle": {

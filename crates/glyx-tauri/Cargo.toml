@@ -19,9 +19,17 @@ workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-global-shortcut = { version = "2" }
+tauri-plugin-window-state = { version = "2" }
+tauri-plugin-single-instance = { version = "2" }
+tauri-plugin-autostart = { version = "2" }
+tauri-plugin-notification = { version = "2" }
+tauri-plugin-deep-link = { version = "2" }
+rust-ini = "=0.21.1"
 tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 glyx-core = { path = "../glyx-core" }
 glyx-crypto = { path = "../glyx-crypto" }
 glyx-store = { path = "../glyx-store" }

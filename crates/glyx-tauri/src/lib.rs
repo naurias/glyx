@@ -1,4 +1,7 @@
 #[cfg(not(mobile))]
+mod desktop;
+
+#[cfg(not(mobile))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(not(mobile))]
@@ -32,15 +35,6 @@ fn desktop_script() -> String {
             String::new()
         }
     }
-}
-
-#[cfg(not(mobile))]
-fn install_shortcut(app: &tauri::App) -> tauri::Result<()> {
-    use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
-    let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyG);
-    app.global_shortcut().register(shortcut).map_err(|e| {
-        tauri::Error::PluginInitialization("global-shortcut".to_owned(), e.to_string())
-    })
 }
 
 #[cfg(mobile)]
@@ -87,33 +81,24 @@ fn mobile_script() -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(not(mobile))]
-    let mut builder = tauri::Builder::default();
+    let mut builder = desktop::configure(tauri::Builder::default());
     #[cfg(mobile)]
     let builder = tauri::Builder::default();
     #[cfg(not(mobile))]
     {
-        builder = builder.plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(move |app, _shortcut, event| {
-                    if matches!(
-                        event.state(),
-                        tauri_plugin_global_shortcut::ShortcutState::Pressed
-                    ) {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                            let _ = window.eval("window.dispatchEvent(new Event('glyx-quick'))");
-                        }
-                    }
-                })
-                .build(),
-        );
+        builder = builder.on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if desktop::settings(window.app_handle()).close_to_tray {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        });
     }
     builder
         .setup(move |app| {
             #[cfg(not(mobile))]
             {
-                install_shortcut(app)?;
                 let script = desktop_script();
                 tauri::WebviewWindowBuilder::new(
                     app,
@@ -124,6 +109,14 @@ pub fn run() {
                 .inner_size(1100.0, 750.0)
                 .initialization_script(&script)
                 .build()?;
+                desktop::setup(app)?;
+                if OWNED_DAEMON.load(Ordering::Relaxed) {
+                    desktop::notify(
+                        app.handle(),
+                        "glyx daemon",
+                        "Daemon started for the selected vault.",
+                    );
+                }
             }
             #[cfg(mobile)]
             {
@@ -142,16 +135,17 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("tauri runtime failed")
-        .run(|_app, event| {
+        .run(|app, event| {
             #[cfg(not(mobile))]
             if let tauri::RunEvent::Exit = event {
                 let stop = glyx_store::config::load().daemon_on_exit
                     == glyx_store::config::DaemonExit::Stop;
                 if stop && OWNED_DAEMON.load(Ordering::Relaxed) {
+                    desktop::notify(app, "glyx daemon", "Daemon stopped.");
                     let _ = glyx_daemon::runtime::stop();
                 }
             }
             #[cfg(mobile)]
-            let _ = event;
+            let _ = (app, event);
         });
 }
