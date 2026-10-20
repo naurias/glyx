@@ -5,6 +5,17 @@ use zeroize::Zeroizing;
 use crate::StoreError;
 
 pub const BLOB_VERSION: u32 = 1;
+pub const MAX_BLOB_BYTES: usize = 25 * 1024 * 1024;
+
+#[must_use]
+pub fn valid_address(addr: &str) -> bool {
+    addr.strip_prefix("blake3-").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct BlobFile {

@@ -78,6 +78,7 @@ pub fn target_label(target: &glyx_sync::RaceTarget) -> String {
         glyx_sync::RaceTarget::Name => "name".to_owned(),
         glyx_sync::RaceTarget::Folder => "folder".to_owned(),
         glyx_sync::RaceTarget::Tags => "tags".to_owned(),
+        glyx_sync::RaceTarget::Favorite => "favorite".to_owned(),
         glyx_sync::RaceTarget::ItemType => "type".to_owned(),
     }
 }

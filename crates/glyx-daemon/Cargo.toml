@@ -18,6 +18,8 @@ serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 axum.workspace = true
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
 rust-embed.workspace = true
 mime_guess.workspace = true
 uuid.workspace = true

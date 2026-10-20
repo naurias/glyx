@@ -1,14 +1,19 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::{middleware, Router};
+use futures_util::StreamExt as _;
 use serde::Deserialize;
+use tokio::io::AsyncWriteExt as _;
+use tokio_util::io::ReaderStream;
 #[derive(Debug)]
 pub struct AppState {
     pub active: Mutex<Option<PathBuf>>,
@@ -59,6 +64,19 @@ impl AppState {
 
 fn now_ms() -> u64 {
     glyx_core::ids::wall_ms_now()
+}
+
+fn temp_tag() -> String {
+    use std::fmt::Write as _;
+    let mut bytes = [0u8; 8];
+    if glyx_crypto::rand::fill_random(&mut bytes).is_ok() {
+        let mut out = String::with_capacity(16);
+        for b in bytes {
+            let _ = write!(out, "{b:02x}");
+        }
+        return out;
+    }
+    format!("{}-{}", std::process::id(), now_ms())
 }
 
 fn hex16(bytes: &[u8; 16]) -> String {
@@ -117,6 +135,7 @@ fn store_error(e: &glyx_store::StoreError) -> (StatusCode, Json<serde_json::Valu
     let code = match e {
         glyx_store::StoreError::NotFound(_) => StatusCode::NOT_FOUND,
         glyx_store::StoreError::Ambiguous(_, _) => StatusCode::CONFLICT,
+        glyx_store::StoreError::Limit(_) => StatusCode::PAYLOAD_TOO_LARGE,
         _ => StatusCode::UNPROCESSABLE_ENTITY,
     };
     (code, Json(serde_json::json!({"error": e.to_string()})))
@@ -136,6 +155,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/vaults/create", post(create_vault))
         .route("/v1/vaults/select", post(select_vault))
         .route("/v1/vaults/rekey", post(rekey_vault))
+        .route("/v1/vaults/backup", get(backup_vault))
+        .route("/v1/vaults/restore", post(restore_vault))
         .route("/v1/settings", get(get_settings).post(set_settings))
         .route("/v1/unlock", post(unlock))
         .route("/v1/lock", post(lock))
@@ -152,6 +173,16 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/items/:id/history/:file",
             get(show_history_item).post(restore_history_item),
         )
+        .route(
+            "/v1/items/:id/history/:file/compare",
+            get(compare_history_item),
+        )
+        .route(
+            "/v1/blobs",
+            post(upload_blob).layer(DefaultBodyLimit::max(glyx_store::MAX_BLOB_BYTES)),
+        )
+        .route("/v1/blobs/gc", post(gc_blobs))
+        .route("/v1/blobs/:addr", get(download_blob))
         .route("/v1/ssh-gen", post(ssh_gen))
         .route("/v1/ssh/export", post(ssh_export))
         .route("/v1/sync", post(sync))
@@ -1029,6 +1060,323 @@ async fn gc(State(state): State<Arc<AppState>>, Json(body): Json<GcBody>) -> imp
     }
 }
 
+async fn upload_blob(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    match uv.put_blob(&body) {
+        Ok(addr) => Json(serde_json::json!({"addr": addr, "size": body.len()})).into_response(),
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+async fn download_blob(
+    State(state): State<Arc<AppState>>,
+    Path(addr): Path<String>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    match uv.get_blob(&addr) {
+        Ok(data) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            headers.insert(
+                CONTENT_DISPOSITION,
+                HeaderValue::from_str(&format!("attachment; filename=\"{addr}.bin\""))
+                    .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+            );
+            headers.insert(
+                "x-content-type-options",
+                HeaderValue::from_static("nosniff"),
+            );
+            headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            (headers, data.to_vec()).into_response()
+        }
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct GcBlobsBody {
+    dry_run: Option<bool>,
+}
+
+async fn gc_blobs(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<GcBlobsBody>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let conn = match glyx_agent::ledger::open_db() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let exports = match glyx_agent::ledger::list_exports(&conn) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let refs: HashSet<String> = exports.into_iter().filter_map(|e| e.blob_addr).collect();
+    match uv.gc_blobs(&refs, body.dry_run.unwrap_or(true)) {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+async fn backup_vault(State(state): State<Arc<AppState>>) -> Response {
+    if state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "lock the vault before creating a backup"})),
+        )
+            .into_response();
+    }
+    let Some(path) = state.active_path() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "no vault selected"})),
+        )
+            .into_response();
+    };
+    let cfg = glyx_store::config::load();
+    let keyfile = cfg
+        .find(&path)
+        .and_then(|entry| entry.keyfile.as_deref())
+        .map(std::path::Path::to_path_buf);
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let tmp =
+        std::env::temp_dir().join(format!("glyx-backup-{}-{stamp}.tar.gz", std::process::id()));
+    let vault_path = path.clone();
+    let tmp_path = tmp.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let vault = glyx_store::Vault::open(&vault_path)?;
+        glyx_store::backup::create(&vault, &tmp_path, keyfile.as_deref())
+    })
+    .await;
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return store_error(&e).into_response();
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    }
+    let file = match tokio::fs::File::open(&tmp).await {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let _ = tokio::fs::remove_file(&tmp).await;
+    let name: String = path
+        .file_name()
+        .map_or_else(|| "vault".to_owned(), |n| n.to_string_lossy().into_owned())
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/gzip"));
+    headers.insert(
+        CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{name}-{stamp}.tar.gz\""))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    let stream = ReaderStream::new(file);
+    (headers, Body::from_stream(stream)).into_response()
+}
+
+#[derive(Deserialize)]
+struct RestoreQuery {
+    dest: PathBuf,
+}
+
+async fn restore_vault(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<RestoreQuery>,
+    request: axum::http::Request<Body>,
+) -> Response {
+    if state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "lock the vault before restoring"})),
+        )
+            .into_response();
+    }
+    let dest = params.dest;
+    let tmp = std::env::temp_dir().join(format!("glyx-restore-{}.tar.gz", temp_tag()));
+    let std_file = {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&tmp) {
+            Ok(f) => f,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        }
+    };
+    if let Err((code, body)) = receive_archive(request, std_file).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return (code, body).into_response();
+    }
+    let tmp_path = tmp.clone();
+    let dest_path = dest.clone();
+    let result =
+        tokio::task::spawn_blocking(move || glyx_store::backup::restore(&tmp_path, &dest_path))
+            .await;
+    let _ = tokio::fs::remove_file(&tmp).await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return store_error(&e).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    }
+    let vault = match glyx_store::Vault::open(&dest) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    let mut cfg = glyx_store::config::load();
+    let label = dest.file_name().map_or_else(
+        || dest.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    cfg.register(glyx_store::config::VaultEntry {
+        path: dest.clone(),
+        name: Some(label),
+        vault_id: Some(vault.config().vault_id),
+        keyfile: None,
+        last_used_ms: now_ms(),
+    });
+    if cfg.current_vault.is_none() {
+        cfg.select(&dest);
+    }
+    if let Err(e) = glyx_store::config::save(&cfg) {
+        return store_error(&e).into_response();
+    }
+    {
+        let mut active = state
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.is_none() {
+            *active = Some(dest.clone());
+        }
+    }
+    Json(serde_json::json!({"ok": true, "path": dest, "vault_id": vault.config().vault_id}))
+        .into_response()
+}
+
+async fn receive_archive(
+    request: axum::http::Request<Body>,
+    std_file: std::fs::File,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let mut file = tokio::fs::File::from_std(std_file);
+    let mut stream = request.into_body().into_data_stream();
+    let mut total = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        })?;
+        total = total.saturating_add(chunk.len() as u64);
+        if total > glyx_store::MAX_ARCHIVE_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({"error": "backup archive is too large"})),
+            ));
+        }
+        file.write_all(&chunk).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        })?;
+    }
+    file.sync_all().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+    })?;
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct DoctorQuery {
     rebuild_index: Option<bool>,
@@ -1691,6 +2039,7 @@ async fn item_history(
 async fn show_history_item(
     State(state): State<Arc<AppState>>,
     Path((id, file)): Path<(String, String)>,
+    Query(params): Query<RevealQuery>,
 ) -> impl IntoResponse {
     let guard = state
         .vault
@@ -1707,10 +2056,75 @@ async fn show_history_item(
             .into_response();
     };
     match uv.history_item(&uuid, &file) {
-        Ok(item) => Json(serde_json::json!({"item": glyx_store::present::item_json(&item, false)}))
-            .into_response(),
+        Ok(item) => Json(serde_json::json!({
+            "item": glyx_store::present::item_json(&item, params.reveal.unwrap_or(false))
+        }))
+        .into_response(),
         Err(e) => store_error(&e).into_response(),
     }
+}
+
+async fn compare_history_item(
+    State(state): State<Arc<AppState>>,
+    Path((id, file)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let Ok(uuid) = id.parse::<uuid::Uuid>() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no such item"})),
+        )
+            .into_response();
+    };
+    let history = match uv.history_item(&uuid, &file) {
+        Ok(item) => item,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    let current = match uv.get_item(&uuid) {
+        Ok(Some(item)) => item,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "no such item"})),
+            )
+                .into_response();
+        }
+        Err(e) => return store_error(&e).into_response(),
+    };
+    let mut changed = Vec::new();
+    if current.name != history.name {
+        changed.push("name");
+    }
+    if current.folder != history.folder {
+        changed.push("folder");
+    }
+    if current.tags != history.tags {
+        changed.push("tags");
+    }
+    if current.favorite != history.favorite {
+        changed.push("favorite");
+    }
+    let keys: std::collections::BTreeSet<_> =
+        current.fields.keys().chain(history.fields.keys()).collect();
+    for key in keys {
+        let now = current.fields.get(key).map(|f| f.value.expose());
+        let before = history.fields.get(key).map(|f| f.value.expose());
+        if now != before {
+            changed.push(key);
+        }
+    }
+    Json(serde_json::json!({
+        "current_rev": current.rev,
+        "history_rev": history.rev,
+        "changed": changed
+    }))
+    .into_response()
 }
 
 async fn restore_history_item(
@@ -2311,6 +2725,185 @@ mod tests {
             .expect("bytes");
         let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, json)
+    }
+
+    async fn call_raw(
+        state: Arc<AppState>,
+        method: &str,
+        uri: &str,
+        body: Body,
+        content_type: Option<&str>,
+        token: &str,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let app = router(state);
+        let mut req = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"));
+        if let Some(content_type) = content_type {
+            req = req.header("content-type", content_type);
+        }
+        let req = req.body(body).expect("request");
+        let res = app.oneshot(req).await.expect("oneshot");
+        let status = res.status();
+        let headers = res.headers().clone();
+        let bytes = axum::body::to_bytes(res.into_body(), 32 * 1024 * 1024)
+            .await
+            .expect("bytes")
+            .to_vec();
+        (status, headers, bytes)
+    }
+
+    #[tokio::test]
+    async fn blob_routes_attach_download_and_gc() {
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": "pw", "keyfile": kf_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, bytes) = call_raw(
+            state.clone(),
+            "POST",
+            "/v1/blobs",
+            Body::from("payload"),
+            Some("application/octet-stream"),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let addr = json["addr"].as_str().expect("addr").to_owned();
+        let (status, headers, body) = call_raw(
+            state.clone(),
+            "GET",
+            &format!("/v1/blobs/{addr}"),
+            Body::empty(),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"payload");
+        assert_eq!(
+            headers
+                .get("x-content-type-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+        assert!(headers
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("attachment")));
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/items",
+            Some(serde_json::json!({
+                "type": "file", "name": "doc", "fields": {"blob": addr, "filename": "doc.bin"}
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, bytes) = call_raw(
+            state.clone(),
+            "POST",
+            "/v1/blobs",
+            Body::from("orphan"),
+            Some("application/octet-stream"),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let orphan = json["addr"].as_str().expect("addr").to_owned();
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/blobs/gc",
+            Some(serde_json::json!({"dry_run": false})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["purged"], 1);
+        let (status, _, _) = call_raw(
+            state.clone(),
+            "GET",
+            &format!("/v1/blobs/{orphan}"),
+            Body::empty(),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn backup_download_and_restore_roundtrip() {
+        let cfg = tempfile::tempdir().expect("config dir");
+        std::env::set_var("GLYX_CONFIG", cfg.path().join("config.toml"));
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": "pw", "keyfile": kf_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/items",
+            Some(serde_json::json!({
+                "type": "login", "name": "web",
+                "fields": {"username": "u", "password": "p"},
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(state.clone(), "POST", "/v1/lock", None, "test-token").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, headers, archive) = call_raw(
+            state.clone(),
+            "GET",
+            "/v1/vaults/backup",
+            Body::empty(),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/gzip")
+        );
+        assert_eq!(&archive[..2], &[0x1f, 0x8b]);
+        let dest = cfg.path().join("restored.glyx");
+        let (status, _, body) = call_raw(
+            state,
+            "POST",
+            &format!("/v1/vaults/restore?dest={}", dest.display()),
+            Body::from(archive),
+            Some("application/gzip"),
+            "test-token",
+        )
+        .await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let vault = glyx_store::Vault::open(&dest).expect("restored vault");
+        let uv = vault.unlock(b"pw", &[1u8; 32]).expect("unlock");
+        assert_eq!(uv.list(false).expect("list").len(), 1);
     }
 
     #[tokio::test]

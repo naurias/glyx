@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -30,6 +31,16 @@ impl Vault {
         fs::create_dir_all(path.join(layout::BLOBS_DIR))?;
         fs::create_dir_all(path.join(layout::HISTORY_DIR))?;
         fs::create_dir_all(path.join(layout::CONFLICTS_DIR))?;
+        harden_dir(path);
+        for dir in [
+            layout::KEYSLOTS_DIR,
+            layout::ITEMS_DIR,
+            layout::BLOBS_DIR,
+            layout::HISTORY_DIR,
+            layout::CONFLICTS_DIR,
+        ] {
+            harden_dir(&path.join(dir));
+        }
         let _session = lock_file(path)?;
         let keyfile_bytes = keyfile.copied().unwrap_or([0u8; 32]);
         let config = glyx_core::VaultConfig::new(Uuid::now_v7(), suite, keyfile.is_some());
@@ -49,6 +60,7 @@ impl Vault {
             "INSERT INTO meta(key, value) VALUES ('vault_id', ?1)",
             [config.vault_id.as_simple().to_string()],
         )?;
+        harden_file(&path.join(layout::INDEX_DB));
         drop(conn);
         Ok(Self {
             path: path.to_owned(),
@@ -64,10 +76,31 @@ impl Vault {
                 return Err(StoreError::Corrupt(format!("missing dir {dir}")));
             }
         }
+        harden_dir(path);
+        for dir in [
+            layout::KEYSLOTS_DIR,
+            layout::ITEMS_DIR,
+            layout::BLOBS_DIR,
+            layout::HISTORY_DIR,
+            layout::CONFLICTS_DIR,
+        ] {
+            let dir = path.join(dir);
+            if dir.is_dir() {
+                harden_dir(&dir);
+            }
+        }
+        harden_file(&path.join(layout::INDEX_DB));
         Ok(Self {
             path: path.to_owned(),
             config,
         })
+    }
+    pub fn try_lock(&self) -> Result<fs::File, StoreError> {
+        let file = open_lock_file(&self.path)?;
+        file.try_lock_exclusive().map_err(|e| {
+            StoreError::Corrupt(format!("vault is unlocked or busy; lock it first: {e}"))
+        })?;
+        Ok(file)
     }
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -122,6 +155,7 @@ impl Vault {
     pub fn rebuild_index(&self) -> Result<usize, StoreError> {
         let _session = lock_file(&self.path)?;
         let conn = Connection::open(self.path.join(layout::INDEX_DB))?;
+        harden_file(&self.path.join(layout::INDEX_DB));
         index::init_schema(&conn)?;
         conn.execute("DELETE FROM items", [])?;
         let mut n = 0;
@@ -195,6 +229,7 @@ impl Vault {
         let node = self.device_id()?;
         let session = lock_file(&self.path)?;
         let conn = Connection::open(self.path.join(layout::INDEX_DB))?;
+        harden_file(&self.path.join(layout::INDEX_DB));
         index::init_schema(&conn)?;
         let mut uv = UnlockedVault {
             path: self.path.clone(),
@@ -208,6 +243,9 @@ impl Vault {
         if healed.healed > 0 {
             uv.stamp_merge()?;
         }
+        if uv.index_needs_rebuild()? {
+            uv.rebuild_index_from_envelopes()?;
+        }
         Ok(uv)
     }
 }
@@ -218,6 +256,33 @@ pub struct HistoryEntry {
     pub hlc: glyx_core::Hlc,
     pub deleted: bool,
     pub file: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlobGcReport {
+    pub existing: usize,
+    pub orphans: usize,
+    pub orphan_bytes: u64,
+    pub purged: usize,
+    pub purged_bytes: u64,
+}
+
+fn hlc_newer(a: glyx_core::Hlc, b: glyx_core::Hlc) -> bool {
+    a.wall_ms > b.wall_ms || (a.wall_ms == b.wall_ms && a.seq > b.seq)
+}
+
+fn collect_blob_refs(
+    env: &Envelope,
+    key: &[u8; 32],
+    refs: &mut HashSet<String>,
+) -> Result<(), StoreError> {
+    let item = env.open(key)?;
+    for field in item.fields.values() {
+        if blob::valid_address(field.value.expose()) {
+            refs.insert(field.value.expose().to_owned());
+        }
+    }
+    Ok(())
 }
 
 pub struct UnlockedVault {
@@ -440,7 +505,113 @@ impl UnlockedVault {
         )?;
         Ok(())
     }
+    fn meta_set_str(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+    fn index_needs_rebuild(&self) -> Result<bool, StoreError> {
+        let vault_id: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = 'vault_id'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if vault_id.is_none() {
+            return Ok(true);
+        }
+        let indexed: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?;
+        let envelopes = fs::read_dir(self.path.join(layout::ITEMS_DIR))?
+            .flatten()
+            .filter(|e| is_envelope_file(&e.path()))
+            .count();
+        if usize::try_from(indexed).unwrap_or(usize::MAX) != envelopes {
+            return Ok(true);
+        }
+        let blank: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM items WHERE item_type = ''", [], |r| {
+                    r.get(0)
+                })?;
+        Ok(blank > 0)
+    }
+    pub fn rebuild_index_from_envelopes(&self) -> Result<usize, StoreError> {
+        self.conn.execute("DELETE FROM items", [])?;
+        let mut max = glyx_core::Hlc {
+            wall_ms: 0,
+            seq: 0,
+            node: self.node,
+        };
+        let mut count = 0usize;
+        for entry in fs::read_dir(self.path.join(layout::ITEMS_DIR))?.flatten() {
+            if !is_envelope_file(&entry.path()) {
+                continue;
+            }
+            let env: Envelope = serde_json::from_slice(&fs::read(entry.path())?)
+                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            let item = env.open(&self.key)?;
+            if hlc_newer(item.hlc, max) {
+                max = item.hlc;
+            }
+            index::upsert(&self.conn, &item)?;
+            count += 1;
+        }
+        let history = self.path.join(layout::HISTORY_DIR);
+        if history.is_dir() {
+            for dir in fs::read_dir(history)?.flatten() {
+                if !dir.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                for entry in fs::read_dir(dir.path())?.flatten() {
+                    if !has_extension(&entry.path(), "json") {
+                        continue;
+                    }
+                    let env: Envelope = serde_json::from_slice(&fs::read(entry.path())?)
+                        .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+                    if hlc_newer(env.hlc, max) {
+                        max = env.hlc;
+                    }
+                }
+            }
+        }
+        let conflicts = self.path.join(layout::CONFLICTS_DIR);
+        if conflicts.is_dir() {
+            for entry in fs::read_dir(conflicts)?.flatten() {
+                if !has_extension(&entry.path(), "json") {
+                    continue;
+                }
+                let conflict = crate::conflicts::read_conflict(&entry.path())?;
+                for env in [&conflict.winner, &conflict.local, &conflict.remote] {
+                    if hlc_newer(env.hlc, max) {
+                        max = env.hlc;
+                    }
+                }
+            }
+        }
+        self.meta_set_str("vault_id", &self.config.vault_id.as_simple().to_string())?;
+        let last_ms = self.meta_get("hlc_ms")?.unwrap_or(0);
+        let last_seq = self.meta_get("hlc_seq")?.unwrap_or(0);
+        if i64::try_from(max.wall_ms).unwrap_or(i64::MAX) > last_ms
+            || (i64::try_from(max.wall_ms).unwrap_or(i64::MAX) == last_ms
+                && i64::from(max.seq) > last_seq)
+        {
+            self.meta_set("hlc_ms", i64::try_from(max.wall_ms).unwrap_or(i64::MAX))?;
+            self.meta_set("hlc_seq", i64::from(max.seq))?;
+        }
+        Ok(count)
+    }
     pub fn put_blob(&self, data: &[u8]) -> Result<String, StoreError> {
+        if data.len() > blob::MAX_BLOB_BYTES {
+            return Err(StoreError::Limit(format!(
+                "blob exceeds {} bytes",
+                blob::MAX_BLOB_BYTES
+            )));
+        }
         let (addr, bytes) = blob::seal(data, &self.key, self.cipher(), b"glyx-blob-v1")?;
         atomic_write(
             &self
@@ -452,12 +623,118 @@ impl UnlockedVault {
         Ok(addr)
     }
     pub fn get_blob(&self, addr: &str) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        if !blob::valid_address(addr) {
+            return Err(StoreError::Corrupt("invalid blob address".into()));
+        }
         let bytes = fs::read(
             self.path
                 .join(layout::BLOBS_DIR)
                 .join(format!("{addr}.enc")),
-        )?;
+        )
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StoreError::NotFound(format!("blob {addr}"))
+            } else {
+                e.into()
+            }
+        })?;
         blob::open(&bytes, &self.key, b"glyx-blob-v1")
+    }
+    pub fn blob_addresses(&self) -> Result<Vec<(String, u64)>, StoreError> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(self.path.join(layout::BLOBS_DIR))?.flatten() {
+            let path = entry.path();
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(addr) = name.strip_suffix(".enc") else {
+                continue;
+            };
+            if !blob::valid_address(addr) {
+                continue;
+            }
+            out.push((addr.to_owned(), entry.metadata()?.len()));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+    pub fn referenced_blobs(&self) -> Result<HashSet<String>, StoreError> {
+        let mut refs = HashSet::new();
+        for entry in fs::read_dir(self.path.join(layout::ITEMS_DIR))?.flatten() {
+            if !is_envelope_file(&entry.path()) {
+                continue;
+            }
+            let env: Envelope = serde_json::from_slice(&fs::read(entry.path())?)
+                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            collect_blob_refs(&env, &self.key, &mut refs)?;
+        }
+        let history = self.path.join(layout::HISTORY_DIR);
+        if history.is_dir() {
+            for dir in fs::read_dir(history)?.flatten() {
+                if !dir.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                for entry in fs::read_dir(dir.path())?.flatten() {
+                    if !has_extension(&entry.path(), "json") {
+                        continue;
+                    }
+                    let env: Envelope = serde_json::from_slice(&fs::read(entry.path())?)
+                        .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+                    collect_blob_refs(&env, &self.key, &mut refs)?;
+                }
+            }
+        }
+        let conflicts = self.path.join(layout::CONFLICTS_DIR);
+        if conflicts.is_dir() {
+            for entry in fs::read_dir(conflicts)?.flatten() {
+                if !has_extension(&entry.path(), "json") {
+                    continue;
+                }
+                let conflict = crate::conflicts::read_conflict(&entry.path())?;
+                for env in [&conflict.winner, &conflict.local, &conflict.remote] {
+                    collect_blob_refs(env, &self.key, &mut refs)?;
+                }
+            }
+        }
+        Ok(refs)
+    }
+    pub fn gc_blobs(
+        &self,
+        extra_refs: &HashSet<String>,
+        dry_run: bool,
+    ) -> Result<BlobGcReport, StoreError> {
+        let mut refs = self.referenced_blobs()?;
+        refs.extend(
+            extra_refs
+                .iter()
+                .filter(|addr| blob::valid_address(addr))
+                .cloned(),
+        );
+        let existing = self.blob_addresses()?;
+        let mut report = BlobGcReport {
+            existing: existing.len(),
+            ..BlobGcReport::default()
+        };
+        for (addr, size) in existing {
+            if refs.contains(&addr) {
+                continue;
+            }
+            report.orphans += 1;
+            report.orphan_bytes = report.orphan_bytes.saturating_add(size);
+            if !dry_run {
+                fs::remove_file(
+                    self.path
+                        .join(layout::BLOBS_DIR)
+                        .join(format!("{addr}.enc")),
+                )?;
+                report.purged += 1;
+                report.purged_bytes = report.purged_bytes.saturating_add(size);
+            }
+        }
+        Ok(report)
     }
     pub fn write_plain_session(&self, ttl_min: u64) -> Result<(), StoreError> {
         crate::session::write_plain_ticket(self.config.vault_id, &self.key, ttl_min)
@@ -1006,22 +1283,59 @@ fn is_envelope_file(path: &Path) -> bool {
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let tmp = path.with_extension("tmp");
-    let mut f = fs::File::create(&tmp)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut f = options.open(&tmp)?;
     f.write_all(bytes)?;
     f.sync_all()?;
     drop(f);
+    harden_file(&tmp);
     fs::rename(&tmp, path)?;
+    harden_file(path);
     Ok(())
 }
 
-fn lock_file(vault_path: &Path) -> Result<fs::File, StoreError> {
-    let file = fs::OpenOptions::new()
+pub(crate) fn harden_dir(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir()) {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+pub(crate) fn harden_file(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file()) {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+fn open_lock_file(vault_path: &Path) -> Result<fs::File, StoreError> {
+    fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(vault_path.join(layout::LOCK_FILE))
-        .map_err(|e| StoreError::Corrupt(format!("cannot open lock file: {e}")))?;
+        .map_err(|e| StoreError::Corrupt(format!("cannot open lock file: {e}")))
+}
+
+fn lock_file(vault_path: &Path) -> Result<fs::File, StoreError> {
+    let file = open_lock_file(vault_path)?;
     file.lock_exclusive()
         .map_err(|e| StoreError::Corrupt(format!("vault is locked by another process: {e}")))?;
     Ok(file)
@@ -1051,6 +1365,7 @@ mod tests {
             name: "example".to_owned(),
             folder: String::new(),
             tags: Vec::new(),
+            favorite: false,
             fields,
             hlc: glyx_core::Hlc {
                 wall_ms: 1,
@@ -1162,6 +1477,97 @@ mod tests {
     }
 
     #[test]
+    fn blob_gc_keeps_history_and_rejects_bad_addresses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("blob.glyx");
+        Vault::init(
+            &path,
+            suite(glyx_core::Cipher::Xchacha20poly1305),
+            b"pw",
+            None,
+        )
+        .expect("init");
+        let vault = Vault::open(&path).expect("open");
+        let mut uv = vault.unlock(b"pw", &[0u8; 32]).expect("unlock");
+        let keep = uv.put_blob(b"keep").expect("keep");
+        let orphan = uv.put_blob(b"orphan").expect("orphan");
+        let node = uv.device_node();
+        let hlc = uv.next_hlc().expect("tick");
+        let mut item = test_item(node);
+        item.hlc = hlc;
+        item.fields.insert(
+            "blob".to_owned(),
+            glyx_core::Field {
+                value: glyx_core::SecretString::new(keep.clone()),
+                field_hlc: hlc,
+            },
+        );
+        uv.put_item(&item).expect("put");
+        let mut updated = item.clone();
+        updated.hlc = uv.next_hlc().expect("tick");
+        updated.rev += 1;
+        updated.updated_by = node;
+        updated.fields.remove("blob");
+        uv.put_item(&updated).expect("put without blob");
+        let refs = std::collections::HashSet::new();
+        let dry = uv.gc_blobs(&refs, true).expect("dry run");
+        assert_eq!(dry.orphans, 1);
+        assert!(uv.get_blob(&keep).is_ok());
+        let purged = uv.gc_blobs(&refs, false).expect("purge");
+        assert_eq!(purged.purged, 1);
+        assert!(uv.get_blob(&orphan).is_err());
+        assert!(uv.get_blob(&keep).is_ok());
+        assert!(uv.get_blob("../escape").is_err());
+    }
+
+    #[test]
+    fn backup_restore_rebuilds_index_and_keeps_blobs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("backup.glyx");
+        let dest = dir.path().join("restored.glyx");
+        let archive = dir.path().join("backup.tar.gz");
+        Vault::init(
+            &path,
+            suite(glyx_core::Cipher::Xchacha20poly1305),
+            b"pw",
+            None,
+        )
+        .expect("init");
+        let vault = Vault::open(&path).expect("open");
+        let mut uv = vault.unlock(b"pw", &[0u8; 32]).expect("unlock");
+        let node = uv.device_node();
+        let hlc = uv.next_hlc().expect("tick");
+        let mut item = test_item(node);
+        item.hlc = hlc;
+        let addr = uv.put_blob(b"attachment").expect("blob");
+        item.fields.insert(
+            "blob".to_owned(),
+            glyx_core::Field {
+                value: glyx_core::SecretString::new(addr.clone()),
+                field_hlc: hlc,
+            },
+        );
+        uv.put_item(&item).expect("put");
+        let busy = crate::backup::create(&vault, &archive, None);
+        assert!(busy.is_err());
+        drop(uv);
+        let report = crate::backup::create(&vault, &archive, None).expect("backup");
+        assert!(report.bytes > 0);
+        crate::backup::restore(&archive, &dest).expect("restore");
+        let restored = Vault::open(&dest).expect("open restored");
+        let mut uv = restored.unlock(b"pw", &[0u8; 32]).expect("unlock restored");
+        let rows = uv.list(false).expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "example");
+        assert_eq!(&*uv.get_blob(&addr).expect("blob"), b"attachment");
+        assert!(
+            uv.next_hlc().expect("tick").wall_ms >= hlc.wall_ms,
+            "hlc floor restored"
+        );
+        assert_ne!(restored.device_id().expect("device"), node);
+    }
+
+    #[test]
     fn vault_lifecycle_both_ciphers() {
         for cipher in [
             glyx_core::Cipher::Xchacha20poly1305,
@@ -1217,6 +1623,7 @@ mod m1_tests {
             name: "web".to_owned(),
             folder: String::new(),
             tags: Vec::new(),
+            favorite: false,
             fields,
             hlc,
             rev: 1,
@@ -1383,6 +1790,7 @@ mod test_helpers {
             name: name.to_owned(),
             folder: String::new(),
             tags: Vec::new(),
+            favorite: false,
             fields: map,
             hlc,
             rev: 1,

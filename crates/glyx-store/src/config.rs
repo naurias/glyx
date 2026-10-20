@@ -186,6 +186,8 @@ pub fn load() -> AppConfig {
 
 #[must_use]
 pub fn load_from(path: &Path) -> AppConfig {
+    crate::vault::harden_file(path);
+    harden_known_config_dir(path);
     std::fs::read_to_string(path)
         .ok()
         .and_then(|text| toml::from_str(&text).ok())
@@ -196,7 +198,23 @@ pub fn save(config: &AppConfig) -> Result<(), StoreError> {
     save_to(&config_path(), config)
 }
 
+fn harden_known_config_dir(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if parent
+        .file_name()
+        .is_some_and(|name| name == std::ffi::OsStr::new("glyx"))
+    {
+        crate::vault::harden_dir(parent);
+    }
+}
+
 pub fn save_to(path: &Path, config: &AppConfig) -> Result<(), StoreError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        harden_known_config_dir(path);
+    }
     let text = toml::to_string_pretty(config)
         .map_err(|e| StoreError::Config(format!("cannot render config: {e}")))?;
     crate::vault::atomic_write(path, text.as_bytes())

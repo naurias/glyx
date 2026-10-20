@@ -12,6 +12,8 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("corrupt vault: {0}")]
     Corrupt(String),
+    #[error("limit exceeded: {0}")]
+    Limit(String),
     #[error("vault already exists at {0}")]
     AlreadyExists(String),
     #[error("config: {0}")]
