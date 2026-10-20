@@ -20,17 +20,35 @@
   let withUnlock = false;
   let sshSock = '';
   let idleLockMin = '';
+  let desktopSettings = null;
+  let desktopNotice = '';
 
   async function load() {
     try {
       status = await api.status();
       settings = await api.settings();
       idleLockMin = settings.idle_lock_min ?? 15;
+      if (window.__TAURI__?.core?.invoke) {
+        desktopSettings = await window.__TAURI__.core.invoke('desktop_settings_get');
+      }
     } catch (e) {
       error = e.message;
     }
   }
   onMount(load);
+
+  async function saveDesktop() {
+    error = '';
+    desktopNotice = '';
+    try {
+      desktopSettings = await window.__TAURI__.core.invoke('desktop_settings_set', {
+        settings: desktopSettings
+      });
+      desktopNotice = 'Desktop settings saved.';
+    } catch (e) {
+      error = e.message;
+    }
+  }
   async function setExit(value) {
     error = '';
     try {
@@ -237,6 +255,30 @@
         <button class="primary" on:click={doRekey}>Rotate</button>
       </div>
       {#if notice}<p class="dim">{notice}</p>{/if}
+    </div>
+  {/if}
+  {#if desktopSettings}
+    <div class="card">
+      <div>Desktop</div>
+      <label class="row">
+        <input type="checkbox" bind:checked={desktopSettings.close_to_tray} /> close to tray
+      </label>
+      <label class="row">
+        <input type="checkbox" bind:checked={desktopSettings.autostart} /> start on login (minimized)
+      </label>
+      <label class="row">
+        <input type="checkbox" bind:checked={desktopSettings.notifications} /> desktop notifications
+      </label>
+      <div class="row">
+        <label class="row">quick-search shortcut
+          <input bind:value={desktopSettings.shortcut} placeholder="Ctrl+Shift+G" style="flex: 1" />
+        </label>
+        <button class="primary" on:click={saveDesktop}>Save desktop settings</button>
+      </div>
+      {#if desktopNotice}<p class="dim">{desktopNotice}</p>{/if}
+      {#if !desktopSettings.close_to_tray}
+        <p class="dim">Closing the window quits glyx and follows the daemon-on-exit setting.</p>
+      {/if}
     </div>
   {/if}
   <div class="card">
