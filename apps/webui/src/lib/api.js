@@ -51,8 +51,10 @@ export const api = {
   totp: (id) => req('GET', `/v1/items/${id}/totp`),
   fill: (id, field, timeout = 15) => req('POST', `/v1/items/${id}/fill`, { field, timeout }),
   history: (id) => req('GET', `/v1/items/${id}/history`),
-  historyItem: (id, file) =>
-    req('GET', `/v1/items/${id}/history/${encodeURIComponent(file)}`),
+  historyItem: (id, file, reveal = false) =>
+    req('GET', `/v1/items/${id}/history/${encodeURIComponent(file)}?reveal=${reveal}`),
+  historyCompare: (id, file) =>
+    req('GET', `/v1/items/${id}/history/${encodeURIComponent(file)}/compare`),
   restoreHistory: (id, file) =>
     req('POST', `/v1/items/${id}/history/${encodeURIComponent(file)}`),
   rekey: (body) => req('POST', '/v1/vaults/rekey', body),
@@ -87,5 +89,51 @@ export const api = {
   createVault: (body) => req('POST', '/v1/vaults/create', body),
   selectVault: (path) => req('POST', '/v1/vaults/select', { path }),
   settings: () => req('GET', '/v1/settings'),
-  saveSettings: (body) => req('POST', '/v1/settings', body)
+  saveSettings: (body) => req('POST', '/v1/settings', body),
+  uploadBlob: async (file) => {
+    const res = await fetch(`${base}/v1/blobs`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: file
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `upload failed: ${res.status}`);
+    return data;
+  },
+  gcBlobs: (dryRun = true) => req('POST', '/v1/blobs/gc', { dry_run: dryRun }),
+  backup: () => download('/v1/vaults/backup'),
+  restore: async (file, dest) => {
+    const res = await fetch(`${base}/v1/vaults/restore?dest=${encodeURIComponent(dest)}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: file
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `restore failed: ${res.status}`);
+    return data;
+  }
 };
+
+export async function download(path, filename) {
+  const res = await fetch(base + path, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `download failed: ${res.status}`);
+  }
+  const disposition = res.headers.get('content-disposition') || '';
+  const match = disposition.match(/filename="([^"]+)"/);
+  const name = filename || (match ? match[1] : 'download.bin');
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+export async function downloadBlob(addr) {
+  return download(`/v1/blobs/${encodeURIComponent(addr)}`, `${addr}.bin`);
+}

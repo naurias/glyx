@@ -1,5 +1,5 @@
 <script>
-  import { api } from '$lib/api.js';
+  import { api, downloadBlob } from '$lib/api.js';
   import { renderMarkdown } from '$lib/markdown.js';
   import ItemForm from '$lib/ItemForm.svelte';
   import { page } from '$app/stores';
@@ -20,6 +20,11 @@
   let history = [];
   let historyOpen = false;
   let historyPreview = null;
+  let historyPreviewFile = null;
+  let historyReveal = false;
+  let historyCompare = null;
+  let attachInput = null;
+  let uploading = false;
   $: id = $page.params.id;
 
   async function load() {
@@ -42,8 +47,73 @@
 
   async function previewHistory(entry) {
     error = '';
+    historyCompare = null;
     try {
-      historyPreview = (await api.historyItem(id, entry.file)).item;
+      historyPreviewFile = entry.file;
+      historyPreview = (await api.historyItem(id, entry.file, historyReveal)).item;
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  async function toggleHistoryReveal() {
+    historyReveal = !historyReveal;
+    if (historyPreview) {
+      try {
+        historyPreview = (await api.historyItem(id, historyPreviewFile, historyReveal)).item;
+      } catch (e) {
+        error = e.message;
+      }
+    }
+  }
+
+  async function compareHistory(entry) {
+    error = '';
+    try {
+      historyCompare = { entry, ...(await api.historyCompare(id, entry.file)) };
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  async function uploadAttachment() {
+    const file = attachInput?.files?.[0];
+    if (!file) return;
+    if (file.size > 25 * 1024 * 1024) {
+      error = 'attachment exceeds the 25 MiB limit';
+      return;
+    }
+    error = '';
+    uploading = true;
+    try {
+      const { addr } = await api.uploadBlob(file);
+      await api.edit(id, { fields: { blob: addr } });
+      notice = 'attachment uploaded';
+      await load();
+      if (attachInput) attachInput.value = '';
+    } catch (e) {
+      error = e.message;
+    } finally {
+      uploading = false;
+    }
+  }
+
+  async function downloadAttachment() {
+    error = '';
+    try {
+      await downloadBlob(item.fields.blob);
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  async function removeAttachment() {
+    if (!confirm('Remove the attachment? The encrypted blob is kept until GC.')) return;
+    error = '';
+    try {
+      await api.edit(id, { delete_fields: ['blob'] });
+      notice = 'attachment removed';
+      await load();
     } catch (e) {
       error = e.message;
     }
@@ -194,6 +264,27 @@
     {/if}
     <div class="card">
       <div class="row">
+        <strong>Attachment</strong>
+        <span class="dim">encrypted · 25 MiB max</span>
+        <span style="flex: 1"></span>
+      </div>
+      {#if item.fields.blob}
+        <p class="dim">{item.fields.blob}</p>
+        <div class="row">
+          <button on:click={downloadAttachment}>Download</button>
+          <button class="danger" on:click={removeAttachment}>Remove</button>
+        </div>
+      {:else}
+        <div class="row">
+          <input type="file" bind:this={attachInput} />
+          <button on:click={uploadAttachment} disabled={uploading}>
+            {uploading ? 'Uploading...' : 'Attach'}
+          </button>
+        </div>
+      {/if}
+    </div>
+    <div class="card">
+      <div class="row">
         <strong>History</strong>
         <span class="dim">({history.length})</span>
         <span style="flex: 1"></span>
@@ -211,6 +302,7 @@
             <span class="dim">{entry.file}</span>
             <span style="flex: 1"></span>
             <button on:click={() => previewHistory(entry)}>Preview</button>
+            <button on:click={() => compareHistory(entry)}>Compare</button>
             <button on:click={() => restoreHistory(entry)}>Restore</button>
           </div>
         {/each}
@@ -220,11 +312,29 @@
               <strong>{historyPreview.name}</strong>
               <span class="dim">rev {historyPreview.rev}</span>
               <span style="flex: 1"></span>
+              <button on:click={toggleHistoryReveal}>
+                {historyReveal ? 'Mask secrets' : 'Reveal secrets'}
+              </button>
               <button on:click={() => (historyPreview = null)}>Close</button>
             </div>
             {#each Object.entries(historyPreview.fields) as [k, v]}
               <div class="row"><strong>{k}</strong><span>{v}</span></div>
             {/each}
+          </div>
+        {/if}
+        {#if historyCompare}
+          <div class="card">
+            <div class="row">
+              <strong>Changes vs rev {historyCompare.entry.rev}</strong>
+              <span class="dim">current rev {historyCompare.current_rev}</span>
+              <span style="flex: 1"></span>
+              <button on:click={() => (historyCompare = null)}>Close</button>
+            </div>
+            {#if historyCompare.changed.length}
+              <p>{historyCompare.changed.join(', ')}</p>
+            {:else}
+              <p class="dim">No differences.</p>
+            {/if}
           </div>
         {/if}
       {/if}

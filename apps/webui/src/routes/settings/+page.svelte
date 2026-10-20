@@ -22,6 +22,10 @@
   let idleLockMin = '';
   let desktopSettings = null;
   let desktopNotice = '';
+  let restoreFile = null;
+  let restoreDest = '';
+  let restoreInput = null;
+  let backupBusy = false;
 
   async function load() {
     try {
@@ -154,6 +158,52 @@
       error = e.message;
     }
   }
+  async function gcBlobs(dry) {
+    error = '';
+    try {
+      report = await api.gcBlobs(dry);
+    } catch (e) {
+      error = e.message;
+    }
+  }
+  async function backup() {
+    error = '';
+    notice = '';
+    backupBusy = true;
+    try {
+      await api.backup();
+      notice = 'Backup downloaded.';
+    } catch (e) {
+      error = e.message;
+    } finally {
+      backupBusy = false;
+    }
+  }
+  async function restore() {
+    if (!restoreFile) {
+      error = 'Choose a backup archive first.';
+      return;
+    }
+    if (!restoreDest) {
+      error = 'Choose a new vault directory.';
+      return;
+    }
+    error = '';
+    notice = '';
+    backupBusy = true;
+    try {
+      const result = await api.restore(restoreFile, restoreDest);
+      notice = `Restored to ${result.path}. Unlock it to rebuild the index.`;
+      restoreFile = null;
+      restoreDest = '';
+      if (restoreInput) restoreInput.value = '';
+      await load();
+    } catch (e) {
+      error = e.message;
+    } finally {
+      backupBusy = false;
+    }
+  }
   async function doctor() {
     error = '';
     try {
@@ -231,6 +281,26 @@
         <button on:click={saveIdleLock}>Save idle lock</button>
       </div>
       <p class="dim">Session mode stores the data key under 0600 in the runtime dir until the TTL expires; one-shot prompts every time.</p>
+    </div>
+    <div class="card">
+      <div>Backup</div>
+      <p class="dim">Lock the vault first. The archive contains encrypted vault files only; the index, device id, and keyfile are excluded.</p>
+      <div class="row">
+        <button on:click={backup} disabled={backupBusy}>Download backup</button>
+      </div>
+      <div class="row">
+        <input type="file" bind:this={restoreInput} on:change={(e) => (restoreFile = e.currentTarget.files?.[0] ?? null)} />
+        <input bind:value={restoreDest} placeholder="new vault directory" style="flex: 1" />
+        <button on:click={restore} disabled={backupBusy}>Restore</button>
+      </div>
+    </div>
+    <div class="card">
+      <div>Attachments</div>
+      <p class="dim">Orphaned encrypted blobs are never purged automatically.</p>
+      <div class="row">
+        <button on:click={() => gcBlobs(true)}>List orphan blobs</button>
+        <button class="danger" on:click={() => gcBlobs(false)}>Purge orphan blobs</button>
+      </div>
     </div>
     <div class="card">
       <div>Rotate credentials (vault must be unlocked)</div>
