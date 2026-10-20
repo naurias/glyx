@@ -4,12 +4,12 @@ Local-first password manager for Linux, Windows, and Android. CLI, full-screen T
 
 Full feature guide for every frontend, with examples: **[docs.md](docs.md)**. The frontend capability summary is under **[Frontends at a glance](docs.md#frontends-at-a-glance)**.
 
-> Status: M5.6 complete. CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, item history/restore, and a polished Linux desktop (tray, deep links, autostart, notifications, persistent window state). M6c Android is paused after the Tauri-mobile shell, scaffold, and debug APK; AutofillService and biometric unlock remain.
+> Status: M5.7a complete. CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, encrypted attachments, item history reveal/compare/restore, safe backups, and a polished Linux desktop (tray, deep links, autostart, notifications, persistent window state). M5.7b library UX and M5.7c health/audit/generator follow; M6c Android is paused after the Tauri-mobile shell, scaffold, and debug APK (AutofillService and biometric unlock remain).
 
 ## What glyx will do
 
 - Store and autofill logins and TOTPs in the browser; store passkeys, identities, and cards (autofill for those is not implemented yet).
-- Store files, manage SSH and other keys, and keep Markdown notes.
+- Store encrypted attachments (25 MiB), back up and restore vaults, manage SSH and other keys, and keep Markdown notes.
 - Project secrets into files or folders while unlocked, wipe them on lock.
 - Inject secrets inside tracked files (for example `.env` or compose files) and restore placeholders on lock.
 - Stay sync-safe when two devices edit the same vault offline, with smart merge and no silent loss.
@@ -101,6 +101,12 @@ glyx lock
 glyx --keyfile ~/keys/main.key vault rekey --new-keyfile ~/keys/main2.key
 glyx --keyfile ~/keys/main.key vault rekey --no-keyfile
 glyx --keyfile ~/keys/main2.key vault rekey --cipher aesgcm
+
+# Encrypted attachments and backups
+glyx add file --name report --attach report.pdf
+glyx blob ls
+glyx vault backup ~/backups/main.tar.gz
+glyx vault restore ~/backups/main.tar.gz ~/vaults/restored.glyx
 
 # Check vault health
 glyx doctor --with-unlock --json

@@ -245,8 +245,8 @@ Supported types:
 | `generic_key` | material, kind |
 
 These are template suggestions. `--field key=value` can add extra fields, and
-the TUI/WebUI forms show the same template. File items store an existing blob
-address; no frontend uploads a blob yet.
+the TUI/WebUI forms show the same template. Any item can carry one encrypted
+attachment in its reserved `blob` field (25 MiB max).
 
 ### CLI
 
@@ -262,6 +262,8 @@ glyx show github
 glyx show github --reveal
 glyx show server --render
 glyx history github
+glyx history github --show 1729450000000-0.json --reveal
+glyx history github --compare 1729450000000-0.json
 glyx restore github --rev 1
 glyx edit github --rename work-github --field url=https://github.com
 glyx edit github --folder work --tag important --remove-tag old
@@ -272,13 +274,30 @@ glyx rm github
 
 `--generate name[:length]` creates a strong random value. `--json` returns machine-readable output; JSON always includes values, so be careful with logs.
 
-`ls --query` searches names, folders, tags, and non-secret fields. `history` lists earlier revisions (newest first) and `restore` brings one back as a new revision, so past revisions are never rewritten. `gen` prints a standalone password and does not touch the vault.
+`ls --query` searches names, folders, tags, and non-secret fields. `history` lists earlier revisions (newest first); `--show` previews one, `--compare` lists changed fields without printing values, and `restore` brings one back as a new revision, so past revisions are never rewritten. `gen` prints a standalone password and does not touch the vault.
+
+### Attachments
+
+```sh
+glyx add file --name report --field filename=report.pdf --attach report.pdf
+glyx edit report --attach report-v2.pdf
+glyx blob ls
+glyx blob get blake3-… --out report.pdf
+glyx blob gc            # list unreferenced blobs
+glyx blob gc --purge    # delete them
+```
+
+Attachments are sealed with the vault key before they touch disk, with a
+25 MiB per-file limit. The original filename is not stored. GC scans current
+items, history, conflicts, and tracked exports; if any scan fails it refuses to
+purge.
 
 ### GUI
 
 - `/items` lists items with server-side search plus type, folder, and tag filters and a deleted (tombstone) toggle; Lock is in the top bar
 - `/items/<id>` shows fields. Edit opens the same form used for adding, with per-field Generate for secret fields. Copy copies a field to the clipboard through the daemon; the clear timeout is configurable on the item page.
-- **History** on the item page lists earlier revisions with Preview and Restore. Restoring always creates a new revision.
+- **History** on the item page lists earlier revisions with Preview, Reveal, Compare, and Restore. Comparing lists changed field names without disclosing values. Restoring always creates a new revision.
+- **Attachment** on the item page uploads, downloads, or removes the encrypted blob.
 - TOTP code is available for any item that has a `seed` field, not only `totp` items.
 - `/add` chooses a type and renders that type's fields
 - notes render markdown and support secret references (see section 8)
@@ -290,6 +309,25 @@ The desktop app is the same GUI plus platform glue:
 - it starts the daemon automatically for the selected vault and stops it on exit by default
 - `Ctrl+Shift+G` opens a quick-search palette. Type to filter, Enter copies the password, Esc closes
 - Settings controls whether closing the app stops or keeps the daemon
+
+### Backup and restore
+
+Backups require a locked vault so the snapshot is consistent. The archive is a
+`tar.gz` of encrypted vault artifacts plus `VAULT.toml`; the plaintext SQLite
+index, lock file, `device.id`, and a registered keyfile are excluded.
+
+```sh
+glyx vault backup ~/backups/main-2026-10-20.tar.gz
+glyx vault restore ~/backups/main-2026-10-20.tar.gz ~/vaults/restored.glyx
+```
+
+Restore requires a destination that does not exist. It rejects absolute paths,
+`..`, symlinks, hardlinks, special files, oversized archives, and unexpected
+top-level entries, extracts to a private temporary directory, then renames it
+into place. A fresh device id is generated and the index is rebuilt from
+envelopes on first unlock, with the HLC floor restored from items, history, and
+conflicts. GUI: Settings → Backup (lock first). The archive is not additionally
+encrypted; treat it as sensitive even though item contents are encrypted.
 
 ---
 
