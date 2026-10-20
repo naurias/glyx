@@ -6,8 +6,8 @@ This guide covers the user-facing frontends:
 
 - **CLI** (`glyx`), including a full-screen TUI (`glyx tui`)
 - **WebUI** (pages served by the local daemon)
-- **Desktop** (`glyx-tauri`, the WebUI plus automatic daemon start and a global quick-copy shortcut)
-- **Android** (`glyx-tauri` mobile, M6c in progress)
+- **Desktop** (`glyx-tauri`, the WebUI plus tray, deep links, notifications, autostart, and a global quick-copy shortcut)
+- **Android** (`glyx-tauri` mobile, M6c paused)
 - **Browser extension** (search, login/TOTP fill, and lock; requires an unlocked daemon)
 - **Git credential helper** (`git-credential-glyx`)
 
@@ -562,18 +562,31 @@ Secrets are kept in memory only and never written to `localStorage`.
 
 `glyx-tauri` (or `nix run .#glyx-desktop`) starts the daemon for the selected vault, injects the URL and token into the WebView, and opens the GUI. It closes the daemon on exit by default.
 
+Desktop behavior (Linux):
+
+- **Tray**: Show, Quick search, Lock vault, Quit. Closing the window hides it to the tray by default; turn this off in Settings to make close quit.
+- **Single instance**: a second launch focuses the running window instead of starting another copy.
+- **Deep links**: `glyx://unlock` opens the unlock page, `glyx://items/<id>` opens an item, `glyx://settings` opens Settings, `glyx://lock` locks, and `glyx://quick` opens the palette. The installed desktop file registers the scheme.
+- **Autostart**: opt-in; starts minimized to the tray. The shortcut is configurable in Settings (default `Ctrl+Shift+G`).
+- **Notifications**: daemon start/stop, idle auto-lock, and tamper detection. Toggle them in Settings.
+- **Window state**: size and position persist across launches.
+- Locking is manual or on exit; there is no OS suspend hook.
+
 Settings:
 
 - **When the desktop app closes**: stop the daemon (default, more private) or keep it running (keeps the browser extension, Git helper, and SSH agent alive)
 - **On unlock**: materialize all tracked files (default) or lock until you unlock each
+- **Desktop**: close-to-tray, start on login, notifications, and the quick-search shortcut
 
-`Ctrl+Shift+G` shows the quick palette from any app. Type to search, Enter copies the password, Esc closes. The clipboard clears after 15 seconds if unchanged.
+`Ctrl+Shift+G` (configurable) shows the quick palette from any app. Type to search. Enter copies the password, Shift+Enter the username, Alt+Enter the current TOTP, Ctrl+Enter opens the item, and Ctrl+N opens the add page; the row buttons do the same. Esc closes. Password and username copies clear after 15 seconds if unchanged.
+
+Desktop-only preferences live in `~/.config/glyx/desktop.json` (or next to `GLYX_CONFIG`), separate from the CLI/daemon config.
 
 ---
 
 ## 18. Configuration reference
 
-Location: `~/.config/glyx/config.toml`, or `GLYX_CONFIG`.
+Location: `~/.config/glyx/config.toml`, or `GLYX_CONFIG`. Desktop-only preferences are stored in `desktop.json` beside it.
 
 ```toml
 mode = "oneshot"            # "oneshot" or "session"
@@ -646,7 +659,7 @@ Runtime directory: `GLYX_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/glyx`, else a temp
 
 ---
 
-## 21. Android (M6c in progress)
+## 21. Android (M6c paused)
 
 The Android app is the Tauri-mobile shell from `crates/glyx-tauri` plus the same
 WebUI. It is not feature-complete yet.

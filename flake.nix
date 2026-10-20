@@ -191,10 +191,11 @@
             Type=Application
             Name=glyx
             Comment=Local-first password manager
-            Exec=glyx-tauri
+            Exec=glyx-tauri %u
             Icon=glyx
             Categories=Utility;Security;
             Terminal=false
+            MimeType=x-scheme-handler/glyx;
             EOF
             cp crates/glyx-tauri/icons/32x32.png $out/share/icons/hicolor/32x32/apps/glyx.png
             cp crates/glyx-tauri/icons/128x128.png $out/share/icons/hicolor/128x128/apps/glyx.png
@@ -263,6 +264,7 @@
             ++ linuxTauriDeps;
           shellHook = ''
             export RUSTUP_HOME="$HOME/.rustup-glyx"
+            export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath linuxTauriDeps}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             echo "glyx dev shell (Linux test-only)"
             echo "cargo $(cargo --version 2>/dev/null || echo missing)"
             echo "Extra targets via: rustup toolchain install stable --target <triple>"
