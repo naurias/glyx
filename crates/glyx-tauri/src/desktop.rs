@@ -70,7 +70,7 @@ fn save_settings(settings: &DesktopSettings) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let bytes = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
-    std::fs::write(path, bytes).map_err(|e| e.to_string())
+    glyx_store::vault::atomic_write(&path, &bytes).map_err(|e| e.to_string())
 }
 
 pub fn configure(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {

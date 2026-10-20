@@ -37,6 +37,7 @@ pub enum RaceTarget {
     Name,
     Folder,
     Tags,
+    Favorite,
     ItemType,
 }
 
@@ -276,6 +277,26 @@ fn merge_attrs(
         &mut tags_json,
     );
     out.tags = serde_json::from_str(&tags_json).unwrap_or_default();
+    let local_favorite = local.favorite.to_string();
+    let remote_favorite = remote.favorite.to_string();
+    let mut favorite_value = local_favorite.clone();
+    let mut favorite_hlc = local.hlc;
+    pick_str(
+        races,
+        local.id,
+        RaceTarget::Favorite,
+        &contest_for(
+            local.hlc,
+            &local_favorite,
+            remote.hlc,
+            &remote_favorite,
+            local_node,
+            remote_node,
+        ),
+        &mut favorite_hlc,
+        &mut favorite_value,
+    );
+    out.favorite = favorite_value == "true";
     if local.item_type != remote.item_type {
         let local_wins = match clock_ord(local.hlc, remote.hlc) {
             Ordering::Greater => true,
@@ -321,6 +342,7 @@ pub fn remote_dominates(local: &Item, remote: &Item) -> bool {
     if local.name != remote.name
         || local.folder != remote.folder
         || local.tags != remote.tags
+        || local.favorite != remote.favorite
         || local.item_type != remote.item_type
     {
         return clock_ord(remote.hlc, local.hlc) == Ordering::Greater;
@@ -425,6 +447,7 @@ mod merge_tests {
             name: "n".to_owned(),
             folder: String::new(),
             tags: Vec::new(),
+            favorite: false,
             fields: map,
             hlc: hlc(ms, node_byte),
             rev: 1,
@@ -465,6 +488,23 @@ mod merge_tests {
         let (out, races) = merge(&a, &b);
         assert!(races.is_empty());
         assert_eq!(out.fields["password"].value.expose(), "new");
+    }
+
+    #[test]
+    fn favorite_merges_by_item_clock() {
+        let id = uuid::Uuid::now_v7();
+        let mut a = item(1, 10, &[]);
+        let mut b = item(2, 20, &[]);
+        a.id = id;
+        b.id = id;
+        a.favorite = true;
+        b.favorite = false;
+        let (out, races) = merge(&a, &b);
+        assert!(!out.favorite);
+        assert!(races.is_empty());
+        b.favorite = true;
+        let (out, _) = merge(&a, &b);
+        assert!(out.favorite);
     }
 
     #[test]
@@ -542,6 +582,7 @@ mod fuzz {
                     name: "n".to_owned(),
                     folder: String::new(),
                     tags: Vec::new(),
+                    favorite: false,
                     fields: map,
                     hlc: Hlc {
                         wall_ms: ms,
