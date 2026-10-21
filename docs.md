@@ -22,6 +22,7 @@ This guide covers the user-facing frontends:
 | Clipboard copy | Yes | Partial | Partial | Inherited | No | No | No |
 | Web form fill | No | No | No | No | Planned | Yes | No |
 | SSH keys/agent | Yes | No | Partial | Inherited | Partial | No | No |
+| Favorites/recents/library/bulk/duplicates | Yes | No | Yes | Inherited | Inherited | No | No |
 | Exports/injection | Yes | No | Yes | Inherited | Inherited | No | No |
 | Sync/conflicts/GC/doctor | Yes | No | Partial | Inherited | Inherited | No | No |
 | Desktop extras | No | No | No | Yes | No | No | No |
@@ -259,6 +260,19 @@ glyx add login --name github --interactive
 glyx ls
 glyx ls --type login --tag work
 glyx ls --query github
+glyx ls --favorite --sort name --limit 20 --offset 0
+glyx favorite github
+glyx recents
+glyx library
+glyx tag rename old new
+glyx tag rm old
+glyx folder rename Work Archive
+glyx folder rm Archive
+glyx duplicates
+glyx bulk favorite --folder work
+glyx bulk add-tag important --folder work
+glyx bulk move-folder Archive --folder work
+glyx bulk delete --id old-login --yes
 glyx gen --length 32
 glyx show github
 glyx show github --reveal
@@ -276,7 +290,13 @@ glyx rm github
 
 `--generate name[:length]` creates a strong random value. `--json` returns machine-readable output; JSON always includes values, so be careful with logs.
 
-`ls --query` searches names, folders, tags, and non-secret fields. `history` lists earlier revisions (newest first); `--show` previews one, `--compare` lists changed fields without printing values, and `restore` brings one back as a new revision, so past revisions are never rewritten. `gen` prints a standalone password and does not touch the vault.
+`ls --query` searches names, folders, tags, and non-secret fields; `--favorite` filters stars and `--sort` accepts `updated`, `name`, `type`, or `favorite` (add `--reverse` to flip; `--limit`/`--offset` page the result). `favorite` toggles the synced star. `recents` lists the last 20 items opened on this device; recents are stored only in the local config and are never synced.
+
+Tags and folders are metadata on each item. `tag rename`/`folder rename` rewrite every live item; `tag rm` removes the tag everywhere and `folder rm` moves its items to the root. `bulk` accepts repeatable `--id` selectors (id, prefix, or exact name) plus an optional `--folder` selector; the selectors combine. `bulk delete` requires `--yes`. `duplicates` groups live items by normalized name and by login URL + username, flags identical passwords without printing them, and never returns secret values.
+
+The WebUI items page mirrors this workflow: recents, star toggles, favorites filter, sort and pagination, folder/tag pickers, multi-select bulk actions, and a Library panel for renaming/deleting tags and folders. The duplicates page groups suspects and supports bulk deletion; it shows only whether passwords match, never the values.
+
+`history` lists earlier revisions (newest first); `--show` previews one, `--compare` lists changed fields without printing values, and `restore` brings one back as a new revision, so past revisions are never rewritten. `gen` prints a standalone password and does not touch the vault.
 
 ### Attachments
 
