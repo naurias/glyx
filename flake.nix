@@ -97,6 +97,7 @@
           webkitgtk_4_1
           libsoup_3
           librsvg
+          libayatana-appindicator
           libappindicator-gtk3
           patchelf
         ];
@@ -158,6 +159,7 @@
           buildInputs = linuxTauriDeps;
           nativeBuildInputs = [
             pkgs.pkg-config
+            pkgs.patchelf
             pkgs.wrapGAppsHook3
             pkgs.nodejs_22
             pkgs.pnpm
@@ -183,6 +185,13 @@
           ];
           preBuild = ''
             (cd apps/webui && pnpm build)
+          '';
+          postFixup = ''
+            if [ -e "$out/bin/.glyx-tauri-wrapped" ]; then
+              patchelf --add-rpath "${pkgs.lib.makeLibraryPath [ pkgs.libayatana-appindicator pkgs.libappindicator-gtk3 ]}" "$out/bin/.glyx-tauri-wrapped"
+            else
+              patchelf --add-rpath "${pkgs.lib.makeLibraryPath [ pkgs.libayatana-appindicator pkgs.libappindicator-gtk3 ]}" "$out/bin/glyx-tauri"
+            fi
           '';
           postInstall = ''
             mkdir -p $out/share/applications $out/share/icons/hicolor/32x32/apps $out/share/icons/hicolor/128x128/apps

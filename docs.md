@@ -57,6 +57,8 @@ cargo nextest run
 pnpm --dir apps/webui build
 ```
 
+The Linux desktop tray uses the system StatusNotifierItem/AppIndicator library (`libayatana-appindicator3` or the legacy `libappindicator3`). Nix builds embed the library path in the binary. On non-Nix systems install the matching package; when running a `cargo`-built `glyx-tauri` directly, use `nix develop` or provide the library path yourself.
+
 First run:
 
 ```sh
