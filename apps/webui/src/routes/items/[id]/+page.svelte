@@ -141,6 +141,15 @@
     await load();
   });
 
+  async function toggleFavorite() {
+    try {
+      await api.edit(id, { favorite: !item.favorite });
+      item = { ...item, favorite: !item.favorite };
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
   async function toggle() {
     reveal = !reveal;
     await load();
@@ -218,7 +227,10 @@
   {#if error}<p style="color: var(--danger)">{error}</p>{/if}
   {#if notice}<p class="dim">{notice}</p>{/if}
   {#if item}
-    <h2>{item.name} <span class="dim">[{item.type}]</span></h2>
+    <h2>
+      <button title="Favorite" on:click={toggleFavorite}>{item.favorite ? '★' : '☆'}</button>
+      {item.name} <span class="dim">[{item.type}]</span>
+    </h2>
     <p class="dim">{item.id} · rev {item.rev}{item.folder ? ` · ${item.folder}` : ''}</p>
     {#if editing}
       <ItemForm

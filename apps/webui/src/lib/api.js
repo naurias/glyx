@@ -18,6 +18,16 @@ export function bootstrapDesktop() {
   return false;
 }
 
+async function reqPage(method, path) {
+  const res = await fetch(base + path, {
+    method,
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
+  });
+  const data = await res.json().catch(() => []);
+  if (!res.ok) throw new Error(data.error || `request failed: ${res.status}`);
+  return { data, total: Number(res.headers.get('x-total-count') || data.length || 0) };
+}
+
 async function req(method, path, body) {
   const res = await fetch(base + path, {
     method,
@@ -43,6 +53,18 @@ export const api = {
     const q = new URLSearchParams(params).toString();
     return req('GET', '/v1/items' + (q ? `?${q}` : ''));
   },
+  itemsPage: (params = {}) => {
+    const q = new URLSearchParams(params).toString();
+    return reqPage('GET', '/v1/items' + (q ? `?${q}` : ''));
+  },
+  bulk: (body) => req('POST', '/v1/items/bulk', body),
+  library: () => req('GET', '/v1/library'),
+  renameTag: (from, to) => req('POST', '/v1/library/tags/rename', { from, to }),
+  deleteTag: (name) => req('POST', '/v1/library/tags/delete', { name }),
+  renameFolder: (from, to) => req('POST', '/v1/library/folders/rename', { from, to }),
+  deleteFolder: (folder) => req('POST', '/v1/library/folders/delete', { folder }),
+  duplicates: () => req('GET', '/v1/items/duplicates'),
+  recents: () => req('GET', '/v1/recents'),
   show: (id, reveal = false) => req('GET', `/v1/items/${id}?reveal=${reveal}`),
   rendered: (id, reveal = false) => req('GET', `/v1/items/${id}/rendered?reveal=${reveal}`),
   create: (body) => req('POST', '/v1/items', body),
