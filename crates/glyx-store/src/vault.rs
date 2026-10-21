@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -259,12 +259,63 @@ pub struct HistoryEntry {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Library {
+    pub tags: BTreeMap<String, usize>,
+    pub folders: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DuplicateItem {
+    pub id: Uuid,
+    pub name: String,
+    pub item_type: String,
+    pub folder: String,
+    pub favorite: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DuplicateGroup {
+    pub reason: Vec<String>,
+    pub same_password: bool,
+    pub items: Vec<DuplicateItem>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlobGcReport {
     pub existing: usize,
     pub orphans: usize,
     pub orphan_bytes: u64,
     pub purged: usize,
     pub purged_bytes: u64,
+}
+
+fn field_value<'a>(item: &'a glyx_core::Item, key: &str) -> Option<&'a str> {
+    item.fields.get(key).map(|field| field.value.expose())
+}
+
+fn normalize_name(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn normalize_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_lowercase()
+}
+
+fn type_label(item_type: glyx_core::ItemType) -> &'static str {
+    match item_type {
+        glyx_core::ItemType::Login => "login",
+        glyx_core::ItemType::Passkey => "passkey",
+        glyx_core::ItemType::Totp => "totp",
+        glyx_core::ItemType::Identity => "identity",
+        glyx_core::ItemType::Card => "card",
+        glyx_core::ItemType::Note => "note",
+        glyx_core::ItemType::File => "file",
+        glyx_core::ItemType::SshKey => "ssh_key",
+        glyx_core::ItemType::GenericKey => "generic_key",
+    }
 }
 
 fn hlc_newer(a: glyx_core::Hlc, b: glyx_core::Hlc) -> bool {
@@ -514,6 +565,9 @@ impl UnlockedVault {
         Ok(())
     }
     fn index_needs_rebuild(&self) -> Result<bool, StoreError> {
+        if index::needs_backfill(&self.conn)? {
+            return Ok(true);
+        }
         let vault_id: Option<String> = self
             .conn
             .query_row("SELECT value FROM meta WHERE key = 'vault_id'", [], |r| {
@@ -594,6 +648,7 @@ impl UnlockedVault {
             }
         }
         self.meta_set_str("vault_id", &self.config.vault_id.as_simple().to_string())?;
+        index::clear_backfill(&self.conn)?;
         let last_ms = self.meta_get("hlc_ms")?.unwrap_or(0);
         let last_seq = self.meta_get("hlc_seq")?.unwrap_or(0);
         if i64::try_from(max.wall_ms).unwrap_or(i64::MAX) > last_ms
@@ -604,6 +659,242 @@ impl UnlockedVault {
             self.meta_set("hlc_seq", i64::from(max.seq))?;
         }
         Ok(count)
+    }
+    fn mutate_items(
+        &mut self,
+        ids: &[Uuid],
+        mut change: impl FnMut(&mut glyx_core::Item) -> bool,
+    ) -> Result<usize, StoreError> {
+        let mut seen = HashSet::new();
+        let mut changed = 0;
+        for id in ids {
+            if !seen.insert(*id) {
+                continue;
+            }
+            let Some(mut item) = self.get_item(id)? else {
+                continue;
+            };
+            if item.deleted || !change(&mut item) {
+                continue;
+            }
+            item.hlc = self.next_hlc()?;
+            item.rev = item.rev.saturating_add(1);
+            item.updated_by = self.node;
+            self.put_item(&item)?;
+            changed += 1;
+        }
+        Ok(changed)
+    }
+    pub fn set_favorite(&mut self, id: &Uuid, value: bool) -> Result<bool, StoreError> {
+        Ok(self.set_favorite_many(&[*id], value)? == 1)
+    }
+    pub fn set_favorite_many(&mut self, ids: &[Uuid], value: bool) -> Result<usize, StoreError> {
+        self.mutate_items(ids, |item| {
+            if item.favorite == value {
+                return false;
+            }
+            item.favorite = value;
+            true
+        })
+    }
+    pub fn add_tags_many(&mut self, ids: &[Uuid], tags: &[String]) -> Result<usize, StoreError> {
+        let tags: Vec<String> = tags
+            .iter()
+            .map(|tag| tag.trim().to_owned())
+            .filter(|tag| !tag.is_empty())
+            .collect();
+        if tags.is_empty() {
+            return Ok(0);
+        }
+        self.mutate_items(ids, |item| {
+            let mut changed = false;
+            for tag in &tags {
+                if !item.tags.contains(tag) {
+                    item.tags.push(tag.clone());
+                    changed = true;
+                }
+            }
+            changed
+        })
+    }
+    pub fn remove_tags_many(&mut self, ids: &[Uuid], tags: &[String]) -> Result<usize, StoreError> {
+        let tags: Vec<String> = tags
+            .iter()
+            .map(|tag| tag.trim().to_owned())
+            .filter(|tag| !tag.is_empty())
+            .collect();
+        if tags.is_empty() {
+            return Ok(0);
+        }
+        self.mutate_items(ids, |item| {
+            let before = item.tags.len();
+            item.tags.retain(|tag| !tags.contains(tag));
+            item.tags.len() != before
+        })
+    }
+    pub fn set_folder_many(&mut self, ids: &[Uuid], folder: &str) -> Result<usize, StoreError> {
+        let folder = folder.trim().to_owned();
+        self.mutate_items(ids, |item| {
+            if item.folder == folder {
+                return false;
+            }
+            item.folder.clone_from(&folder);
+            true
+        })
+    }
+    pub fn delete_many(&mut self, ids: &[Uuid]) -> Result<usize, StoreError> {
+        let mut seen = HashSet::new();
+        let mut deleted = 0;
+        for id in ids {
+            if !seen.insert(*id) {
+                continue;
+            }
+            let Some(item) = self.get_item(id)? else {
+                continue;
+            };
+            if item.deleted {
+                continue;
+            }
+            if self.delete_item(id)? {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
+    fn all_live_ids(&self) -> Result<Vec<Uuid>, StoreError> {
+        Ok(self.list(false)?.into_iter().map(|row| row.id).collect())
+    }
+    pub fn rename_tag(&mut self, from: &str, to: &str) -> Result<usize, StoreError> {
+        if from == to {
+            return Ok(0);
+        }
+        let ids = self.all_live_ids()?;
+        self.mutate_items(&ids, |item| {
+            if !item.tags.iter().any(|tag| tag == from) {
+                return false;
+            }
+            for tag in &mut item.tags {
+                if tag == from {
+                    to.clone_into(tag);
+                }
+            }
+            let mut seen = HashSet::new();
+            item.tags.retain(|tag| seen.insert(tag.clone()));
+            true
+        })
+    }
+    pub fn delete_tag(&mut self, tag: &str) -> Result<usize, StoreError> {
+        let ids = self.all_live_ids()?;
+        self.remove_tags_many(&ids, &[tag.to_owned()])
+    }
+    pub fn rename_folder(&mut self, from: &str, to: &str) -> Result<usize, StoreError> {
+        if from == to {
+            return Ok(0);
+        }
+        let ids: Vec<Uuid> = self
+            .list(false)?
+            .into_iter()
+            .filter(|row| row.folder == from)
+            .map(|row| row.id)
+            .collect();
+        self.set_folder_many(&ids, to)
+    }
+    pub fn delete_folder(&mut self, folder: &str) -> Result<usize, StoreError> {
+        let ids: Vec<Uuid> = self
+            .list(false)?
+            .into_iter()
+            .filter(|row| row.folder == folder)
+            .map(|row| row.id)
+            .collect();
+        self.set_folder_many(&ids, "")
+    }
+    pub fn library(&self) -> Result<Library, StoreError> {
+        let mut library = Library::default();
+        for row in self.list(false)? {
+            if !row.folder.is_empty() {
+                *library.folders.entry(row.folder).or_default() += 1;
+            }
+            for tag in row.tags {
+                *library.tags.entry(tag).or_default() += 1;
+            }
+        }
+        Ok(library)
+    }
+    pub fn duplicates(&self) -> Result<Vec<DuplicateGroup>, StoreError> {
+        let mut items = Vec::new();
+        for row in self.list(false)? {
+            if let Some(item) = self.get_item(&row.id)? {
+                items.push(item);
+            }
+        }
+        let mut groups: BTreeMap<Vec<Uuid>, BTreeSet<String>> = BTreeMap::new();
+        let mut names: BTreeMap<String, Vec<Uuid>> = BTreeMap::new();
+        let mut logins: BTreeMap<String, Vec<Uuid>> = BTreeMap::new();
+        for item in &items {
+            let name = normalize_name(&item.name);
+            if !name.is_empty() {
+                names.entry(name).or_default().push(item.id);
+            }
+            if item.item_type == glyx_core::ItemType::Login {
+                let url = field_value(item, "url")
+                    .map(normalize_url)
+                    .unwrap_or_default();
+                let username = field_value(item, "username")
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned();
+                if !url.is_empty() || !username.is_empty() {
+                    logins
+                        .entry(format!("{url}\u{1f}{username}"))
+                        .or_default()
+                        .push(item.id);
+                }
+            }
+        }
+        for (reason, map) in [("name", names), ("login", logins)] {
+            for ids in map.into_values() {
+                if ids.len() < 2 {
+                    continue;
+                }
+                let mut ids = ids;
+                ids.sort_unstable();
+                ids.dedup();
+                groups.entry(ids).or_default().insert(reason.to_owned());
+            }
+        }
+        let by_id: BTreeMap<Uuid, &glyx_core::Item> =
+            items.iter().map(|item| (item.id, item)).collect();
+        let mut out = Vec::new();
+        for (ids, reasons) in groups {
+            let mut same_password = false;
+            let mut passwords = HashSet::new();
+            let mut duplicate_items = Vec::new();
+            for id in ids {
+                let Some(item) = by_id.get(&id) else {
+                    continue;
+                };
+                if item.item_type == glyx_core::ItemType::Login {
+                    if let Some(password) = field_value(item, "password") {
+                        if !passwords.insert(password) {
+                            same_password = true;
+                        }
+                    }
+                }
+                duplicate_items.push(DuplicateItem {
+                    id: item.id,
+                    name: item.name.clone(),
+                    item_type: type_label(item.item_type).to_owned(),
+                    folder: item.folder.clone(),
+                    favorite: item.favorite,
+                });
+            }
+            out.push(DuplicateGroup {
+                reason: reasons.into_iter().collect(),
+                same_password,
+                items: duplicate_items,
+            });
+        }
+        Ok(out)
     }
     pub fn put_blob(&self, data: &[u8]) -> Result<String, StoreError> {
         if data.len() > blob::MAX_BLOB_BYTES {
@@ -1996,6 +2287,97 @@ mod m2_tests {
         assert!(uv.gc_tombstones(u64::MAX).expect("gc").is_empty());
         assert_eq!(uv.gc_tombstones(0).expect("gc"), vec![id]);
         assert!(uv.get_item(&id).expect("get").is_none());
+    }
+}
+
+#[cfg(test)]
+mod m57_library_tests {
+    use super::test_helpers::*;
+    use super::*;
+
+    #[test]
+    fn bulk_library_tags_folders_and_duplicates() {
+        let (_dir, a, _b) = two_vaults();
+        let vault = Vault::open(&a).expect("open");
+        let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+        let mut first = m1_item(
+            &mut uv,
+            "Example",
+            &[
+                ("url", "https://example.com"),
+                ("username", "alice"),
+                ("password", "TOPSECRET"),
+            ],
+        );
+        first.folder = "Work".to_owned();
+        first.tags = vec!["old".to_owned()];
+        uv.put_item(&first).expect("put");
+        let mut second = m1_item(
+            &mut uv,
+            " example ",
+            &[
+                ("url", "https://example.com/"),
+                ("username", "alice"),
+                ("password", "TOPSECRET"),
+            ],
+        );
+        second.folder = "Personal".to_owned();
+        second.tags = vec!["old".to_owned(), "keep".to_owned()];
+        uv.put_item(&second).expect("put");
+        let third = m1_item(&mut uv, "Example", &[("password", "other")]);
+        uv.put_item(&third).expect("put");
+
+        assert_eq!(
+            uv.set_favorite_many(&[first.id, second.id], true)
+                .expect("favorite"),
+            2
+        );
+        assert_eq!(
+            uv.add_tags_many(&[first.id], &["new".to_owned()])
+                .expect("tag"),
+            1
+        );
+        assert_eq!(uv.rename_tag("old", "renamed").expect("rename"), 2);
+        assert_eq!(
+            uv.set_folder_many(&[first.id], "Archive").expect("folder"),
+            1
+        );
+        assert_eq!(uv.rename_folder("Personal", "Private").expect("fold"), 1);
+
+        let lib = uv.library().expect("library");
+        assert_eq!(lib.tags.get("renamed"), Some(&2));
+        assert_eq!(lib.tags.get("keep"), Some(&1));
+        assert_eq!(lib.tags.get("new"), Some(&1));
+        assert_eq!(lib.folders.get("Archive"), Some(&1));
+        assert_eq!(lib.folders.get("Private"), Some(&1));
+
+        let groups = uv.duplicates().expect("duplicates");
+        assert_eq!(groups.len(), 2);
+        assert!(groups
+            .iter()
+            .any(|group| group.reason == vec!["login".to_owned()] && group.same_password));
+        let json = serde_json::to_string(&groups).expect("json");
+        assert!(!json.contains("TOPSECRET"));
+
+        assert_eq!(
+            uv.delete_many(&[first.id, second.id, third.id])
+                .expect("delete"),
+            3
+        );
+        assert!(uv.list(false).expect("list").is_empty());
+    }
+
+    #[test]
+    fn delete_folder_moves_items_to_root() {
+        let (_dir, a, _b) = two_vaults();
+        let vault = Vault::open(&a).expect("open");
+        let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+        let mut item = m1_item(&mut uv, "x", &[("password", "p")]);
+        item.folder = "Work".to_owned();
+        uv.put_item(&item).expect("put");
+        assert_eq!(uv.delete_folder("Work").expect("delete folder"), 1);
+        assert!(uv.list(false).expect("list")[0].folder.is_empty());
+        assert_eq!(uv.library().expect("library").folders.len(), 0);
     }
 }
 

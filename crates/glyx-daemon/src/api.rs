@@ -158,9 +158,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/vaults/backup", get(backup_vault))
         .route("/v1/vaults/restore", post(restore_vault))
         .route("/v1/settings", get(get_settings).post(set_settings))
+        .route("/v1/library", get(library))
+        .route("/v1/library/tags/rename", post(rename_tag))
+        .route("/v1/library/tags/delete", post(delete_tag))
+        .route("/v1/library/folders/rename", post(rename_folder))
+        .route("/v1/library/folders/delete", post(delete_folder))
+        .route("/v1/recents", get(recents))
         .route("/v1/unlock", post(unlock))
         .route("/v1/lock", post(lock))
         .route("/v1/items", get(list_items).post(create_item))
+        .route("/v1/items/bulk", post(bulk_items))
+        .route("/v1/items/duplicates", get(duplicate_items))
         .route(
             "/v1/items/:id",
             get(show_item).patch(edit_item).delete(delete_item),
@@ -462,6 +470,25 @@ struct ListQuery {
     tag: Option<String>,
     all: Option<bool>,
     q: Option<String>,
+    favorite: Option<bool>,
+    sort: Option<String>,
+    order: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+fn row_json(row: &glyx_store::IndexRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.id,
+        "type": row.item_type,
+        "name": row.name,
+        "rev": row.rev,
+        "deleted": row.deleted,
+        "favorite": row.favorite,
+        "folder": row.folder,
+        "tags": row.tags,
+        "updated_ms": row.updated_ms,
+    })
 }
 
 async fn list_items(
@@ -485,42 +512,304 @@ async fn list_items(
         if q.item_type.as_ref().is_some_and(|t| &row.item_type != t) {
             continue;
         }
-        let item = uv.get_item(&row.id).ok().flatten();
+        if q.favorite.is_some_and(|f| row.favorite != f) {
+            continue;
+        }
+        if q.folder.as_ref().is_some_and(|f| &row.folder != f) {
+            continue;
+        }
+        if q.tag
+            .as_ref()
+            .is_some_and(|t| !row.tags.iter().any(|x| x == t))
+        {
+            continue;
+        }
         if let Some(needle) = needle.as_ref() {
-            let hit = row.name.to_lowercase().contains(needle)
-                || item.as_ref().is_some_and(|item| {
-                    item.folder.to_lowercase().contains(needle)
-                        || item
-                            .tags
-                            .iter()
-                            .any(|tag| tag.to_lowercase().contains(needle))
-                        || item.fields.iter().any(|(key, field)| {
-                            glyx_store::present::display_value(item.item_type, key, false)
-                                && field.value.expose().to_lowercase().contains(needle)
-                        })
-                });
+            let mut hit = row.name.to_lowercase().contains(needle)
+                || row.folder.to_lowercase().contains(needle)
+                || row
+                    .tags
+                    .iter()
+                    .any(|tag| tag.to_lowercase().contains(needle));
+            if !hit {
+                if let Some(item) = uv.get_item(&row.id).ok().flatten() {
+                    hit = item.fields.iter().any(|(key, field)| {
+                        glyx_store::present::display_value(item.item_type, key, false)
+                            && field.value.expose().to_lowercase().contains(needle)
+                    });
+                }
+            }
             if !hit {
                 continue;
             }
         }
-        if q.folder
-            .as_ref()
-            .is_some_and(|f| item.as_ref().is_none_or(|item| &item.folder != f))
-        {
-            continue;
+        out.push(row);
+    }
+    let sort = q.sort.as_deref().unwrap_or("updated");
+    let desc = q
+        .order
+        .as_deref()
+        .map_or(!matches!(sort, "name" | "type"), |order| order == "desc");
+    out.sort_by(|a, b| {
+        let ordering = match sort {
+            "name" => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            "type" => a.item_type.cmp(&b.item_type),
+            "favorite" => a
+                .favorite
+                .cmp(&b.favorite)
+                .then_with(|| b.updated_ms.cmp(&a.updated_ms)),
+            _ => a.updated_ms.cmp(&b.updated_ms),
+        };
+        let ordering = if desc { ordering.reverse() } else { ordering };
+        ordering.then_with(|| a.id.cmp(&b.id))
+    });
+    let total = out.len();
+    let offset = q.offset.unwrap_or(0);
+    let limit = q.limit.map_or(total, |limit| limit.min(500));
+    let page: Vec<_> = out
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|row| row_json(&row))
+        .collect();
+    let mut response = Json(serde_json::Value::Array(page)).into_response();
+    if let Ok(value) = HeaderValue::from_str(&total.to_string()) {
+        response.headers_mut().insert("x-total-count", value);
+    }
+    response
+}
+
+#[derive(Deserialize)]
+struct BulkBody {
+    ids: Vec<uuid::Uuid>,
+    action: String,
+    tags: Option<Vec<String>>,
+    folder: Option<String>,
+}
+
+async fn bulk_items(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<BulkBody>,
+) -> impl IntoResponse {
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return locked_error().into_response();
+    };
+    let result = match body.action.as_str() {
+        "favorite" => uv.set_favorite_many(&body.ids, true),
+        "unfavorite" => uv.set_favorite_many(&body.ids, false),
+        "add_tags" => match body.tags {
+            Some(tags) if !tags.is_empty() => uv.add_tags_many(&body.ids, &tags),
+            _ => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({"error": "tags are required"})),
+                )
+                    .into_response();
+            }
+        },
+        "remove_tags" => match body.tags {
+            Some(tags) if !tags.is_empty() => uv.remove_tags_many(&body.ids, &tags),
+            _ => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({"error": "tags are required"})),
+                )
+                    .into_response();
+            }
+        },
+        "set_folder" => match body.folder {
+            Some(folder) => uv.set_folder_many(&body.ids, &folder),
+            None => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({"error": "folder is required"})),
+                )
+                    .into_response();
+            }
+        },
+        "delete" => uv.delete_many(&body.ids),
+        _ => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "unknown bulk action"})),
+            )
+                .into_response();
         }
-        if q.tag.as_ref().is_some_and(|t| {
-            item.as_ref()
-                .is_none_or(|item| !item.tags.iter().any(|x| x == t))
-        }) {
+    };
+    match result {
+        Ok(affected) => Json(serde_json::json!({"ok": true, "affected": affected})).into_response(),
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RenameBody {
+    from: String,
+    to: String,
+}
+
+#[derive(Deserialize)]
+struct NameBody {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct FolderBody {
+    folder: String,
+}
+
+async fn library(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    match uv.library() {
+        Ok(library) => Json(library).into_response(),
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+async fn rename_tag(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RenameBody>,
+) -> impl IntoResponse {
+    if body.from.trim().is_empty() || body.to.trim().is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "tag names must not be empty"})),
+        )
+            .into_response();
+    }
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return locked_error().into_response();
+    };
+    match uv.rename_tag(&body.from, &body.to) {
+        Ok(affected) => Json(serde_json::json!({"ok": true, "affected": affected})).into_response(),
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+async fn delete_tag(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<NameBody>,
+) -> impl IntoResponse {
+    if body.name.trim().is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "tag name must not be empty"})),
+        )
+            .into_response();
+    }
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return locked_error().into_response();
+    };
+    match uv.delete_tag(&body.name) {
+        Ok(affected) => Json(serde_json::json!({"ok": true, "affected": affected})).into_response(),
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+async fn rename_folder(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RenameBody>,
+) -> impl IntoResponse {
+    if body.from.trim().is_empty() || body.to.trim().is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "folder names must not be empty"})),
+        )
+            .into_response();
+    }
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return locked_error().into_response();
+    };
+    match uv.rename_folder(&body.from, &body.to) {
+        Ok(affected) => Json(serde_json::json!({"ok": true, "affected": affected})).into_response(),
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+async fn delete_folder(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<FolderBody>,
+) -> impl IntoResponse {
+    if body.folder.trim().is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "folder name must not be empty"})),
+        )
+            .into_response();
+    }
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return locked_error().into_response();
+    };
+    match uv.delete_folder(&body.folder) {
+        Ok(affected) => Json(serde_json::json!({"ok": true, "affected": affected})).into_response(),
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+async fn duplicate_items(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    match uv.duplicates() {
+        Ok(groups) => Json(serde_json::json!({"groups": groups})).into_response(),
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+async fn recents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let config = glyx_store::config::load();
+    let mut out = Vec::new();
+    for recent in config.recents(&uv.config().vault_id) {
+        let Ok(Some(item)) = uv.get_item(&recent.item_id) else {
+            continue;
+        };
+        if item.deleted {
             continue;
         }
         out.push(serde_json::json!({
-            "id": row.id,
-            "type": row.item_type,
-            "name": row.name,
-            "rev": row.rev,
-            "deleted": row.deleted,
+            "id": item.id,
+            "name": item.name,
+            "type": serde_json::to_value(item.item_type).unwrap_or_default(),
+            "favorite": item.favorite,
+            "folder": item.folder,
+            "at_ms": recent.at_ms,
         }));
     }
     Json(serde_json::Value::Array(out)).into_response()
@@ -544,11 +833,14 @@ async fn show_item(
         return locked_error().into_response();
     };
     match uv.resolve(&id) {
-        Ok(item) => Json(glyx_store::present::item_json(
-            &item,
-            q.reveal.unwrap_or(false),
-        ))
-        .into_response(),
+        Ok(item) => {
+            let _ = glyx_store::config::note_recent(uv.config().vault_id, item.id);
+            Json(glyx_store::present::item_json(
+                &item,
+                q.reveal.unwrap_or(false),
+            ))
+            .into_response()
+        }
         Err(e) => store_error(&e).into_response(),
     }
 }
@@ -671,6 +963,7 @@ struct EditBody {
     rename: Option<String>,
     folder: Option<String>,
     tags: Option<Vec<String>>,
+    favorite: Option<bool>,
     fields: Option<BTreeMap<String, String>>,
     delete_fields: Option<Vec<String>>,
 }
@@ -695,12 +988,15 @@ async fn edit_item(
     if let Some(name) = body.rename {
         item.name = name;
     }
-    let meta_touched = body.folder.is_some() || body.tags.is_some();
+    let meta_touched = body.folder.is_some() || body.tags.is_some() || body.favorite.is_some();
     if let Some(folder) = body.folder {
         item.folder = folder;
     }
     if let Some(tags) = body.tags {
         item.tags = tags;
+    }
+    if let Some(favorite) = body.favorite {
+        item.favorite = favorite;
     }
     let values = body.fields.unwrap_or_default();
     let touched = !values.is_empty() || body.delete_fields.is_some() || renamed || meta_touched;
@@ -3310,5 +3606,146 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(new_path.exists());
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn library_pagination_bulk_duplicates_and_recents() {
+        let (dir, state) = test_state();
+        std::env::set_var("GLYX_CONFIG", dir.path().join("config.toml"));
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": "pw", "keyfile": kf_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let mut ids = Vec::new();
+        for (name, username, password) in [
+            ("Alpha", "alice", "same"),
+            (" alpha ", "alice", "same"),
+            ("Beta", "bob", "other"),
+        ] {
+            let (status, body) = call(
+                state.clone(),
+                "POST",
+                "/v1/items",
+                Some(serde_json::json!({
+                    "type": "login",
+                    "name": name,
+                    "folder": "Work",
+                    "tags": ["old"],
+                    "fields": {
+                        "url": "https://example.com",
+                        "username": username,
+                        "password": password
+                    }
+                })),
+                "test-token",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            ids.push(body["id"].as_str().expect("id").to_owned());
+        }
+
+        let (status, body) = call(
+            state.clone(),
+            "PATCH",
+            &format!("/v1/items/{}", ids[0]),
+            Some(serde_json::json!({"favorite": true})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, headers, bytes) = call_raw(
+            state.clone(),
+            "GET",
+            "/v1/items?sort=name&limit=2&offset=0",
+            Body::empty(),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get("x-total-count").and_then(|v| v.to_str().ok()),
+            Some("3")
+        );
+        let page: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(page.as_array().expect("array").len(), 2);
+
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            "/v1/items?favorite=true",
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().expect("array").len(), 1);
+        assert_eq!(body[0]["favorite"], serde_json::json!(true));
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/items/bulk",
+            Some(serde_json::json!({
+                "ids": [ids[0], ids[1]],
+                "action": "add_tags",
+                "tags": ["new"]
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["affected"], serde_json::json!(2));
+
+        let (status, body) = call(state.clone(), "GET", "/v1/library", None, "test-token").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["tags"]["new"], serde_json::json!(2));
+        assert_eq!(body["folders"]["Work"], serde_json::json!(3));
+
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            "/v1/items/duplicates",
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let groups = body["groups"].as_array().expect("groups");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["same_password"], serde_json::json!(true));
+
+        let (status, _) = call(
+            state.clone(),
+            "GET",
+            &format!("/v1/items/{}", ids[0]),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = call(state.clone(), "GET", "/v1/recents", None, "test-token").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body[0]["id"], serde_json::json!(ids[0]));
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/library/tags/delete",
+            Some(serde_json::json!({"name": "new"})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["affected"], serde_json::json!(2));
     }
 }

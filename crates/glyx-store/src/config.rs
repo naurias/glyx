@@ -46,6 +46,15 @@ impl VaultEntry {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentItem {
+    pub vault_id: Uuid,
+    pub item_id: Uuid,
+    pub at_ms: u64,
+}
+
+pub const MAX_RECENTS: usize = 20;
+
 fn default_ttl() -> u64 {
     crate::session::SESSION_TTL_DEFAULT_MIN
 }
@@ -70,6 +79,8 @@ pub struct AppConfig {
     pub current_vault: Option<PathBuf>,
     #[serde(default)]
     pub vaults: Vec<VaultEntry>,
+    #[serde(default)]
+    pub recent_items: Vec<RecentItem>,
 }
 
 impl Default for AppConfig {
@@ -82,6 +93,7 @@ impl Default for AppConfig {
             idle_lock_min: None,
             current_vault: None,
             vaults: Vec::new(),
+            recent_items: Vec::new(),
         }
     }
 }
@@ -146,6 +158,36 @@ impl AppConfig {
         self.current_vault = Some(normalized);
     }
 
+    pub fn note_recent(&mut self, vault_id: Uuid, item_id: Uuid) {
+        self.recent_items
+            .retain(|recent| recent.vault_id != vault_id || recent.item_id != item_id);
+        self.recent_items.insert(
+            0,
+            RecentItem {
+                vault_id,
+                item_id,
+                at_ms: glyx_core::ids::wall_ms_now(),
+            },
+        );
+        let mut kept = 0;
+        self.recent_items.retain(|recent| {
+            if recent.vault_id != vault_id {
+                return true;
+            }
+            kept += 1;
+            kept <= MAX_RECENTS
+        });
+    }
+
+    #[must_use]
+    pub fn recents(&self, vault_id: &Uuid) -> Vec<RecentItem> {
+        self.recent_items
+            .iter()
+            .filter(|recent| &recent.vault_id == vault_id)
+            .cloned()
+            .collect()
+    }
+
     pub fn remove(&mut self, path: &Path) {
         let want = normalize(path);
         self.vaults.retain(|v| normalize(&v.path) != want);
@@ -196,6 +238,12 @@ pub fn load_from(path: &Path) -> AppConfig {
 
 pub fn save(config: &AppConfig) -> Result<(), StoreError> {
     save_to(&config_path(), config)
+}
+
+pub fn note_recent(vault_id: Uuid, item_id: Uuid) -> Result<(), StoreError> {
+    let mut config = load();
+    config.note_recent(vault_id, item_id);
+    save(&config)
 }
 
 fn harden_known_config_dir(path: &Path) {
@@ -262,6 +310,26 @@ mod tests {
         assert_eq!(entry.name.as_deref(), Some("B"));
         assert_eq!(entry.keyfile.as_deref(), Some(keyfile.as_path()));
         assert_eq!(entry.last_used_ms, 9_000_000_000_000);
+    }
+
+    #[test]
+    fn recents_are_deduped_capped_and_scoped() {
+        let mut cfg = AppConfig::default();
+        let vault = Uuid::now_v7();
+        let other = Uuid::now_v7();
+        let mut first = Uuid::now_v7();
+        for _ in 0..(MAX_RECENTS + 5) {
+            first = Uuid::now_v7();
+            cfg.note_recent(vault, first);
+        }
+        assert_eq!(cfg.recents(&vault).len(), MAX_RECENTS);
+        assert_eq!(cfg.recents(&vault)[0].item_id, first);
+        cfg.note_recent(vault, first);
+        assert_eq!(cfg.recents(&vault)[0].item_id, first);
+        assert_eq!(cfg.recents(&vault).len(), MAX_RECENTS);
+        cfg.note_recent(other, first);
+        assert_eq!(cfg.recents(&other).len(), 1);
+        assert_eq!(cfg.recents(&vault).len(), MAX_RECENTS);
     }
 
     #[test]

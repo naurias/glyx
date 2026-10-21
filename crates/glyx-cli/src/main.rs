@@ -63,6 +63,16 @@ enum Cmd {
         all: bool,
         #[arg(long, short, help = "Case-insensitive search")]
         query: Option<String>,
+        #[arg(long, help = "Only favorites")]
+        favorite: bool,
+        #[arg(long, value_enum, default_value = "updated", help = "Sort order")]
+        sort: SortKey,
+        #[arg(long, help = "Reverse the sort")]
+        reverse: bool,
+        #[arg(long, help = "Return at most this many items")]
+        limit: Option<usize>,
+        #[arg(long, default_value_t = 0, help = "Skip this many items")]
+        offset: usize,
     },
     #[command(about = "Show one item")]
     Show {
@@ -82,6 +92,34 @@ enum Cmd {
     Blob {
         #[command(subcommand)]
         cmd: BlobCmd,
+    },
+    #[command(about = "Mark an item as favorite")]
+    Favorite {
+        #[arg(help = "Id, id prefix, or exact name")]
+        query: String,
+        #[arg(long, help = "Remove the favorite mark")]
+        off: bool,
+    },
+    #[command(about = "Recently opened items")]
+    Recents,
+    #[command(about = "Tags and folders with item counts")]
+    Library,
+    #[command(about = "Manage tags")]
+    Tag {
+        #[command(subcommand)]
+        cmd: TagCmd,
+    },
+    #[command(about = "Manage folders")]
+    Folder {
+        #[command(subcommand)]
+        cmd: FolderCmd,
+    },
+    #[command(about = "Find possible duplicate items")]
+    Duplicates,
+    #[command(about = "Apply an action to several items")]
+    Bulk {
+        #[command(subcommand)]
+        cmd: BulkCmd,
     },
     #[command(about = "Show item history")]
     History {
@@ -518,6 +556,104 @@ enum CipherOpt {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+enum SortKey {
+    #[value(help = "Last updated")]
+    Updated,
+    #[value(help = "Name")]
+    Name,
+    #[value(help = "Item type")]
+    Type,
+    #[value(help = "Favorites first")]
+    Favorite,
+}
+
+#[derive(Debug, Subcommand)]
+enum TagCmd {
+    #[command(about = "Rename a tag everywhere")]
+    Rename {
+        #[arg(help = "Current tag")]
+        from: String,
+        #[arg(help = "New tag")]
+        to: String,
+    },
+    #[command(about = "Remove a tag everywhere")]
+    Rm {
+        #[arg(help = "Tag to remove")]
+        tag: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FolderCmd {
+    #[command(about = "Rename a folder everywhere")]
+    Rename {
+        #[arg(help = "Current folder")]
+        from: String,
+        #[arg(help = "New folder")]
+        to: String,
+    },
+    #[command(about = "Move all items in a folder to the root")]
+    Rm {
+        #[arg(help = "Folder to remove")]
+        folder: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BulkCmd {
+    #[command(about = "Mark selected items as favorite")]
+    Favorite {
+        #[arg(long = "id", help = "Item id, prefix, or name (repeatable)")]
+        ids: Vec<String>,
+        #[arg(long, help = "Also select this folder")]
+        folder: Option<String>,
+    },
+    #[command(about = "Remove the favorite mark")]
+    Unfavorite {
+        #[arg(long = "id", help = "Item id, prefix, or name (repeatable)")]
+        ids: Vec<String>,
+        #[arg(long, help = "Also select this folder")]
+        folder: Option<String>,
+    },
+    #[command(about = "Add a tag")]
+    AddTag {
+        #[arg(help = "Tag to add")]
+        tag: String,
+        #[arg(long = "id", help = "Item id, prefix, or name (repeatable)")]
+        ids: Vec<String>,
+        #[arg(long, help = "Also select this folder")]
+        folder: Option<String>,
+    },
+    #[command(about = "Remove a tag")]
+    RemoveTag {
+        #[arg(help = "Tag to remove")]
+        tag: String,
+        #[arg(long = "id", help = "Item id, prefix, or name (repeatable)")]
+        ids: Vec<String>,
+        #[arg(long, help = "Also select this folder")]
+        folder: Option<String>,
+    },
+    #[command(about = "Move selected items to a folder")]
+    MoveFolder {
+        #[arg(help = "Destination folder")]
+        to: String,
+        #[arg(long = "id", help = "Item id, prefix, or name (repeatable)")]
+        ids: Vec<String>,
+        #[arg(long, help = "Also select items in this folder")]
+        folder: Option<String>,
+    },
+    #[command(about = "Tombstone selected items")]
+    Delete {
+        #[arg(long = "id", help = "Item id, prefix, or name (repeatable)")]
+        ids: Vec<String>,
+        #[arg(long, help = "Also select this folder")]
+        folder: Option<String>,
+        #[arg(long, help = "Confirm deletion")]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum SshKind {
     #[value(help = "Ed25519")]
     Ed25519,
@@ -610,6 +746,7 @@ fn git_credential_main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Ls {
@@ -618,13 +755,25 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             item_type,
             all,
             query,
+            favorite,
+            sort,
+            reverse,
+            limit,
+            offset,
         } => cmd_ls(
             ctx,
-            folder.as_deref(),
-            tag.as_deref(),
-            item_type.as_deref(),
-            all,
-            query.as_deref(),
+            LsArgs {
+                folder: folder.as_deref(),
+                tag: tag.as_deref(),
+                item_type: item_type.as_deref(),
+                all,
+                query: query.as_deref(),
+                favorite,
+                sort,
+                reverse,
+                limit,
+                offset,
+            },
         ),
         Cmd::Show {
             query,
@@ -633,6 +782,13 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
         } => cmd_show(ctx, &query, reveal, render),
         Cmd::Gen { length } => cmd_gen(ctx, length),
         Cmd::Blob { cmd } => cmd_blob(ctx, cmd),
+        cmd @ (Cmd::Favorite { .. }
+        | Cmd::Recents
+        | Cmd::Library
+        | Cmd::Tag { .. }
+        | Cmd::Folder { .. }
+        | Cmd::Duplicates
+        | Cmd::Bulk { .. }) => dispatch_library(ctx, cmd),
         Cmd::History {
             query,
             show,
@@ -759,6 +915,13 @@ fn dispatch_grouped(ctx: &Ctx, cmd: Cmd) -> Result<()> {
         | Cmd::Show { .. }
         | Cmd::Gen { .. }
         | Cmd::Blob { .. }
+        | Cmd::Favorite { .. }
+        | Cmd::Recents
+        | Cmd::Library
+        | Cmd::Tag { .. }
+        | Cmd::Folder { .. }
+        | Cmd::Duplicates
+        | Cmd::Bulk { .. }
         | Cmd::History { .. }
         | Cmd::Restore { .. }
         | Cmd::Add { .. }
@@ -1297,14 +1460,33 @@ fn item_matches(item: &glyx_core::Item, query: &str) -> bool {
         })
 }
 
-fn cmd_ls(
-    ctx: &Ctx,
-    folder: Option<&str>,
-    tag: Option<&str>,
-    item_type: Option<&str>,
+#[derive(Clone, Copy)]
+struct LsArgs<'a> {
+    folder: Option<&'a str>,
+    tag: Option<&'a str>,
+    item_type: Option<&'a str>,
     all: bool,
-    query: Option<&str>,
-) -> Result<()> {
+    query: Option<&'a str>,
+    favorite: bool,
+    sort: SortKey,
+    reverse: bool,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+fn cmd_ls(ctx: &Ctx, args: LsArgs<'_>) -> Result<()> {
+    let LsArgs {
+        folder,
+        tag,
+        item_type,
+        all,
+        query,
+        favorite: favorite_only,
+        sort,
+        reverse,
+        limit,
+        offset,
+    } = args;
     let uv = ctx.unlocked()?;
     let rows = uv.list(all)?;
     let want_type = item_type
@@ -1316,6 +1498,9 @@ fn cmd_ls(
             if type_label(want) != row.item_type {
                 continue;
             }
+        }
+        if favorite_only && !row.favorite {
+            continue;
         }
         let item = uv.get_item(&row.id)?;
         let keep = folder
@@ -1329,6 +1514,28 @@ fn cmd_ls(
             detailed.push(row.clone());
         }
     }
+    detailed.sort_by(|a, b| {
+        let ordering = match sort {
+            SortKey::Updated => a.updated_ms.cmp(&b.updated_ms),
+            SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            SortKey::Type => a.item_type.cmp(&b.item_type),
+            SortKey::Favorite => a
+                .favorite
+                .cmp(&b.favorite)
+                .then_with(|| b.updated_ms.cmp(&a.updated_ms)),
+        };
+        let ordering = if matches!(sort, SortKey::Updated | SortKey::Favorite) == reverse {
+            ordering
+        } else {
+            ordering.reverse()
+        };
+        ordering.then_with(|| a.id.cmp(&b.id))
+    });
+    let detailed: Vec<_> = detailed
+        .into_iter()
+        .skip(offset)
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
     if ctx.json {
         println!("{}", serde_json::to_string_pretty(&rows_json(&detailed))?);
     } else {
@@ -1338,9 +1545,236 @@ fn cmd_ls(
                 "{} {} {}{del}",
                 &row.id.as_simple().to_string()[..8],
                 row.item_type,
-                row.name
+                if row.favorite {
+                    format!("★ {}", row.name)
+                } else {
+                    row.name.clone()
+                }
             );
         }
+    }
+    Ok(())
+}
+
+fn dispatch_library(ctx: &Ctx, cmd: Cmd) -> Result<()> {
+    match cmd {
+        Cmd::Favorite { query, off } => cmd_favorite(ctx, &query, off),
+        Cmd::Recents => cmd_recents(ctx),
+        Cmd::Library => cmd_library(ctx),
+        Cmd::Tag { cmd } => cmd_tag(ctx, cmd),
+        Cmd::Folder { cmd } => cmd_folder(ctx, cmd),
+        Cmd::Duplicates => cmd_duplicates(ctx),
+        Cmd::Bulk { cmd } => cmd_bulk(ctx, cmd),
+        _ => unreachable!("not a library command"),
+    }
+}
+
+fn cmd_favorite(ctx: &Ctx, query: &str, off: bool) -> Result<()> {
+    let mut uv = ctx.unlocked()?;
+    let item = items::resolve_query(&uv, query)?;
+    uv.set_favorite(&item.id, !off)?;
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::json!({"id": item.id, "name": item.name, "favorite": !off})
+        );
+    } else {
+        println!(
+            "{} {}",
+            if off { "unfavorited" } else { "favorited" },
+            item.name
+        );
+    }
+    Ok(())
+}
+
+fn cmd_recents(ctx: &Ctx) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    let config = glyx_store::config::load();
+    let mut out = Vec::new();
+    for recent in config.recents(&uv.config().vault_id) {
+        let Ok(Some(item)) = uv.get_item(&recent.item_id) else {
+            continue;
+        };
+        if item.deleted {
+            continue;
+        }
+        out.push(serde_json::json!({
+            "id": item.id,
+            "name": item.name,
+            "type": type_label(item.item_type),
+            "favorite": item.favorite,
+            "folder": item.folder,
+            "at_ms": recent.at_ms,
+        }));
+    }
+    if ctx.json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else if out.is_empty() {
+        println!("no recents");
+    } else {
+        for row in out {
+            println!(
+                "{} {} {}",
+                row["id"].as_str().map_or("", |id| &id[..8.min(id.len())]),
+                row["type"].as_str().unwrap_or(""),
+                row["name"].as_str().unwrap_or("")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_library(ctx: &Ctx) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    let library = uv.library()?;
+    if ctx.json {
+        println!("{}", serde_json::to_string_pretty(&library)?);
+    } else {
+        println!("tags:");
+        for (tag, count) in &library.tags {
+            println!("  {tag} ({count})");
+        }
+        println!("folders:");
+        for (folder, count) in &library.folders {
+            println!("  {folder} ({count})");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_tag(ctx: &Ctx, cmd: TagCmd) -> Result<()> {
+    let mut uv = ctx.unlocked()?;
+    let affected = match cmd {
+        TagCmd::Rename { from, to } => {
+            if to.trim().is_empty() {
+                bail!("tag name must not be empty");
+            }
+            uv.rename_tag(&from, &to)?
+        }
+        TagCmd::Rm { tag } => uv.delete_tag(&tag)?,
+    };
+    if ctx.json {
+        println!("{}", serde_json::json!({"ok": true, "affected": affected}));
+    } else {
+        println!("updated {affected} item(s)");
+    }
+    Ok(())
+}
+
+fn cmd_folder(ctx: &Ctx, cmd: FolderCmd) -> Result<()> {
+    let mut uv = ctx.unlocked()?;
+    let affected = match cmd {
+        FolderCmd::Rename { from, to } => {
+            if to.trim().is_empty() {
+                bail!("folder name must not be empty");
+            }
+            uv.rename_folder(&from, &to)?
+        }
+        FolderCmd::Rm { folder } => uv.delete_folder(&folder)?,
+    };
+    if ctx.json {
+        println!("{}", serde_json::json!({"ok": true, "affected": affected}));
+    } else {
+        println!("updated {affected} item(s)");
+    }
+    Ok(())
+}
+
+fn cmd_duplicates(ctx: &Ctx) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    let groups = uv.duplicates()?;
+    if ctx.json {
+        println!("{}", serde_json::to_string_pretty(&groups)?);
+    } else if groups.is_empty() {
+        println!("no duplicates found");
+    } else {
+        for (index, group) in groups.iter().enumerate() {
+            println!(
+                "group {}: {}{}",
+                index + 1,
+                group.reason.join("+"),
+                if group.same_password {
+                    " (same password)"
+                } else {
+                    ""
+                }
+            );
+            for item in &group.items {
+                println!(
+                    "  {} {} {}",
+                    &item.id.as_simple().to_string()[..8],
+                    item.item_type,
+                    item.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bulk_targets(
+    uv: &glyx_store::UnlockedVault,
+    ids: &[String],
+    folder: Option<&str>,
+) -> Result<Vec<uuid::Uuid>> {
+    let mut out = Vec::new();
+    for query in ids {
+        out.push(items::resolve_query(uv, query)?.id);
+    }
+    if let Some(folder) = folder {
+        for row in uv.list(false)? {
+            if row.folder == folder {
+                out.push(row.id);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    if out.is_empty() {
+        bail!("no items selected; pass --id and/or --folder");
+    }
+    Ok(out)
+}
+
+fn cmd_bulk(ctx: &Ctx, cmd: BulkCmd) -> Result<()> {
+    let mut uv = ctx.unlocked()?;
+    let affected = match cmd {
+        BulkCmd::Favorite { ids, folder } => {
+            let targets = bulk_targets(&uv, &ids, folder.as_deref())?;
+            uv.set_favorite_many(&targets, true)?
+        }
+        BulkCmd::Unfavorite { ids, folder } => {
+            let targets = bulk_targets(&uv, &ids, folder.as_deref())?;
+            uv.set_favorite_many(&targets, false)?
+        }
+        BulkCmd::AddTag { tag, ids, folder } => {
+            if tag.trim().is_empty() {
+                bail!("tag must not be empty");
+            }
+            let targets = bulk_targets(&uv, &ids, folder.as_deref())?;
+            uv.add_tags_many(&targets, &[tag])?
+        }
+        BulkCmd::RemoveTag { tag, ids, folder } => {
+            let targets = bulk_targets(&uv, &ids, folder.as_deref())?;
+            uv.remove_tags_many(&targets, &[tag])?
+        }
+        BulkCmd::MoveFolder { to, ids, folder } => {
+            let targets = bulk_targets(&uv, &ids, folder.as_deref())?;
+            uv.set_folder_many(&targets, &to)?
+        }
+        BulkCmd::Delete { ids, folder, yes } => {
+            if !yes {
+                bail!("refusing to delete without --yes");
+            }
+            let targets = bulk_targets(&uv, &ids, folder.as_deref())?;
+            uv.delete_many(&targets)?
+        }
+    };
+    if ctx.json {
+        println!("{}", serde_json::json!({"ok": true, "affected": affected}));
+    } else {
+        println!("updated {affected} item(s)");
     }
     Ok(())
 }
@@ -1572,6 +2006,7 @@ fn cmd_restore(ctx: &Ctx, query: &str, rev: Option<u64>, file: Option<&str>) -> 
 fn cmd_show(ctx: &Ctx, query: &str, reveal: bool, render: bool) -> Result<()> {
     let uv = ctx.unlocked()?;
     let item = items::resolve_query(&uv, query)?;
+    let _ = glyx_store::config::note_recent(uv.config().vault_id, item.id);
     if render {
         let body = glyx_store::present::note_rendered(&uv, &item, reveal)?;
         if ctx.json {
@@ -2225,6 +2660,10 @@ fn rows_json(rows: &[glyx_store::IndexRow]) -> serde_json::Value {
                     "name": r.name,
                     "rev": r.rev,
                     "deleted": r.deleted,
+                    "favorite": r.favorite,
+                    "folder": r.folder,
+                    "tags": r.tags,
+                    "updated_ms": r.updated_ms,
                 })
             })
             .collect(),

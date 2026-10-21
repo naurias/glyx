@@ -6,4 +6,4 @@ pub const HISTORY_DIR: &str = "history";
 pub const CONFLICTS_DIR: &str = "conflicts";
 pub const INDEX_DB: &str = "glyx.db";
 pub const LOCK_FILE: &str = "glyx.db.lock";
-pub const INDEX_SCHEMA_VERSION: i64 = 1;
+pub const INDEX_SCHEMA_VERSION: i64 = 2;
