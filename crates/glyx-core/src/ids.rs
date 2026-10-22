@@ -14,6 +14,26 @@ impl DeviceId {
     pub fn zero() -> Self {
         Self([0u8; 16])
     }
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(32);
+        for b in self.0 {
+            let _ = write!(out, "{b:02x}");
+        }
+        out
+    }
+    #[must_use]
+    pub fn from_hex(value: &str) -> Option<Self> {
+        if value.len() != 32 {
+            return None;
+        }
+        let mut bytes = [0u8; 16];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        Some(Self(bytes))
+    }
 }
 
 #[must_use]

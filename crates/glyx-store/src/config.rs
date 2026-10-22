@@ -53,6 +53,13 @@ pub struct RecentItem {
     pub at_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceLabel {
+    pub vault_id: Uuid,
+    pub device: String,
+    pub label: String,
+}
+
 pub const MAX_RECENTS: usize = 20;
 
 fn default_ttl() -> u64 {
@@ -81,6 +88,8 @@ pub struct AppConfig {
     pub vaults: Vec<VaultEntry>,
     #[serde(default)]
     pub recent_items: Vec<RecentItem>,
+    #[serde(default)]
+    pub device_labels: Vec<DeviceLabel>,
 }
 
 impl Default for AppConfig {
@@ -94,6 +103,7 @@ impl Default for AppConfig {
             current_vault: None,
             vaults: Vec::new(),
             recent_items: Vec::new(),
+            device_labels: Vec::new(),
         }
     }
 }
@@ -186,6 +196,30 @@ impl AppConfig {
             .filter(|recent| &recent.vault_id == vault_id)
             .cloned()
             .collect()
+    }
+
+    #[must_use]
+    pub fn device_label(&self, vault_id: &Uuid, device: &str) -> Option<&str> {
+        self.device_labels
+            .iter()
+            .find(|entry| &entry.vault_id == vault_id && entry.device == device)
+            .map(|entry| entry.label.as_str())
+    }
+
+    pub fn set_device_label(&mut self, vault_id: Uuid, device: String, label: String) {
+        if let Some(entry) = self
+            .device_labels
+            .iter_mut()
+            .find(|entry| entry.vault_id == vault_id && entry.device == device)
+        {
+            entry.label = label;
+        } else {
+            self.device_labels.push(DeviceLabel {
+                vault_id,
+                device,
+                label,
+            });
+        }
     }
 
     pub fn remove(&mut self, path: &Path) {

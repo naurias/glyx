@@ -304,7 +304,7 @@ fn normalize_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_lowercase()
 }
 
-fn type_label(item_type: glyx_core::ItemType) -> &'static str {
+pub(crate) fn type_label(item_type: glyx_core::ItemType) -> &'static str {
     match item_type {
         glyx_core::ItemType::Login => "login",
         glyx_core::ItemType::Passkey => "passkey",
@@ -2365,6 +2365,31 @@ mod m57_library_tests {
             3
         );
         assert!(uv.list(false).expect("list").is_empty());
+    }
+
+    #[test]
+    fn health_flags_weak_reused_and_old_passwords() {
+        let (_dir, a, _b) = two_vaults();
+        let vault = Vault::open(&a).expect("open");
+        let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+        let first = m1_item(&mut uv, "One", &[("password", "short")]);
+        uv.put_item(&first).expect("put");
+        let mut second = m1_item(&mut uv, "Two", &[("password", "short")]);
+        second
+            .fields
+            .get_mut("password")
+            .expect("field")
+            .field_hlc
+            .wall_ms = 1;
+        uv.put_item(&second).expect("put");
+        let report = uv.health(12, 365).expect("health");
+        assert_eq!(report.summary.items, 2);
+        assert_eq!(report.summary.weak, 2);
+        assert_eq!(report.summary.reused, 2);
+        assert_eq!(report.summary.old, 1);
+        assert_eq!(report.summary.no_totp, 2);
+        let json = serde_json::to_string(&report).expect("json");
+        assert!(!json.contains("short"));
     }
 
     #[test]

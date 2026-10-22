@@ -10,6 +10,7 @@ use tauri::{App, AppHandle, Manager as _};
 
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_deep_link::DeepLinkExt as _;
+use tauri_plugin_dialog::DialogExt as _;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt as _, Shortcut};
 use tauri_plugin_notification::NotificationExt as _;
 
@@ -73,6 +74,52 @@ fn save_settings(settings: &DesktopSettings) -> Result<(), String> {
     glyx_store::vault::atomic_write(&path, &bytes).map_err(|e| e.to_string())
 }
 
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+fn desktop_pick_folder(app: AppHandle, title: Option<String>) -> Option<String> {
+    let mut dialog = app.dialog().file();
+    if let Some(title) = title {
+        dialog = dialog.set_title(title);
+    }
+    dialog
+        .blocking_pick_folder()
+        .and_then(|path| path.into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+fn desktop_pick_save(
+    app: AppHandle,
+    title: Option<String>,
+    file_name: Option<String>,
+) -> Option<String> {
+    let mut dialog = app.dialog().file();
+    if let Some(title) = title {
+        dialog = dialog.set_title(title);
+    }
+    if let Some(file_name) = file_name {
+        dialog = dialog.set_file_name(file_name);
+    }
+    dialog
+        .blocking_save_file()
+        .and_then(|path| path.into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+fn desktop_pick_file(app: AppHandle, title: Option<String>) -> Option<String> {
+    let mut dialog = app.dialog().file();
+    if let Some(title) = title {
+        dialog = dialog.set_title(title);
+    }
+    dialog
+        .blocking_pick_file()
+        .and_then(|path| path.into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 pub fn configure(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
     builder
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
@@ -87,6 +134,7 @@ pub fn configure(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::W
             Some(vec!["--minimized"]),
         ))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -103,7 +151,11 @@ pub fn configure(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::W
         )
         .invoke_handler(tauri::generate_handler![
             desktop_settings_get,
-            desktop_settings_set
+            desktop_settings_set,
+            crate::desktop_bootstrap,
+            desktop_pick_folder,
+            desktop_pick_file,
+            desktop_pick_save
         ])
 }
 

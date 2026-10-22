@@ -87,6 +87,16 @@ enum Cmd {
     Gen {
         #[arg(long, default_value_t = 24, help = "Length")]
         length: usize,
+        #[arg(long, help = "Exclude lowercase letters")]
+        no_lower: bool,
+        #[arg(long, help = "Exclude uppercase letters")]
+        no_upper: bool,
+        #[arg(long, help = "Exclude digits")]
+        no_digits: bool,
+        #[arg(long, help = "Exclude symbols")]
+        no_symbols: bool,
+        #[arg(long, help = "Allow visually ambiguous characters")]
+        allow_ambiguous: bool,
     },
     #[command(about = "Encrypted vault attachments")]
     Blob {
@@ -120,6 +130,27 @@ enum Cmd {
     Bulk {
         #[command(subcommand)]
         cmd: BulkCmd,
+    },
+    #[command(about = "Known devices, labels, and last activity")]
+    Devices {
+        #[command(subcommand)]
+        cmd: Option<DeviceCmd>,
+    },
+    #[command(about = "Password health report")]
+    Health {
+        #[arg(long, default_value_t = 12, help = "Minimum password length")]
+        min_length: usize,
+        #[arg(long, default_value_t = 365, help = "Maximum password age in days")]
+        max_age_days: u64,
+    },
+    #[command(about = "Local audit log")]
+    Audit {
+        #[arg(long, default_value_t = 50, help = "Number of events")]
+        limit: usize,
+        #[arg(long, default_value_t = 0, help = "Skip events")]
+        offset: usize,
+        #[arg(long, help = "Filter by event name")]
+        event: Option<String>,
     },
     #[command(about = "Show item history")]
     History {
@@ -555,6 +586,17 @@ enum CipherOpt {
     Aesgcm,
 }
 
+#[derive(Debug, Subcommand)]
+enum DeviceCmd {
+    #[command(about = "Set a local device label")]
+    Label {
+        #[arg(help = "Device id, id prefix, or 'this'")]
+        device: String,
+        #[arg(help = "New label")]
+        label: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SortKey {
     #[value(help = "Last updated")]
@@ -780,7 +822,22 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             reveal,
             render,
         } => cmd_show(ctx, &query, reveal, render),
-        Cmd::Gen { length } => cmd_gen(ctx, length),
+        Cmd::Gen {
+            length,
+            no_lower,
+            no_upper,
+            no_digits,
+            no_symbols,
+            allow_ambiguous,
+        } => cmd_gen(
+            ctx,
+            length,
+            no_lower,
+            no_upper,
+            no_digits,
+            no_symbols,
+            allow_ambiguous,
+        ),
         Cmd::Blob { cmd } => cmd_blob(ctx, cmd),
         cmd @ (Cmd::Favorite { .. }
         | Cmd::Recents
@@ -788,7 +845,10 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
         | Cmd::Tag { .. }
         | Cmd::Folder { .. }
         | Cmd::Duplicates
-        | Cmd::Bulk { .. }) => dispatch_library(ctx, cmd),
+        | Cmd::Bulk { .. }
+        | Cmd::Devices { .. }
+        | Cmd::Health { .. }
+        | Cmd::Audit { .. }) => dispatch_library(ctx, cmd),
         Cmd::History {
             query,
             show,
@@ -922,6 +982,9 @@ fn dispatch_grouped(ctx: &Ctx, cmd: Cmd) -> Result<()> {
         | Cmd::Folder { .. }
         | Cmd::Duplicates
         | Cmd::Bulk { .. }
+        | Cmd::Devices { .. }
+        | Cmd::Health { .. }
+        | Cmd::Audit { .. }
         | Cmd::History { .. }
         | Cmd::Restore { .. }
         | Cmd::Add { .. }
@@ -1565,8 +1628,139 @@ fn dispatch_library(ctx: &Ctx, cmd: Cmd) -> Result<()> {
         Cmd::Folder { cmd } => cmd_folder(ctx, cmd),
         Cmd::Duplicates => cmd_duplicates(ctx),
         Cmd::Bulk { cmd } => cmd_bulk(ctx, cmd),
+        Cmd::Devices { cmd } => cmd_devices(ctx, cmd),
+        Cmd::Health {
+            min_length,
+            max_age_days,
+        } => cmd_health(ctx, min_length, max_age_days),
+        Cmd::Audit {
+            limit,
+            offset,
+            event,
+        } => cmd_audit(ctx, limit, offset, event.as_deref()),
         _ => unreachable!("not a library command"),
     }
+}
+
+fn cmd_devices(ctx: &Ctx, cmd: Option<DeviceCmd>) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    if let Some(DeviceCmd::Label { device, label }) = cmd {
+        let devices = uv.devices()?;
+        let target = if device == "this" {
+            devices.iter().find(|d| d.current)
+        } else {
+            devices
+                .iter()
+                .find(|d| d.id == device || d.id.starts_with(&device))
+        };
+        let Some(target) = target else {
+            bail!("device not found");
+        };
+        let mut cfg = glyx_store::config::load();
+        cfg.set_device_label(uv.config().vault_id, target.id.clone(), label.clone());
+        glyx_store::config::save(&cfg)?;
+        let _ = glyx_store::audit::append(
+            uv.config().vault_id,
+            &uv.device_node().to_hex(),
+            "device_label",
+            None,
+            None,
+            Some("success"),
+            Some(&format!("{} -> {label}", target.id)),
+        );
+        println!("labeled {} as {label}", &target.id[..8]);
+        return Ok(());
+    }
+    let devices = uv.devices()?;
+    if ctx.json {
+        println!("{}", serde_json::to_string_pretty(&devices)?);
+    } else {
+        for device in devices {
+            println!(
+                "{} {}{} {}",
+                &device.id[..8],
+                if device.current { "* " } else { "" },
+                device.label,
+                if device.last_seen_ms > 0 {
+                    format!("last seen {}", device.last_seen_ms)
+                } else {
+                    String::new()
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_health(ctx: &Ctx, min_length: usize, max_age_days: u64) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    let report = uv.health(min_length, max_age_days)?;
+    if ctx.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "items {} | weak {} | reused {} | old {} | no TOTP {}",
+            report.summary.items,
+            report.summary.weak,
+            report.summary.reused,
+            report.summary.old,
+            report.summary.no_totp
+        );
+        for issue in &report.issues {
+            println!(
+                "{} {} [{}]",
+                &issue.id.as_simple().to_string()[..8],
+                issue.name,
+                issue.issues.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_audit(ctx: &Ctx, limit: usize, offset: usize, event: Option<&str>) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    let events = glyx_store::audit::list(&uv.config().vault_id, limit, offset, event)?;
+    if ctx.json {
+        println!("{}", serde_json::to_string_pretty(&events)?);
+    } else if events.is_empty() {
+        println!("no audit events");
+    } else {
+        for event in events {
+            println!(
+                "{} {} {}{}{}",
+                event.ts_ms,
+                event.event,
+                event.outcome.unwrap_or_default(),
+                event
+                    .item_id
+                    .map(|id| format!(" {}", &id.as_simple().to_string()[..8]))
+                    .unwrap_or_default(),
+                event
+                    .field
+                    .map(|field| format!(" {field}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cli_audit(
+    uv: &glyx_store::UnlockedVault,
+    event: &str,
+    item: Option<uuid::Uuid>,
+    field: Option<&str>,
+) {
+    let _ = glyx_store::audit::append(
+        uv.config().vault_id,
+        &uv.device_node().to_hex(),
+        event,
+        item,
+        field,
+        Some("success"),
+        None,
+    );
 }
 
 fn cmd_favorite(ctx: &Ctx, query: &str, off: bool) -> Result<()> {
@@ -1779,12 +1973,33 @@ fn cmd_bulk(ctx: &Ctx, cmd: BulkCmd) -> Result<()> {
     Ok(())
 }
 
-fn cmd_gen(ctx: &Ctx, length: usize) -> Result<()> {
-    let password = glyx_crypto::pass::generate_password(length)?;
+#[allow(clippy::fn_params_excessive_bools)]
+fn cmd_gen(
+    ctx: &Ctx,
+    length: usize,
+    no_lower: bool,
+    no_upper: bool,
+    no_digits: bool,
+    no_symbols: bool,
+    allow_ambiguous: bool,
+) -> Result<()> {
+    let options = glyx_crypto::pass::PasswordOptions {
+        length,
+        lowercase: !no_lower,
+        uppercase: !no_upper,
+        digits: !no_digits,
+        symbols: !no_symbols,
+        exclude_ambiguous: !allow_ambiguous,
+    };
+    let password = glyx_crypto::pass::generate_with_options(options)?;
     if ctx.json {
         println!(
             "{}",
-            serde_json::json!({"password": password, "length": length})
+            serde_json::json!({
+                "password": password,
+                "length": length,
+                "entropy_bits": glyx_crypto::pass::password_entropy_bits(&options)
+            })
         );
     } else {
         println!("{password}");
@@ -1888,6 +2103,9 @@ fn cmd_history(
     let item = items::resolve_query(&uv, query)?;
     if let Some(file) = show {
         let history = uv.history_item(&item.id, file)?;
+        if reveal {
+            cli_audit(&uv, "item_reveal", Some(item.id), Some("history"));
+        }
         if ctx.json {
             println!(
                 "{}",
@@ -1987,6 +2205,7 @@ fn cmd_restore(ctx: &Ctx, query: &str, rev: Option<u64>, file: Option<&str>) -> 
             .with_context(|| format!("no history revision {rev}"))?
     };
     let restored = uv.restore_history(&item.id, &file)?;
+    cli_audit(&uv, "item_restore", Some(restored.id), None);
     if ctx.json {
         println!(
             "{}",
@@ -2007,6 +2226,9 @@ fn cmd_show(ctx: &Ctx, query: &str, reveal: bool, render: bool) -> Result<()> {
     let uv = ctx.unlocked()?;
     let item = items::resolve_query(&uv, query)?;
     let _ = glyx_store::config::note_recent(uv.config().vault_id, item.id);
+    if reveal {
+        cli_audit(&uv, "item_reveal", Some(item.id), None);
+    }
     if render {
         let body = glyx_store::present::note_rendered(&uv, &item, reveal)?;
         if ctx.json {
@@ -2106,6 +2328,7 @@ fn cmd_add(ctx: &Ctx, input: AddInput) -> Result<()> {
     )?;
     let id = item.id;
     uv.put_item(&item)?;
+    cli_audit(&uv, "item_create", Some(id), None);
     if ctx.json {
         println!("{}", serde_json::json!({"ok": true, "id": id}));
     } else {
@@ -2178,6 +2401,7 @@ fn cmd_edit(ctx: &Ctx, input: EditInput) -> Result<()> {
         || !remove_tag.is_empty();
     if changed {
         uv.put_item(&item)?;
+        cli_audit(&uv, "item_edit", Some(item.id), None);
     }
     if ctx.json {
         println!(
@@ -2195,6 +2419,7 @@ fn cmd_rm(ctx: &Ctx, query: &str) -> Result<()> {
     let item = items::resolve_query(&uv, query)?;
     let id = item.id;
     uv.delete_item(&id)?;
+    cli_audit(&uv, "item_delete", Some(id), None);
     if ctx.json {
         println!("{}", serde_json::json!({"ok": true, "id": id}));
     } else {
@@ -2261,6 +2486,7 @@ fn cmd_totp(ctx: &Ctx, query: &str) -> Result<()> {
     let item = items::resolve_query(&uv, query)?;
     let params = items::totp_params(&item)?;
     let code = glyx_crypto::totp::generate_code(&params)?;
+    cli_audit(&uv, "totp", Some(item.id), None);
     if ctx.json {
         println!(
             "{}",

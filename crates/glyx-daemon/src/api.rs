@@ -88,6 +88,25 @@ fn hex16(bytes: &[u8; 16]) -> String {
     out
 }
 
+fn audit(
+    uv: &glyx_store::UnlockedVault,
+    event: &str,
+    item: Option<uuid::Uuid>,
+    field: Option<&str>,
+    outcome: &str,
+    detail: Option<&str>,
+) {
+    let _ = glyx_store::audit::append(
+        uv.config().vault_id,
+        &uv.device_node().to_hex(),
+        event,
+        item,
+        field,
+        Some(outcome),
+        detail,
+    );
+}
+
 fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
@@ -146,6 +165,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(ui_index))
         .fallback(ui_fallback)
         .route("/v1/health", get(health))
+        .route("/v1/health/report", get(health_report))
+        .route("/v1/devices", get(devices))
+        .route("/v1/devices/label", post(set_device_label))
+        .route("/v1/audit", get(audit_log))
+        .route("/v1/generate", post(generate_password))
         .route("/v1/templates", get(list_templates))
         .route("/v1/status", get(status))
         .route(
@@ -324,6 +348,7 @@ struct UnlockBody {
     materialize: Option<bool>,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn unlock(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UnlockBody>,
@@ -342,6 +367,11 @@ async fn unlock(
         Err(e) => return store_error(&e).into_response(),
     };
     let vault_id = vault.config().vault_id;
+    let device_hex = vault
+        .device_id()
+        .ok()
+        .map(glyx_core::DeviceId::to_hex)
+        .unwrap_or_default();
     let keyfile_required = vault.keyfile_required();
     let via_pin = body.pin.is_some();
     let new_pin = body.new_pin.clone();
@@ -373,6 +403,7 @@ async fn unlock(
     .await;
     match result {
         Ok(Ok(mut uv)) => {
+            audit(&uv, "unlock", None, None, "success", None);
             let cfg = glyx_store::config::load();
             if !via_pin {
                 if let Some(pin) = new_pin.as_deref() {
@@ -416,7 +447,18 @@ async fn unlock(
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(uv);
             Json(serde_json::json!({"ok": true})).into_response()
         }
-        Ok(Err(e)) => store_error(&e).into_response(),
+        Ok(Err(e)) => {
+            let _ = glyx_store::audit::append(
+                vault_id,
+                &device_hex,
+                "unlock",
+                None,
+                None,
+                Some("failed"),
+                None,
+            );
+            store_error(&e).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -453,6 +495,7 @@ fn do_lock(state: &AppState) {
         .take();
     stop_agent_socket(state);
     if let Some(uv) = taken.as_ref() {
+        audit(uv, "lock", None, None, "success", None);
         release_vault(uv);
     }
 }
@@ -816,6 +859,140 @@ async fn recents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 #[derive(Deserialize)]
+struct HealthQuery {
+    min_length: Option<usize>,
+    max_age_days: Option<u64>,
+}
+
+async fn health_report(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HealthQuery>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    match uv.health(q.min_length.unwrap_or(12), q.max_age_days.unwrap_or(365)) {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+async fn devices(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    match uv.devices() {
+        Ok(devices) => Json(serde_json::json!({"devices": devices})).into_response(),
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeviceLabelBody {
+    id: String,
+    label: String,
+}
+
+async fn set_device_label(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DeviceLabelBody>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let Some(device) = glyx_core::DeviceId::from_hex(&body.id) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "bad device id"})),
+        )
+            .into_response();
+    };
+    let mut cfg = glyx_store::config::load();
+    cfg.set_device_label(uv.config().vault_id, body.id.clone(), body.label.clone());
+    if let Err(e) = glyx_store::config::save(&cfg) {
+        return store_error(&e).into_response();
+    }
+    let _ = glyx_store::audit::append(
+        uv.config().vault_id,
+        &uv.device_node().to_hex(),
+        "device_label",
+        None,
+        None,
+        Some("success"),
+        Some(&format!("{device:?} -> {}", body.label)),
+    );
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    event: Option<String>,
+}
+
+async fn audit_log(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<AuditQuery>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let total = match glyx_store::audit::count(&uv.config().vault_id, q.event.as_deref()) {
+        Ok(total) => total,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    match glyx_store::audit::list(
+        &uv.config().vault_id,
+        q.limit.unwrap_or(100),
+        q.offset.unwrap_or(0),
+        q.event.as_deref(),
+    ) {
+        Ok(events) => {
+            let mut response = Json(serde_json::json!({"events": events})).into_response();
+            if let Ok(value) = HeaderValue::from_str(&total.to_string()) {
+                response.headers_mut().insert("x-total-count", value);
+            }
+            response
+        }
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+async fn generate_password(
+    Json(options): Json<glyx_crypto::pass::PasswordOptions>,
+) -> impl IntoResponse {
+    match glyx_crypto::pass::generate_with_options(options) {
+        Ok(password) => Json(serde_json::json!({
+            "password": password,
+            "entropy_bits": glyx_crypto::pass::password_entropy_bits(&options),
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 struct RevealQuery {
     reveal: Option<bool>,
 }
@@ -835,6 +1012,9 @@ async fn show_item(
     match uv.resolve(&id) {
         Ok(item) => {
             let _ = glyx_store::config::note_recent(uv.config().vault_id, item.id);
+            if q.reveal.unwrap_or(false) {
+                audit(uv, "item_reveal", Some(item.id), None, "success", None);
+            }
             Json(glyx_store::present::item_json(
                 &item,
                 q.reveal.unwrap_or(false),
@@ -859,6 +1039,16 @@ async fn rendered_item(
     };
     match uv.resolve(&id) {
         Ok(item) => {
+            if q.reveal.unwrap_or(false) {
+                audit(
+                    uv,
+                    "item_reveal",
+                    Some(item.id),
+                    Some("body"),
+                    "success",
+                    None,
+                );
+            }
             match glyx_store::present::note_rendered(uv, &item, q.reveal.unwrap_or(false)) {
                 Ok(body) => Json(serde_json::json!({
                     "id": item.id,
@@ -950,7 +1140,10 @@ async fn create_item(
         Ok(item) => {
             let id = item.id;
             match uv.put_item(&item) {
-                Ok(()) => Json(serde_json::json!({"ok": true, "id": id})).into_response(),
+                Ok(()) => {
+                    audit(uv, "item_create", Some(id), None, "success", None);
+                    Json(serde_json::json!({"ok": true, "id": id})).into_response()
+                }
                 Err(e) => store_error(&e).into_response(),
             }
         }
@@ -1010,6 +1203,7 @@ async fn edit_item(
         if let Err(e) = uv.put_item(&item) {
             return store_error(&e).into_response();
         }
+        audit(uv, "item_edit", Some(item.id), None, "success", None);
     }
     Json(serde_json::json!({"ok": true, "id": item.id, "rev": item.rev})).into_response()
 }
@@ -1030,7 +1224,10 @@ async fn delete_item(
         Err(e) => return store_error(&e).into_response(),
     };
     match uv.delete_item(&item.id) {
-        Ok(_) => Json(serde_json::json!({"ok": true, "id": item.id})).into_response(),
+        Ok(_) => {
+            audit(uv, "item_delete", Some(item.id), None, "success", None);
+            Json(serde_json::json!({"ok": true, "id": item.id})).into_response()
+        }
         Err(e) => store_error(&e).into_response(),
     }
 }
@@ -1055,7 +1252,10 @@ async fn totp_code(
         Err(e) => return store_error(&e).into_response(),
     };
     match glyx_crypto::totp::generate_code(&params) {
-        Ok(code) => Json(serde_json::json!({"code": code, "period": params.step})).into_response(),
+        Ok(code) => {
+            audit(uv, "totp", Some(item.id), None, "success", None);
+            Json(serde_json::json!({"code": code, "period": params.step})).into_response()
+        }
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -1204,6 +1404,14 @@ async fn sync(State(state): State<Arc<AppState>>, Json(body): Json<SyncBody>) ->
         }
         Err(e) => return store_error(&e).into_response(),
     }
+    audit(
+        uv,
+        "sync",
+        None,
+        None,
+        "success",
+        Some(&format!("merged={merged} conflicts={conflicts}")),
+    );
     Json(serde_json::json!({
         "healed": heal.healed,
         "adopted": adopted,
@@ -1351,7 +1559,17 @@ async fn gc(State(state): State<Arc<AppState>>, Json(body): Json<GcBody>) -> imp
         return Json(serde_json::json!({"ids": ids})).into_response();
     }
     match uv.gc_tombstones(window) {
-        Ok(ids) => Json(serde_json::json!({"ids": ids})).into_response(),
+        Ok(ids) => {
+            audit(
+                uv,
+                "gc",
+                None,
+                None,
+                "success",
+                Some(&format!("purged={}", ids.len())),
+            );
+            Json(serde_json::json!({"ids": ids})).into_response()
+        }
         Err(e) => store_error(&e).into_response(),
     }
 }
@@ -2786,6 +3004,14 @@ async fn fill_item(
     };
     let value = field_value.value.expose().to_owned();
     let timeout = body.timeout.unwrap_or(15);
+    audit(
+        uv,
+        "field_copy",
+        Some(item.id),
+        Some(&field),
+        "success",
+        None,
+    );
     drop(guard);
     if glyx_autofill::clipboard::copy(&value).is_err() {
         return (
@@ -3655,7 +3881,7 @@ mod tests {
         let (status, body) = call(
             state.clone(),
             "PATCH",
-            &format!("/v1/items/{}", ids[0]),
+            &format!("/v1/items/{}?reveal=true", ids[0]),
             Some(serde_json::json!({"favorite": true})),
             "test-token",
         )
@@ -3727,7 +3953,7 @@ mod tests {
         let (status, _) = call(
             state.clone(),
             "GET",
-            &format!("/v1/items/{}", ids[0]),
+            &format!("/v1/items/{}?reveal=true", ids[0]),
             None,
             "test-token",
         )
@@ -3747,5 +3973,59 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["affected"], serde_json::json!(2));
+
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            "/v1/health/report",
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["summary"]["weak"].as_u64().is_some(), "{body}");
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/generate",
+            Some(serde_json::json!({
+                "length": 20, "lowercase": true, "uppercase": true,
+                "digits": true, "symbols": true, "exclude_ambiguous": true
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["password"].as_str().map(str::len), Some(20));
+
+        let (status, body) = call(state.clone(), "GET", "/v1/devices", None, "test-token").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let device = body["devices"][0]["id"]
+            .as_str()
+            .expect("device")
+            .to_owned();
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/devices/label",
+            Some(serde_json::json!({"id": device, "label": "Laptop"})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            "/v1/audit?event=item_reveal",
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["events"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty()));
     }
 }
