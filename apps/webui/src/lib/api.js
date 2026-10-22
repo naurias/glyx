@@ -1,5 +1,6 @@
 let base = '';
 let token = '';
+let bootError = '';
 
 export function configure(url, tok) {
   base = url.replace(/\/$/, '');
@@ -13,9 +14,61 @@ export function configured() {
 export function bootstrapDesktop() {
   if (typeof window !== 'undefined' && window.__GLYX__) {
     configure(window.__GLYX__.url, window.__GLYX__.token);
+    bootError = '';
     return true;
   }
+  if (typeof window !== 'undefined' && window.__GLYX_BOOT__?.error) {
+    bootError = window.__GLYX_BOOT__.error;
+  }
   return false;
+}
+
+export function bootstrapError() {
+  return bootError;
+}
+
+export async function retryDesktopBootstrap() {
+  if (typeof window === 'undefined' || !window.__TAURI__?.core?.invoke) {
+    return configured();
+  }
+  try {
+    const info = await window.__TAURI__.core.invoke('desktop_bootstrap');
+    if (info.url && info.token) {
+      configure(info.url, info.token);
+      bootError = '';
+      return true;
+    }
+    bootError = info.error || 'daemon did not start';
+  } catch (e) {
+    bootError = e.message || String(e);
+  }
+  return false;
+}
+
+export async function pickFolder(title = 'Choose folder') {
+  if (typeof window !== 'undefined' && window.__TAURI__?.core?.invoke) {
+    return (await window.__TAURI__.core.invoke('desktop_pick_folder', { title })) || '';
+  }
+  return prompt(title) || '';
+}
+
+export async function pickFile(title = 'Choose file') {
+  if (typeof window !== 'undefined' && window.__TAURI__?.core?.invoke) {
+    return (await window.__TAURI__.core.invoke('desktop_pick_file', { title })) || '';
+  }
+  return prompt(title) || '';
+}
+
+export async function pickSave(title = 'Choose file', fileName = '') {
+  if (typeof window !== 'undefined' && window.__TAURI__?.core?.invoke) {
+    return (
+      (await window.__TAURI__.core.invoke('desktop_pick_save', {
+        title,
+        fileName: fileName || undefined
+      })) || ''
+    );
+  }
+  return prompt(title) || '';
 }
 
 async function reqPage(method, path) {
@@ -58,6 +111,17 @@ export const api = {
     return reqPage('GET', '/v1/items' + (q ? `?${q}` : ''));
   },
   bulk: (body) => req('POST', '/v1/items/bulk', body),
+  devices: () => req('GET', '/v1/devices'),
+  labelDevice: (id, label) => req('POST', '/v1/devices/label', { id, label }),
+  health: (params = {}) => {
+    const q = new URLSearchParams(params).toString();
+    return req('GET', '/v1/health/report' + (q ? `?${q}` : ''));
+  },
+  audit: (params = {}) => {
+    const q = new URLSearchParams(params).toString();
+    return reqPage('GET', '/v1/audit' + (q ? `?${q}` : ''));
+  },
+  generate: (options) => req('POST', '/v1/generate', options),
   library: () => req('GET', '/v1/library'),
   renameTag: (from, to) => req('POST', '/v1/library/tags/rename', { from, to }),
   deleteTag: (name) => req('POST', '/v1/library/tags/delete', { name }),

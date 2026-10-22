@@ -197,6 +197,10 @@
   <a href="/add">Add</a>
   <a href="/conflicts">Conflicts</a>
   <a href="/exports">Exports</a>
+  <a href="/health">Health</a>
+  <a href="/audit">Audit</a>
+  <a href="/devices">Devices</a>
+  <a href="/generator">Generator</a>
   <a href="/settings">Settings</a>
   <a href="/onboarding">Vaults</a>
   <span style="flex: 1"></span>

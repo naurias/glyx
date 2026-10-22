@@ -1,5 +1,12 @@
 <script>
-  import { api, configure, configured, bootstrapDesktop } from '$lib/api.js';
+  import {
+    api,
+    configure,
+    configured,
+    bootstrapDesktop,
+    bootstrapError,
+    retryDesktopBootstrap
+  } from '$lib/api.js';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
   let url = 'http://127.0.0.1:8080';
@@ -17,6 +24,8 @@
   let desktop = false;
   let needsKeyfile = true;
   let vaultLabel = '';
+  let booting = false;
+  let bootError = '';
 
   async function loadStatus() {
     const st = await api.status();
@@ -33,13 +42,43 @@
     return true;
   }
 
-  onMount(async () => {
+  async function ensureDesktop() {
     desktop = bootstrapDesktop();
-    if (desktop) {
+    bootError = bootstrapError();
+    if (!configured() && window.__TAURI__?.core?.invoke) {
+      booting = true;
+      const ok = await retryDesktopBootstrap();
+      booting = false;
+      desktop = ok;
+      bootError = ok ? '' : bootstrapError();
+    }
+    return configured();
+  }
+
+  async function retry() {
+    error = '';
+    bootError = '';
+    booting = true;
+    const ok = await retryDesktopBootstrap();
+    booting = false;
+    desktop = ok;
+    if (!ok) {
+      bootError = bootstrapError() || 'daemon did not start';
+      return;
+    }
+    try {
+      await loadStatus();
+    } catch (e) {
+      bootError = e.message;
+    }
+  }
+
+  onMount(async () => {
+    if (await ensureDesktop()) {
       try {
         await loadStatus();
       } catch (e) {
-        error = e.message;
+        bootError = e.message;
       }
     }
   });
@@ -82,12 +121,24 @@
   <h1>glyx</h1>
   <p class="dim">Local-first password manager. The daemon holds your vault; this page keeps secrets in memory only.</p>
   {#if error}<p style="color: var(--danger)">{error}</p>{/if}
-  {#if desktop}
+  {#if booting}
+    <p class="dim">Starting the glyx daemon...</p>
+  {:else if bootError}
+    <div class="card">
+      <p style="color: var(--danger)">Could not start the glyx daemon.</p>
+      <p class="dim">{bootError}</p>
+      <div class="row">
+        <button class="primary" on:click={retry}>Retry</button>
+        <button on:click={goOnboarding}>Vaults...</button>
+      </div>
+    </div>
+  {:else if desktop}
     {#if vaultLabel}<p class="dim">Vault: <code>{vaultLabel}</code></p>{/if}
   {:else}
     <label>Daemon URL<input bind:value={url} placeholder="http://127.0.0.1:PORT" /></label>
     <label>Token<input bind:value={token} placeholder="from daemon-*.json" /></label>
   {/if}
+  {#if !booting && !bootError}
   <div class="row">
     <button class:selected={mode === 'password'} on:click={() => (mode = 'password')}>Password</button>
     <button class:selected={mode === 'pin'} on:click={() => (mode = 'pin')}>PIN</button>
@@ -130,6 +181,7 @@
     <button on:click={goOnboarding}>Vaults...</button>
   </div>
   {#if !desktop && !configured()}<p class="dim">Find the port and token in your runtime dir: <code>daemon-&lt;vault&gt;.json</code> (run <code>glyx daemon start</code>), or enter them to manage vaults.</p>{/if}
+  {/if}
 </main>
 
 <style>
