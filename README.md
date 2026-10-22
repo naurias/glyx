@@ -4,7 +4,7 @@ Local-first password manager for Linux, Windows, and Android. CLI, full-screen T
 
 Full feature guide for every frontend, with examples: **[docs.md](docs.md)**. The frontend capability summary is under **[Frontends at a glance](docs.md#frontends-at-a-glance)**.
 
-> Status: M5.7b complete. CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, encrypted attachments, item history reveal/compare/restore, safe backups, favorites/recents, tag and folder management, sorting/pagination, bulk actions, duplicate detection, and a polished Linux desktop (tray, deep links, autostart, notifications, persistent window state). M5.7c health/audit/generator follows; M6c Android is paused after the Tauri-mobile shell, scaffold, and debug APK (AutofillService and biometric unlock remain).
+> Status: M5.7c complete. CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, encrypted attachments, item history reveal/compare/restore, safe backups, favorites/recents, tag and folder management, sorting/pagination, bulk actions, duplicate detection, device labels, password health, a local audit log, a standalone generator, and a polished Linux desktop with no-vault onboarding (tray, deep links, autostart, notifications, persistent window state). M6c Android is paused after the Tauri-mobile shell, scaffold, and debug APK (AutofillService and biometric unlock remain).
 
 ## What glyx will do
 

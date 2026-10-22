@@ -23,6 +23,7 @@ This guide covers the user-facing frontends:
 | Web form fill | No | No | No | No | Planned | Yes | No |
 | SSH keys/agent | Yes | No | Partial | Inherited | Partial | No | No |
 | Favorites/recents/library/bulk/duplicates | Yes | No | Yes | Inherited | Inherited | No | No |
+| Devices/health/audit/generator | Yes | No | Yes | Inherited | Inherited | No | No |
 | Exports/injection | Yes | No | Yes | Inherited | Inherited | No | No |
 | Sync/conflicts/GC/doctor | Yes | No | Partial | Inherited | Inherited | No | No |
 | Desktop extras | No | No | No | Yes | No | No | No |
@@ -273,7 +274,12 @@ glyx bulk favorite --folder work
 glyx bulk add-tag important --folder work
 glyx bulk move-folder Archive --folder work
 glyx bulk delete --id old-login --yes
+glyx devices
+glyx devices label this Laptop
+glyx health --min-length 12 --max-age-days 365
+glyx audit --limit 50 --event item_reveal
 glyx gen --length 32
+glyx gen --length 20 --no-symbols --allow-ambiguous
 glyx show github
 glyx show github --reveal
 glyx show server --render
@@ -295,6 +301,8 @@ glyx rm github
 Tags and folders are metadata on each item. `tag rename`/`folder rename` rewrite every live item; `tag rm` removes the tag everywhere and `folder rm` moves its items to the root. `bulk` accepts repeatable `--id` selectors (id, prefix, or exact name) plus an optional `--folder` selector; the selectors combine. `bulk delete` requires `--yes`. `duplicates` groups live items by normalized name and by login URL + username, flags identical passwords without printing them, and never returns secret values.
 
 The WebUI items page mirrors this workflow: recents, star toggles, favorites filter, sort and pagination, folder/tag pickers, multi-select bulk actions, and a Library panel for renaming/deleting tags and folders. The duplicates page groups suspects and supports bulk deletion; it shows only whether passwords match, never the values.
+
+`devices` derives known devices from item, history, and conflict clocks. Last seen means the newest write activity observed in the vault, not online presence; labels are local to this device. `health` reports weak (`<12` chars or `<60` bits), reused, old (`>365` days), and missing-TOTP login items without printing secrets. `audit` reads the local append-only JSONL log; it records event IDs and field names only, never item names or values. `gen` supports class toggles and ambiguity control; the WebUI has `/devices`, `/health`, `/audit`, and `/generator` pages.
 
 `history` lists earlier revisions (newest first); `--show` previews one, `--compare` lists changed fields without printing values, and `restore` brings one back as a new revision, so past revisions are never rewritten. `gen` prints a standalone password and does not touch the vault.
 
@@ -621,6 +629,8 @@ Secrets are kept in memory only and never written to `localStorage`.
 ## 17. Desktop app
 
 `glyx-tauri` (or `nix run .#glyx-desktop`) starts the daemon for the selected vault, injects the URL and token into the WebView, and opens the GUI. It closes the daemon on exit by default.
+
+With no vault selected, the desktop opens onboarding instead of failing to connect: it lists known vaults and offers **Open existing vault**, **Create new vault**, and **Restore from backup**. Folder/keyfile/archive selection uses native dialogs on desktop and text paths in the browser WebUI. Creating a vault auto-unlocks it and opens the item list. If the external daemon cannot be started, the desktop falls back to an in-process daemon and shows a retryable error card instead of a blank connection error.
 
 Desktop behavior (Linux):
 
