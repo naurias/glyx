@@ -178,6 +178,8 @@
             "glyx-tauri"
             "--bin"
             "glyx-daemon"
+            "--features"
+            "glyx-tauri/custom-protocol"
           ];
           cargoTestFlags = [
             "-p"
