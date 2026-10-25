@@ -612,7 +612,7 @@ glyx daemon stop
 
 `daemon start` reuses a live daemon or starts one. It does not need a vault argument; it uses the selected vault, or starts empty for onboarding. `--idle-lock-min` overrides the persisted `idle_lock_min` setting for that daemon instance. The record is `daemon.json` in the runtime directory (port, pid, token, selected vault), readable only by you.
 
-The daemon serves the GUI on loopback with token auth. Open the printed URL, enter the token from `daemon.json`, and use the pages:
+The daemon serves the GUI on loopback. The static pages are public; every `/v1` API call requires the bearer token. Open the printed URL, enter the token from `daemon.json`, and use the pages:
 
 - `/` unlock with password, keyfile, or PIN, with an Advanced section for per-unlock TTL and materialization; when unlocking with a password you can also set a PIN
 - `/items` and `/items/<id>` browse, search, reveal, copy, edit, delete, TOTP, and restore history
@@ -631,6 +631,8 @@ Secrets are kept in memory only and never written to `localStorage`.
 `glyx-tauri` (or `nix run .#glyx-desktop`) starts the daemon for the selected vault, injects the URL and token into the WebView, and opens the GUI. It closes the daemon on exit by default.
 
 With no vault selected, the desktop opens onboarding instead of failing to connect: it lists known vaults and offers **Open existing vault**, **Create new vault**, and **Restore from backup**. Folder/keyfile/archive selection uses native dialogs on desktop and text paths in the browser WebUI. Creating a vault auto-unlocks it and opens the item list. If the external daemon cannot be started, the desktop falls back to an in-process daemon and shows a retryable error card instead of a blank connection error.
+
+On Hyprland, the desktop starts through XWayland (`GDK_BACKEND=x11`) because WebKitGTK/GTK3 can compute a corrupted viewport after a Wayland tile resize. Set `GDK_BACKEND=wayland` explicitly to opt out. The Nix package embeds the production WebUI; `cargo build -p glyx-tauri --features glyx-tauri/custom-protocol` does the same for local builds.
 
 Desktop behavior (Linux):
 
@@ -699,6 +701,8 @@ Runtime directory: `GLYX_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/glyx`, else a temp
 **"this vault requires a keyfile"**: pass `--keyfile`, or store the path when selecting the vault.
 
 **Daemon locked (409) in the GUI**: unlock on `/` or via `glyx unlock`.
+
+**Desktop window is blank or a one-character-wide column on Hyprland/Wayland**: this is a WebKitGTK/GTK3 Wayland resize bug. The app forces XWayland on Hyprland automatically; remove any `GDK_BACKEND=wayland` override if you set one.
 
 **TUI refuses to start**: another process (often the daemon) holds the vault open. Stop the daemon or use the GUI. The TUI opens the vault directly like other CLI commands.
 

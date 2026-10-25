@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::{middleware, Router};
@@ -14,6 +14,8 @@ use futures_util::StreamExt as _;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt as _;
 use tokio_util::io::ReaderStream;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+
 #[derive(Debug)]
 pub struct AppState {
     pub active: Mutex<Option<PathBuf>>,
@@ -160,10 +162,36 @@ fn store_error(e: &glyx_store::StoreError) -> (StatusCode, Json<serde_json::Valu
     (code, Json(serde_json::json!({"error": e.to_string()})))
 }
 
+fn cors_layer() -> CorsLayer {
+    let origins = [
+        "tauri://localhost",
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+    .into_iter()
+    .filter_map(|origin| origin.parse::<HeaderValue>().ok())
+    .collect::<Vec<_>>();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+        .expose_headers([
+            HeaderName::from_static("x-total-count"),
+            CONTENT_DISPOSITION,
+        ])
+        .max_age(std::time::Duration::from_secs(600))
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/", get(ui_index))
-        .fallback(ui_fallback)
+    let api = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/health/report", get(health_report))
         .route("/v1/devices", get(devices))
@@ -240,8 +268,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(agent_merge_preview).post(agent_merge_apply),
         )
         .route("/v1/ssh/env", get(ssh_env))
-        .layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth));
+    Router::new()
+        .route("/", get(ui_index))
+        .fallback(ui_fallback)
+        .merge(api)
         .with_state(state)
+        .layer(cors_layer())
 }
 
 #[derive(rust_embed::RustEmbed)]
@@ -3433,6 +3466,61 @@ mod tests {
         let (_d, state) = test_state();
         let (status, _) = call(state, "GET", "/v1/health", None, "wrong").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ui_is_public_and_cors_allows_tauri() {
+        let (_d, state) = test_state();
+        let app = router(state);
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("oneshot");
+        assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/status")
+                    .header("origin", "tauri://localhost")
+                    .header("access-control-request-method", "GET")
+                    .header("access-control-request-headers", "authorization")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("tauri://localhost")
+        );
+        assert!(res
+            .headers()
+            .get("access-control-allow-headers")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.to_ascii_lowercase().contains("authorization")));
+
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

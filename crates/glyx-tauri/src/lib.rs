@@ -12,6 +12,18 @@ static OWNED_DAEMON: AtomicBool = AtomicBool::new(false);
 #[cfg(not(mobile))]
 static EMBEDDED_DAEMON: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_os = "linux")]
+fn configure_linux_backend() {
+    if std::env::var_os("GDK_BACKEND").is_some()
+        || std::env::var_os("WAYLAND_DISPLAY").is_none()
+        || std::env::var_os("DISPLAY").is_none()
+        || std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none()
+    {
+        return;
+    }
+    std::env::set_var("GDK_BACKEND", "x11");
+}
+
 #[cfg(not(mobile))]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BootstrapInfo {
@@ -191,6 +203,8 @@ fn mobile_script() -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    configure_linux_backend();
     #[cfg(not(mobile))]
     let mut builder = desktop::configure(tauri::Builder::default());
     #[cfg(mobile)]

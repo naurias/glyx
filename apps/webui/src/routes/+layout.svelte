@@ -1,4 +1,5 @@
 <script>
+  import '../app.css';
   import { onMount } from 'svelte';
   import Quick from '$lib/Quick.svelte';
   import { api } from '$lib/api.js';
