@@ -83,6 +83,11 @@ enum Cmd {
         #[arg(long, help = "Render note refs to values")]
         render: bool,
     },
+    #[command(about = "Manage stored passkeys")]
+    Passkey {
+        #[command(subcommand)]
+        cmd: PasskeyCmd,
+    },
     #[command(about = "Generate a password")]
     Gen {
         #[arg(long, default_value_t = 24, help = "Length")]
@@ -368,6 +373,22 @@ enum ConfigCmd {
         key: String,
         #[arg(help = "New value")]
         value: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PasskeyCmd {
+    #[command(about = "List stored passkeys")]
+    Ls,
+    #[command(about = "Show passkey metadata")]
+    Show {
+        #[arg(help = "Id, id prefix, or exact name")]
+        query: String,
+    },
+    #[command(about = "Delete a passkey")]
+    Rm {
+        #[arg(help = "Id, id prefix, or exact name")]
+        query: String,
     },
 }
 
@@ -822,6 +843,7 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
             reveal,
             render,
         } => cmd_show(ctx, &query, reveal, render),
+        Cmd::Passkey { cmd } => dispatch_passkey(ctx, cmd),
         Cmd::Gen {
             length,
             no_lower,
@@ -992,6 +1014,7 @@ fn dispatch_grouped(ctx: &Ctx, cmd: Cmd) -> Result<()> {
         | Cmd::Rm { .. }
         | Cmd::Totp { .. }
         | Cmd::Fill { .. }
+        | Cmd::Passkey { .. }
         | Cmd::Tui => unreachable!("interactive commands handled in dispatch"),
     }
 }
@@ -2410,6 +2433,109 @@ fn cmd_edit(ctx: &Ctx, input: EditInput) -> Result<()> {
         );
     } else {
         println!("updated {} (rev {})", item.id, item.rev);
+    }
+    Ok(())
+}
+
+fn dispatch_passkey(ctx: &Ctx, cmd: PasskeyCmd) -> Result<()> {
+    match cmd {
+        PasskeyCmd::Ls => cmd_passkey_ls(ctx),
+        PasskeyCmd::Show { query } => cmd_passkey_show(ctx, &query),
+        PasskeyCmd::Rm { query } => cmd_passkey_rm(ctx, &query),
+    }
+}
+
+fn resolve_passkey(uv: &glyx_store::UnlockedVault, query: &str) -> Result<glyx_core::Item> {
+    if let Ok(item) = uv.resolve(query) {
+        if glyx_daemon::passkey::metadata(&item).is_some() {
+            return Ok(item);
+        }
+    }
+    let mut hits = Vec::new();
+    for row in uv.list(false)? {
+        if let Some(item) = uv.get_item(&row.id)? {
+            if let Some(meta) = glyx_daemon::passkey::metadata(&item) {
+                if meta.rp_id == query || meta.user_name == query || meta.name == query {
+                    hits.push(item);
+                }
+            }
+        }
+    }
+    match hits.len() {
+        0 => bail!("no passkey matching {query:?}"),
+        1 => Ok(hits.remove(0)),
+        count => bail!("{count} passkeys match {query:?}; use the item id"),
+    }
+}
+
+fn cmd_passkey_ls(ctx: &Ctx) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    let mut out = Vec::new();
+    for row in uv.list(false)? {
+        if let Some(item) = uv.get_item(&row.id)? {
+            if let Some(meta) = glyx_daemon::passkey::metadata(&item) {
+                out.push(meta);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.rp_name.cmp(&b.rp_name).then_with(|| a.name.cmp(&b.name)));
+    if ctx.json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else if out.is_empty() {
+        println!("no passkeys stored");
+    } else {
+        for item in out {
+            println!(
+                "{}  {}  {}  {}{}",
+                item.item_id,
+                item.rp_id,
+                item.user_name,
+                item.name,
+                if item.usable { "" } else { "  [missing key]" }
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_passkey_show(ctx: &Ctx, query: &str) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    let item = resolve_passkey(&uv, query)?;
+    let meta = glyx_daemon::passkey::metadata(&item).context("item is not a passkey")?;
+    if ctx.json {
+        println!("{}", serde_json::to_string_pretty(&meta)?);
+    } else {
+        println!("{} [passkey]", meta.name);
+        println!("id: {}", meta.item_id);
+        println!("relying_party: {}", meta.rp_id);
+        println!("rp_name: {}", meta.rp_name);
+        println!("user_name: {}", meta.user_name);
+        println!("display_name: {}", meta.display_name);
+        println!("credential_id: {}", meta.credential_id);
+        println!("algorithm: {}", meta.algorithm);
+        println!("sign_count: {}", meta.sign_count);
+        println!("aaguid: {}", meta.aaguid);
+        println!("transports: {}", meta.transports);
+        println!("discoverable: {}", meta.discoverable);
+        println!("backup_eligible: {}", meta.backup_eligible);
+        println!("backup_state: {}", meta.backup_state);
+        println!("created_ms: {}", meta.created_ms);
+        println!("last_used_ms: {}", meta.last_used_ms);
+        println!("usable: {}", meta.usable);
+    }
+    Ok(())
+}
+
+fn cmd_passkey_rm(ctx: &Ctx, query: &str) -> Result<()> {
+    let mut uv = ctx.unlocked()?;
+    let item = resolve_passkey(&uv, query)?;
+    let id = item.id;
+    uv.delete_item(&id)?;
+    cli_audit(&uv, "item_delete", Some(id), None);
+    if ctx.json {
+        println!("{}", serde_json::json!({"ok": true, "id": id}));
+    } else {
+        println!("deleted {id} (tombstone kept for sync)");
     }
     Ok(())
 }
