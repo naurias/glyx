@@ -21,6 +21,8 @@ This guide covers the user-facing frontends:
 | Notes/TOTP | Yes | Yes | Yes | Inherited | Inherited | Partial | No |
 | Clipboard copy | Yes | Partial | Partial | Inherited | No | No | No |
 | Web form fill | No | No | No | No | Autofill | Yes | No |
+| Passkey storage/management | Yes | Partial | Yes | Inherited | Inherited | No | No |
+| Passkey WebAuthn | No | No | Manage | Inherited | No | Chromium | No |
 | SSH keys/agent | Yes | No | Partial | Inherited | Partial | No | No |
 | Favorites/recents/library/bulk/duplicates | Yes | No | Yes | Inherited | Inherited | No | No |
 | Devices/health/audit/generator | Yes | No | Yes | Inherited | Inherited | No | No |
@@ -240,7 +242,7 @@ Supported types:
 | Type | Fields |
 |------|--------|
 | `login` | username, password, url, notes |
-| `passkey` | relying_party, user_handle, credential_id, private_key |
+| `passkey` | relying_party, user_handle, credential_id, private_key, plus optional RP/user metadata and sync flags |
 | `totp` | seed or `otpauth://` URI, period, digits |
 | `identity` | full_name, email, phone, address |
 | `card` | number, holder, expiry, cvc |
@@ -557,12 +559,60 @@ glyx extension status
 
 Load `apps/extension` in the browser. The popup searches items (ranking
 candidates by registrable domain), has a Fill button for username/password, a
-TOTP button, and a Lock button. Filling sets input values and dispatches
-`input`/`change` events; it never auto-submits a form.
+TOTP button, a Passkeys toggle, and a Lock button. Filling sets input values and
+dispatches `input`/`change` events; it never auto-submits a form. Passkeys need
+Chromium 115+ because the manifest declares `webAuthenticationProxy`; use a
+Chromium build for the passkey provider.
 
-The native host exposes only `status`, `search`, `fill`, `totp`, and `lock`.
-The extension cannot unlock the vault, create/edit/delete/reveal items, or
-manage vaults, exports, sync, or SSH.
+The native host exposes `status`, `search`, `fill`, `totp`, `lock`, and the
+passkey operations described below. The extension cannot unlock the vault,
+create/edit/delete/reveal regular items, or manage vaults, exports, sync, or
+SSH.
+
+### Passkeys
+
+Passkeys are stored as synced vault items. The Chromium extension is the desktop
+WebAuthn provider; Firefox and Safari do not provide an equivalent extension API.
+The WebUI, CLI, and desktop app manage passkey metadata but cannot answer
+WebAuthn requests themselves.
+
+1. Open the extension popup and enable **Passkeys**. This attaches the extension
+   as the active WebAuthn proxy. Only one extension can hold that role at a time.
+2. On a website's passkey registration screen, choose glyx when Chromium asks
+   where to save the passkey.
+3. Confirm the RP and account in the glyx passkey window. The daemon creates an
+   ES256 credential and stores it in the vault; the extension returns the
+   attestation to the site.
+4. On later sign-ins, choose the glyx passkey in Chromium's passkey picker and
+   confirm the account. The daemon signs the challenge.
+
+Passkeys are synced because they are normal vault items (`BE=1`, `BS=1`, sign
+count 0). A vault backup/restore carries them. The private key never leaves the
+daemon; the extension receives only the WebAuthn response.
+
+Known limits:
+
+- Chromium/Chrome only; Firefox and Safari passkeys are unsupported.
+- Cross-origin iframe requests fall back to the browser because Chrome does not
+  expose the iframe origin to the proxy.
+- Existing passkeys in Chrome, Google Password Manager, or Apple cannot be
+  imported; passkeys are non-exportable. glyx can only capture passkeys created
+  while it is the selected provider.
+- The extension confirmation counts as user verification for this milestone;
+  stronger re-authentication is a later hardening step.
+- Manage or delete passkeys from **Passkeys** in the WebUI/desktop app or
+  `glyx passkey ls|show|rm`. RP ID, credential ID, user handle, algorithm, and
+  private key are read-only.
+
+```sh
+glyx passkey ls
+glyx passkey show example.com
+glyx passkey rm example.com
+```
+
+A quick Chromium smoke test: load `apps/extension`, run `glyx extension install`,
+allow the extension ID, enable **Passkeys** in the popup, then register and sign
+in on a WebAuthn test RP. The passkey appears under **Passkeys** in the WebUI.
 
 ---
 
@@ -729,6 +779,9 @@ Runtime directory: `GLYX_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/glyx`, else a temp
 - Pointers are bound to their target path and fail closed if copied elsewhere.
 - The daemon listens on loopback only and requires a bearer token stored under `0600`.
 - The GUI keeps secrets in memory only. It never writes them to browser storage.
+- Passkey private keys stay in the daemon/vault. The extension receives only the
+  WebAuthn attestation or assertion; an explicit extension confirmation counts as
+  user verification in M6e.1.
 - Session files hold the data key under `0600` until the TTL expires. Use one-shot mode or short TTLs if that tradeoff is not acceptable.
 - Commit only locked forms (`__GLYXENC:...__` or `ENC[...]`), never unresolved values. Review files before committing.
 - Back up the vault and your keyfile separately. Without them, recovery is impossible by design.
@@ -761,6 +814,8 @@ Known limitations:
 - no lock-on-background yet
 - biometric unlock is not offered for keyfile-required vaults (the biometric
   secret cannot satisfy the keyfile requirement)
+- no Android passkey provider yet; `CredentialProviderService` is planned for
+  M6e.2 (Android 14+) and will stay separate from the password `AutofillService`
 - the browser extension and Git helper are desktop-only
 
 Build from the repository:
@@ -785,5 +840,5 @@ Runtime device verification is still pending because the build host has no
 attached emulator/device. The APK, Kotlin compilation, merged manifest, and Rust
 cross-check are verified.
 
-Next milestones: lock on background, SAF picker, safe areas/icons, and device
-smoke testing.
+Next milestones: Android passkeys (`CredentialProviderService`, M6e.2), lock on
+background, SAF picker, safe areas/icons, and device smoke testing.

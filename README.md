@@ -4,11 +4,11 @@ Local-first password manager for Linux, Windows, and Android. CLI, full-screen T
 
 Full feature guide for every frontend, with examples: **[docs.md](docs.md)**. The frontend capability summary is under **[Frontends at a glance](docs.md#frontends-at-a-glance)**.
 
-> Status: M5.7c complete. CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, encrypted attachments, item history reveal/compare/restore, safe backups, favorites/recents, tag and folder management, sorting/pagination, bulk actions, duplicate detection, device labels, password health, a local audit log, a standalone generator, and a polished Linux desktop with no-vault onboarding (tray, deep links, autostart, notifications, persistent window state). M6c Android now includes the Tauri-mobile shell, AutofillService, and Android Keystore-backed biometric unlock; APK build is verified, device smoke testing remains.
+> Status: M6e.1 passkeys. CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, encrypted attachments, item history reveal/compare/restore, safe backups, favorites/recents, tag and folder management, sorting/pagination, bulk actions, duplicate detection, device labels, password health, a local audit log, a standalone generator, and a polished Linux desktop with no-vault onboarding. M6c Android includes the Tauri-mobile shell, AutofillService, and Android Keystore-backed biometric unlock; APK build is verified, device smoke testing remains. M6e.1 adds synced passkey storage, a Chromium extension WebAuthn provider, and passkey management in the WebUI/CLI/desktop (Chrome manual matrix pending); Android passkeys are M6e.2.
 
 ## What glyx will do
 
-- Store and autofill logins and TOTPs in the browser; store passkeys, identities, and cards (autofill for those is not implemented yet).
+- Store and autofill logins and TOTPs in the browser; create and use synced passkeys in Chromium via the extension; store identities and cards (autofill for those is not implemented yet).
 - Store encrypted attachments (25 MiB), back up and restore vaults, manage SSH and other keys, and keep Markdown notes.
 - Project secrets into files or folders while unlocked, wipe them on lock.
 - Inject secrets inside tracked files (for example `.env` or compose files) and restore placeholders on lock.
@@ -23,7 +23,7 @@ Full feature guide for every frontend, with examples: **[docs.md](docs.md)**. Th
 | WebUI | Browser pages served by the local daemon on loopback |
 | Desktop | `glyx-tauri`: the WebUI plus daemon autostart, tray, deep links, notifications, and a configurable quick palette |
 | Android | `glyx-tauri` mobile: in-process daemon, WebUI, AutofillService, and biometric unlock |
-| Extension | Chrome/Firefox search, login/TOTP fill, and lock; requires an unlocked daemon |
+| Extension | Chrome/Firefox search, login/TOTP fill, and lock; Chromium also provides synced passkeys. Requires an unlocked daemon. |
 | Git | `git-credential-glyx`: HTTPS credential `get/store/erase` |
 
 The detailed matrix, including known gaps, lives in `local/feature-parity.md` (local only).
@@ -304,7 +304,7 @@ local/           Agent and developer docs (gitignored, local only)
 
 ## Roadmap
 
-Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 browser/Git/clipboard fill (done), M5 file agent plus SSH (done), M5.1 three-way file merge (done), M5.2 vault onboarding plus optional keyfiles plus self-starting desktop (done), M5.3 frontend parity plus CLI TUI (done), M5.4 parity gap closure (done), M5.5 parity foundation (done), M5.6 Linux desktop polish (done), M6a notes, M6b external Markdown folders (done), M6c Android shell/scaffold/APK build plus AutofillService and biometric unlock (implemented; device smoke test pending), M7 hardening and installers.
+Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 browser/Git/clipboard fill (done), M5 file agent plus SSH (done), M5.1 three-way file merge (done), M5.2 vault onboarding plus optional keyfiles plus self-starting desktop (done), M5.3 frontend parity plus CLI TUI (done), M5.4 parity gap closure (done), M5.5 parity foundation (done), M5.6 Linux desktop polish (done), M6a notes, M6b external Markdown folders (done), M6c Android shell/scaffold/APK build plus AutofillService and biometric unlock (implemented; device smoke test pending), M6e.1 synced passkeys plus Chromium extension create/get and WebUI/CLI/desktop management (implemented), M6e.2 Android Credential Manager (planned), M7 hardening and installers.
 
 ## License
 
