@@ -1,5 +1,5 @@
 <script>
-  import { api } from '$lib/api.js';
+  import { api, isMobile } from '$lib/api.js';
   import { onMount } from 'svelte';
   let status = null;
   let report = null;
@@ -26,20 +26,79 @@
   let restoreDest = '';
   let restoreInput = null;
   let backupBusy = false;
+  let mobile = isMobile();
+  let biometric = null;
+  let bioBusy = false;
+  let bioNotice = '';
 
   async function load() {
     try {
       status = await api.status();
       settings = await api.settings();
       idleLockMin = settings.idle_lock_min ?? 15;
-      if (window.__TAURI__?.core?.invoke) {
+      if (!mobile && window.__TAURI__?.core?.invoke) {
         desktopSettings = await window.__TAURI__.core.invoke('desktop_settings_get');
       }
+      if (mobile) await loadBiometric();
     } catch (e) {
       error = e.message;
     }
   }
   onMount(load);
+
+  async function loadBiometric() {
+    if (!mobile || !window.__TAURI__?.core?.invoke) return;
+    try {
+      biometric = await window.__TAURI__.core.invoke('mobile_biometric_status');
+    } catch {
+      biometric = null;
+    }
+  }
+
+  async function enableBiometric() {
+    error = '';
+    bioNotice = '';
+    bioBusy = true;
+    let slot = null;
+    try {
+      slot = await api.addBiometricSlot();
+      await window.__TAURI__.core.invoke('mobile_biometric_enable', {
+        secret: slot.secret,
+        vaultId: status.vault.vault_id,
+        slotId: slot.slot_id
+      });
+      slot.secret = '';
+      bioNotice = 'Biometric unlock enabled.';
+      await loadBiometric();
+    } catch (e) {
+      if (slot?.slot_id) {
+        try {
+          await api.retireBiometricSlot(slot.slot_id);
+        } catch {
+          /* best effort */
+        }
+      }
+      error = e.message;
+    } finally {
+      bioBusy = false;
+    }
+  }
+
+  async function disableBiometric() {
+    error = '';
+    bioNotice = '';
+    bioBusy = true;
+    try {
+      if (biometric?.slot_id) await api.retireBiometricSlot(biometric.slot_id);
+      await window.__TAURI__.core.invoke('mobile_biometric_disable');
+      bioNotice = 'Biometric unlock disabled.';
+      await loadBiometric();
+    } catch (e) {
+      error = e.message;
+    } finally {
+      bioBusy = false;
+    }
+  }
 
   async function saveDesktop() {
     error = '';
@@ -325,6 +384,23 @@
         <button class="primary" on:click={doRekey}>Rotate</button>
       </div>
       {#if notice}<p class="dim">{notice}</p>{/if}
+    </div>
+  {/if}
+  {#if mobile && biometric?.available}
+    <div class="card">
+      <div>Biometric unlock</div>
+      {#if status?.vault?.keyfile_required}
+        <p class="dim">Not available for keyfile-required vaults.</p>
+      {:else if status?.locked}
+        <p class="dim">Unlock the vault first.</p>
+      {:else if biometric.enabled && biometric.vault_id === status?.vault?.vault_id}
+        <p class="dim">Enabled for this vault. The key is stored in Android Keystore and requires biometric authentication.</p>
+        <button on:click={disableBiometric} disabled={bioBusy}>Disable biometric unlock</button>
+      {:else}
+        <p class="dim">Enable after unlocking. The key is stored in Android Keystore and requires biometric authentication.</p>
+        <button on:click={enableBiometric} disabled={bioBusy}>Enable biometric unlock</button>
+      {/if}
+      {#if bioNotice}<p class="dim">{bioNotice}</p>{/if}
     </div>
   {/if}
   {#if desktopSettings}

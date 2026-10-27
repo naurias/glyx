@@ -5,7 +5,8 @@
     configured,
     bootstrapDesktop,
     bootstrapError,
-    retryDesktopBootstrap
+    retryDesktopBootstrap,
+    isMobile
   } from '$lib/api.js';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
@@ -24,8 +25,14 @@
   let desktop = false;
   let needsKeyfile = true;
   let vaultLabel = '';
+  let vaultId = '';
   let booting = false;
   let bootError = '';
+  let mobile = isMobile();
+  let biometric = null;
+  let biometricBusy = false;
+  $: biometricMatches =
+    !!biometric?.enabled && !!vaultId && biometric.vault_id === vaultId;
 
   async function loadStatus() {
     const st = await api.status();
@@ -35,11 +42,21 @@
     }
     needsKeyfile = st.vault.keyfile_required !== false;
     vaultLabel = st.vault.path;
+    vaultId = st.vault.vault_id || '';
     if (!st.locked) {
       goto('/items');
       return false;
     }
     return true;
+  }
+
+  async function loadBiometric() {
+    if (!mobile || !window.__TAURI__?.core?.invoke) return;
+    try {
+      biometric = await window.__TAURI__.core.invoke('mobile_biometric_status');
+    } catch {
+      biometric = null;
+    }
   }
 
   async function ensureDesktop() {
@@ -77,6 +94,7 @@
     if (await ensureDesktop()) {
       try {
         await loadStatus();
+        await loadBiometric();
       } catch (e) {
         bootError = e.message;
       }
@@ -111,6 +129,25 @@
     }
   }
 
+  async function unlockBiometric() {
+    error = '';
+    biometricBusy = true;
+    try {
+      const result = await window.__TAURI__.core.invoke('mobile_biometric_unlock', {
+        vaultId
+      });
+      const secret = result.secret;
+      await api.unlock(secret);
+      result.secret = '';
+      goto('/items');
+    } catch (e) {
+      error = e.message;
+      await loadBiometric();
+    } finally {
+      biometricBusy = false;
+    }
+  }
+
   function goOnboarding() {
     if (!desktop && (url || token)) configure(url, token);
     goto('/onboarding');
@@ -139,6 +176,19 @@
     <label>Token<input bind:value={token} placeholder="from daemon-*.json" /></label>
   {/if}
   {#if !booting && !bootError}
+  {#if mobile && biometric?.available && !needsKeyfile}
+    <div class="card">
+      <div>Biometric unlock</div>
+      {#if biometricMatches}
+        <p class="dim">Unlock without typing your password.</p>
+        <button class="primary" on:click={unlockBiometric} disabled={biometricBusy}>
+          Unlock with biometrics
+        </button>
+      {:else}
+        <p class="dim">Unlock normally, then enable biometric unlock in Settings.</p>
+      {/if}
+    </div>
+  {/if}
   <div class="row">
     <button class:selected={mode === 'password'} on:click={() => (mode = 'password')}>Password</button>
     <button class:selected={mode === 'pin'} on:click={() => (mode = 'pin')}>PIN</button>

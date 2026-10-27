@@ -6,7 +6,9 @@
     bootstrapError,
     retryDesktopBootstrap,
     pickFolder,
-    pickSave
+    pickSave,
+    isMobile,
+    mobileDataDir
   } from '$lib/api.js';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
@@ -31,6 +33,7 @@
   let restoreInput = null;
   let restoring = false;
   let busy = false;
+  let mobile = isMobile();
 
   let form = { preset: 'balanced', cipher: 'xchacha' };
 
@@ -70,6 +73,11 @@
   }
 
   onMount(async () => {
+    if (mobile) {
+      const base = mobileDataDir() ? `${mobileDataDir()}/vaults` : 'vaults';
+      if (!createParent) createParent = base;
+      if (!restoreParent) restoreParent = base;
+    }
     if (await ensureDesktop()) await load();
   });
 
