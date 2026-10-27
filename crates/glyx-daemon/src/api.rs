@@ -16,6 +16,8 @@ use tokio::io::AsyncWriteExt as _;
 use tokio_util::io::ReaderStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+use crate::passkey;
+
 #[derive(Debug)]
 pub struct AppState {
     pub active: Mutex<Option<PathBuf>>,
@@ -199,6 +201,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/audit", get(audit_log))
         .route("/v1/generate", post(generate_password))
         .route("/v1/templates", get(list_templates))
+        .route("/v1/passkeys", get(list_passkeys))
+        .route("/v1/passkeys/lookup", post(passkey_lookup))
+        .route("/v1/passkeys/create", post(passkey_create))
+        .route("/v1/passkeys/get", post(passkey_get))
         .route("/v1/status", get(status))
         .route(
             "/v1/vaults",
@@ -334,6 +340,321 @@ async fn list_templates() -> impl IntoResponse {
         })
         .collect();
     Json(serde_json::Value::Array(out))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn passkey_error(e: passkey::PasskeyError) -> Response {
+    let status = match &e {
+        passkey::PasskeyError::BadRequest(_) | passkey::PasskeyError::NotSupported(_) => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        passkey::PasskeyError::InvalidState(_) => StatusCode::CONFLICT,
+        passkey::PasskeyError::NotAllowed(_) | passkey::PasskeyError::Security(_) => {
+            StatusCode::FORBIDDEN
+        }
+    };
+    (
+        status,
+        Json(serde_json::json!({"error": e.to_string(), "name": e.name()})),
+    )
+        .into_response()
+}
+
+fn passkey_locked() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({"error": "vault locked", "name": "NotAllowedError"})),
+    )
+        .into_response()
+}
+
+async fn list_passkeys(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return passkey_locked();
+    };
+    let rows = match uv.list(false) {
+        Ok(rows) => rows,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        match uv.get_item(&row.id) {
+            Ok(Some(item)) => {
+                if let Some(meta) = passkey::metadata(&item) {
+                    out.push(meta);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return store_error(&e).into_response(),
+        }
+    }
+    out.sort_by(|a, b| a.rp_name.cmp(&b.rp_name).then_with(|| a.name.cmp(&b.name)));
+    Json(out).into_response()
+}
+
+#[derive(Deserialize)]
+struct PasskeyLookupBody {
+    origin: String,
+    rp_id: String,
+    #[serde(default)]
+    allow_credentials: Vec<String>,
+}
+
+async fn passkey_lookup(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PasskeyLookupBody>,
+) -> impl IntoResponse {
+    if let Err(e) = passkey::validate_origin_rp(&body.origin, &body.rp_id) {
+        return passkey_error(e);
+    }
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return passkey_locked();
+    };
+    let rows = match uv.list(false) {
+        Ok(rows) => rows,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    let mut items = Vec::new();
+    for row in rows {
+        match uv.get_item(&row.id) {
+            Ok(Some(item)) => items.push(item),
+            Ok(None) => {}
+            Err(e) => return store_error(&e).into_response(),
+        }
+    }
+    let found = passkey::lookup(&items, &body.rp_id, &body.allow_credentials);
+    Json(found).into_response()
+}
+
+#[derive(Deserialize)]
+struct PasskeyCreateBody {
+    origin: String,
+    request: serde_json::Value,
+    #[serde(default)]
+    user_verified: bool,
+}
+
+async fn passkey_create(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PasskeyCreateBody>,
+) -> impl IntoResponse {
+    let options = match passkey::parse_creation(&body.request, &body.origin) {
+        Ok(options) => options,
+        Err(e) => return passkey_error(e),
+    };
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return passkey_locked();
+    };
+    let rows = match uv.list(false) {
+        Ok(rows) => rows,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    for row in rows {
+        match uv.get_item(&row.id) {
+            Ok(Some(item)) => {
+                if let Some(meta) = passkey::metadata(&item) {
+                    if meta.rp_id == options.rp_id
+                        && options.exclude_credentials.contains(&meta.credential_id)
+                    {
+                        return passkey_error(passkey::PasskeyError::InvalidState(
+                            "a matching passkey already exists".into(),
+                        ));
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return store_error(&e).into_response(),
+        }
+    }
+    let created = match passkey::create_credential(&options, body.user_verified) {
+        Ok(created) => created,
+        Err(e) => return passkey_error(e),
+    };
+    let now = now_ms();
+    let name = if created.user_name.is_empty() {
+        created.rp_name.clone()
+    } else {
+        format!("{} ({})", created.rp_name, created.user_name)
+    };
+    let values = BTreeMap::from([
+        ("relying_party".to_owned(), created.rp_id.clone()),
+        ("rp_name".to_owned(), created.rp_name.clone()),
+        ("user_handle".to_owned(), created.user_handle.clone()),
+        ("user_name".to_owned(), created.user_name.clone()),
+        ("display_name".to_owned(), created.display_name.clone()),
+        ("credential_id".to_owned(), created.credential_id.clone()),
+        ("private_key".to_owned(), created.private_key.clone()),
+        ("algorithm".to_owned(), "ES256".to_owned()),
+        ("sign_count".to_owned(), "0".to_owned()),
+        ("discoverable".to_owned(), created.discoverable.to_string()),
+        ("backup_eligible".to_owned(), "true".to_owned()),
+        ("backup_state".to_owned(), "true".to_owned()),
+        ("aaguid".to_owned(), created.aaguid.clone()),
+        ("created_ms".to_owned(), now.to_string()),
+        ("last_used_ms".to_owned(), now.to_string()),
+        ("transports".to_owned(), "internal".to_owned()),
+    ]);
+    let item = match glyx_store::present::build_new(
+        uv,
+        glyx_core::ItemType::Passkey,
+        name,
+        String::new(),
+        Vec::new(),
+        values,
+    ) {
+        Ok(item) => item,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    let id = item.id;
+    if let Err(e) = uv.put_item(&item) {
+        return store_error(&e).into_response();
+    }
+    audit(
+        uv,
+        "passkey_create",
+        Some(id),
+        None,
+        "success",
+        Some(&created.rp_id),
+    );
+    Json(serde_json::json!({
+        "item_id": id,
+        "name": item.name,
+        "rp_id": created.rp_id,
+        "response": created.response,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct PasskeyGetBody {
+    origin: String,
+    request: serde_json::Value,
+    item_id: Option<String>,
+    #[serde(default)]
+    user_verified: bool,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn passkey_get(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PasskeyGetBody>,
+) -> impl IntoResponse {
+    let options = match passkey::parse_assertion(&body.request, &body.origin) {
+        Ok(options) => options,
+        Err(e) => return passkey_error(e),
+    };
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return passkey_locked();
+    };
+    let mut item = if let Some(id) = body.item_id.as_deref() {
+        match uv.resolve(id) {
+            Ok(item) => item,
+            Err(_) => {
+                return passkey_error(passkey::PasskeyError::NotAllowed(
+                    "passkey not found".into(),
+                ));
+            }
+        }
+    } else {
+        let rows = match uv.list(false) {
+            Ok(rows) => rows,
+            Err(e) => return store_error(&e).into_response(),
+        };
+        let mut found = Vec::new();
+        for row in rows {
+            match uv.get_item(&row.id) {
+                Ok(Some(candidate)) => {
+                    if let Some(meta) = passkey::metadata(&candidate) {
+                        let allowed = if options.allow_credentials.is_empty() {
+                            meta.discoverable
+                        } else {
+                            options.allow_credentials.contains(&meta.credential_id)
+                        };
+                        if meta.rp_id == options.rp_id && allowed {
+                            found.push(candidate);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => return store_error(&e).into_response(),
+            }
+        }
+        if found.len() != 1 {
+            return passkey_error(passkey::PasskeyError::NotAllowed(if found.is_empty() {
+                "no matching passkey".into()
+            } else {
+                "multiple passkeys match; select one".into()
+            }));
+        }
+        found.remove(0)
+    };
+    let Some(meta) = passkey::metadata(&item) else {
+        return passkey_error(passkey::PasskeyError::NotAllowed(
+            "item is not a passkey".into(),
+        ));
+    };
+    if meta.rp_id != options.rp_id {
+        return passkey_error(passkey::PasskeyError::NotAllowed(
+            "passkey relying party does not match".into(),
+        ));
+    }
+    if options.allow_credentials.is_empty() && !meta.discoverable {
+        return passkey_error(passkey::PasskeyError::NotAllowed(
+            "passkey is not discoverable".into(),
+        ));
+    }
+    if !options.allow_credentials.is_empty()
+        && !options.allow_credentials.contains(&meta.credential_id)
+    {
+        return passkey_error(passkey::PasskeyError::NotAllowed(
+            "passkey is not in allowCredentials".into(),
+        ));
+    }
+    let assertion = match passkey::assert_credential(&options, &item, body.user_verified) {
+        Ok(assertion) => assertion,
+        Err(e) => return passkey_error(e),
+    };
+    let now = now_ms();
+    let mut values = BTreeMap::new();
+    values.insert("last_used_ms".to_owned(), now.to_string());
+    if let Err(e) = glyx_store::present::apply_fields(uv, &mut item, values) {
+        return store_error(&e).into_response();
+    }
+    if let Err(e) = uv.put_item(&item) {
+        return store_error(&e).into_response();
+    }
+    audit(
+        uv,
+        "passkey_get",
+        Some(item.id),
+        None,
+        "success",
+        Some(&assertion.rp_id),
+    );
+    Json(serde_json::json!({
+        "item_id": item.id,
+        "name": item.name,
+        "rp_id": assertion.rp_id,
+        "response": assertion.response,
+    }))
+    .into_response()
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -3619,6 +3940,134 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn passkey_create_lookup_and_get() {
+        let cfg = tempfile::tempdir().expect("config dir");
+        std::env::set_var("GLYX_CONFIG", cfg.path().join("config.toml"));
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": "pw", "keyfile": kf_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let creation = serde_json::json!({
+            "rp": {"id": "example.com", "name": "Example"},
+            "user": {
+                "id": "dXNlcg",
+                "name": "alice@example.com",
+                "displayName": "Alice"
+            },
+            "challenge": "Y2hhbGxlbmdl",
+            "pubKeyCredParams": [{"type": "public-key", "alg": -7}],
+            "excludeCredentials": [],
+            "authenticatorSelection": {
+                "residentKey": "required",
+                "userVerification": "required"
+            },
+            "extensions": {"credProps": true}
+        });
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/passkeys/create",
+            Some(serde_json::json!({
+                "origin": "https://example.com",
+                "request": creation.clone(),
+                "user_verified": true
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let item_id = body["item_id"].as_str().expect("item id").to_owned();
+        let credential_id = body["response"]["id"]
+            .as_str()
+            .expect("credential id")
+            .to_owned();
+        assert_eq!(body["response"]["response"]["publicKeyAlgorithm"], -7);
+
+        let (status, body) = call(state.clone(), "GET", "/v1/passkeys", None, "test-token").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.as_array().expect("array").len(), 1);
+        assert_eq!(body[0]["rp_id"], "example.com");
+        assert_eq!(body[0]["usable"], true);
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/passkeys/lookup",
+            Some(serde_json::json!({
+                "origin": "https://example.com",
+                "rp_id": "example.com",
+                "allow_credentials": []
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.as_array().expect("array").len(), 1);
+        assert_eq!(body[0]["item_id"], item_id);
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/passkeys/get",
+            Some(serde_json::json!({
+                "origin": "https://example.com",
+                "item_id": item_id,
+                "user_verified": true,
+                "request": {
+                    "rpId": "example.com",
+                    "challenge": "b3RoZXItY2hhbGxlbmdl",
+                    "userVerification": "required",
+                    "allowCredentials": [{"type": "public-key", "id": credential_id}]
+                }
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["response"]["id"], credential_id);
+        assert!(body["response"]["response"]["signature"].as_str().is_some());
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/passkeys/create",
+            Some(serde_json::json!({
+                "origin": "https://evil.example",
+                "request": creation.clone(),
+                "user_verified": true
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["name"], "SecurityError");
+
+        let (status, body) = call(
+            state,
+            "POST",
+            "/v1/passkeys/create",
+            Some(serde_json::json!({
+                "origin": "https://example.com",
+                "request": creation,
+                "user_verified": false
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["name"], "NotAllowedError");
     }
 
     #[tokio::test]

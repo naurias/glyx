@@ -139,12 +139,19 @@ pub fn http(
         if line.is_empty() {
             break;
         }
-        if let Some(v) = line.strip_prefix("Content-Length:") {
-            content_length = v.trim().parse().unwrap_or(0);
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
         }
     }
-    let mut buf = vec![0u8; content_length];
-    reader.read_exact(&mut buf)?;
+    let mut buf = Vec::new();
+    if content_length == 0 {
+        reader.read_to_end(&mut buf)?;
+    } else {
+        buf.resize(content_length, 0);
+        reader.read_exact(&mut buf)?;
+    }
     let json = if buf.is_empty() {
         serde_json::Value::Null
     } else {
@@ -197,6 +204,27 @@ fn handle(req: &Call) -> Response {
             )
         }
         "lock" => http(record.port, &record.token, "POST", "/v1/lock", None),
+        "passkey_lookup" => http(
+            record.port,
+            &record.token,
+            "POST",
+            "/v1/passkeys/lookup",
+            Some(&req.args),
+        ),
+        "passkey_create" => http(
+            record.port,
+            &record.token,
+            "POST",
+            "/v1/passkeys/create",
+            Some(&req.args),
+        ),
+        "passkey_get" => http(
+            record.port,
+            &record.token,
+            "POST",
+            "/v1/passkeys/get",
+            Some(&req.args),
+        ),
         other => return fail(anyhow::anyhow!("unknown op {other}")),
     };
     match out {
@@ -309,6 +337,23 @@ mod tests {
         let mut buf = (10u32 * 1024 * 1024).to_le_bytes().to_vec();
         buf.extend_from_slice(&[0u8; 16]);
         assert!(read_frame(&mut Cursor::new(buf)).is_err());
+    }
+
+    #[test]
+    fn http_reads_lowercase_content_length() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 8\r\n\r\n{\"ok\":1}")
+                .expect("write");
+        });
+        let (status, data) = http(port, "token", "GET", "/v1/status", None).expect("http");
+        assert_eq!(status, 200);
+        assert_eq!(data["ok"], 1);
     }
 
     #[test]

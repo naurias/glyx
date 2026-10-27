@@ -37,9 +37,24 @@ const PASSKEY: &[FieldSpec] = &[
         required: true,
     },
     FieldSpec {
+        name: "rp_name",
+        secret: false,
+        required: false,
+    },
+    FieldSpec {
         name: "user_handle",
         secret: false,
         required: true,
+    },
+    FieldSpec {
+        name: "user_name",
+        secret: false,
+        required: false,
+    },
+    FieldSpec {
+        name: "display_name",
+        secret: false,
+        required: false,
     },
     FieldSpec {
         name: "credential_id",
@@ -49,6 +64,51 @@ const PASSKEY: &[FieldSpec] = &[
     FieldSpec {
         name: "private_key",
         secret: true,
+        required: false,
+    },
+    FieldSpec {
+        name: "algorithm",
+        secret: false,
+        required: false,
+    },
+    FieldSpec {
+        name: "sign_count",
+        secret: false,
+        required: false,
+    },
+    FieldSpec {
+        name: "discoverable",
+        secret: false,
+        required: false,
+    },
+    FieldSpec {
+        name: "backup_eligible",
+        secret: false,
+        required: false,
+    },
+    FieldSpec {
+        name: "backup_state",
+        secret: false,
+        required: false,
+    },
+    FieldSpec {
+        name: "aaguid",
+        secret: false,
+        required: false,
+    },
+    FieldSpec {
+        name: "created_ms",
+        secret: false,
+        required: false,
+    },
+    FieldSpec {
+        name: "last_used_ms",
+        secret: false,
+        required: false,
+    },
+    FieldSpec {
+        name: "transports",
+        secret: false,
         required: false,
     },
 ];
