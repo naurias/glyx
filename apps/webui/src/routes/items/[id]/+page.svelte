@@ -186,6 +186,18 @@
     }
   }
 
+  async function renameItem() {
+    const name = prompt('Passkey name', item.name);
+    if (!name || name === item.name) return;
+    error = '';
+    try {
+      await api.edit(id, { rename: name });
+      await load();
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
   async function save(payload) {
     error = '';
     busy = true;
@@ -217,6 +229,7 @@
 <nav>
   <a href="/items">Items</a>
   <a href="/add">Add</a>
+  <a href="/passkeys">Passkeys</a>
   <a href="/conflicts">Conflicts</a>
   <a href="/exports">Exports</a>
   <a href="/settings">Settings</a>
@@ -251,6 +264,24 @@
       <div class="row">
         <button on:click={startEdit}>Edit</button>
         <button on:click={toggle}>{reveal ? 'Mask secrets' : 'Reveal secrets'}</button>
+        <button class="danger" on:click={remove}>Delete</button>
+      </div>
+    {:else if item.type === 'passkey'}
+      <p class="dim">
+        Passkey credentials are read-only here. Create and use passkeys from the Chromium
+        extension; edit the name, folder, tags, or favorite from the Passkeys page.
+      </p>
+      {#each Object.entries(item.fields) as [k, v]}
+        <div class="card row">
+          <strong>{k}</strong>
+          <span style="flex: 1">{v}</span>
+        </div>
+      {/each}
+      <div class="row">
+        {#if item.fields.user_name}
+          <button on:click={() => copy('user_name')}>Copy username</button>
+        {/if}
+        <button on:click={renameItem}>Rename</button>
         <button class="danger" on:click={remove}>Delete</button>
       </div>
     {:else}

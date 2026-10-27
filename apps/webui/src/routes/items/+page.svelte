@@ -195,6 +195,7 @@
 <nav>
   <a href="/items">Items</a>
   <a href="/add">Add</a>
+  <a href="/passkeys">Passkeys</a>
   <a href="/conflicts">Conflicts</a>
   <a href="/exports">Exports</a>
   <a href="/health">Health</a>

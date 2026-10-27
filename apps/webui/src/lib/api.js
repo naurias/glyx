@@ -121,6 +121,7 @@ export const api = {
     const q = new URLSearchParams(params).toString();
     return req('GET', '/v1/items' + (q ? `?${q}` : ''));
   },
+  passkeys: () => req('GET', '/v1/passkeys'),
   itemsPage: (params = {}) => {
     const q = new URLSearchParams(params).toString();
     return reqPage('GET', '/v1/items' + (q ? `?${q}` : ''));
