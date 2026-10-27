@@ -1,10 +1,10 @@
 # glyx
 
-Local-first password manager for Linux, Windows, and Android. CLI, full-screen TUI, WebUI, desktop app, and an Android shell (paused) on one Rust core. No accounts, no telemetry, your vault stays yours.
+Local-first password manager for Linux, Windows, and Android. CLI, full-screen TUI, WebUI, desktop app, and an Android app on one Rust core. No accounts, no telemetry, your vault stays yours.
 
 Full feature guide for every frontend, with examples: **[docs.md](docs.md)**. The frontend capability summary is under **[Frontends at a glance](docs.md#frontends-at-a-glance)**.
 
-> Status: M5.7c complete. CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, encrypted attachments, item history reveal/compare/restore, safe backups, favorites/recents, tag and folder management, sorting/pagination, bulk actions, duplicate detection, device labels, password health, a local audit log, a standalone generator, and a polished Linux desktop with no-vault onboarding (tray, deep links, autostart, notifications, persistent window state). M6c Android is paused after the Tauri-mobile shell, scaffold, and debug APK (AutofillService and biometric unlock remain).
+> Status: M5.7c complete. CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, encrypted attachments, item history reveal/compare/restore, safe backups, favorites/recents, tag and folder management, sorting/pagination, bulk actions, duplicate detection, device labels, password health, a local audit log, a standalone generator, and a polished Linux desktop with no-vault onboarding (tray, deep links, autostart, notifications, persistent window state). M6c Android now includes the Tauri-mobile shell, AutofillService, and Android Keystore-backed biometric unlock; APK build is verified, device smoke testing remains.
 
 ## What glyx will do
 
@@ -22,7 +22,7 @@ Full feature guide for every frontend, with examples: **[docs.md](docs.md)**. Th
 | TUI | `glyx tui`: focused item browser/editor (add/edit, notes, TOTP, first-secret copy) |
 | WebUI | Browser pages served by the local daemon on loopback |
 | Desktop | `glyx-tauri`: the WebUI plus daemon autostart, tray, deep links, notifications, and a configurable quick palette |
-| Android | `glyx-tauri` mobile: in-process daemon plus the WebUI (M6c paused) |
+| Android | `glyx-tauri` mobile: in-process daemon, WebUI, AutofillService, and biometric unlock |
 | Extension | Chrome/Firefox search, login/TOTP fill, and lock; requires an unlocked daemon |
 | Git | `git-credential-glyx`: HTTPS credential `get/store/erase` |
 
@@ -304,7 +304,7 @@ local/           Agent and developer docs (gitignored, local only)
 
 ## Roadmap
 
-Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 browser/Git/clipboard fill (done), M5 file agent plus SSH (done), M5.1 three-way file merge (done), M5.2 vault onboarding plus optional keyfiles plus self-starting desktop (done), M5.3 frontend parity plus CLI TUI (done), M5.4 parity gap closure (done), M5.5 parity foundation (done), M5.6 Linux desktop polish (done), M6a notes, M6b external Markdown folders (done), M6c Android shell/scaffold/APK build (done; AutofillService and biometric unlock pending), M7 hardening and installers.
+Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 browser/Git/clipboard fill (done), M5 file agent plus SSH (done), M5.1 three-way file merge (done), M5.2 vault onboarding plus optional keyfiles plus self-starting desktop (done), M5.3 frontend parity plus CLI TUI (done), M5.4 parity gap closure (done), M5.5 parity foundation (done), M5.6 Linux desktop polish (done), M6a notes, M6b external Markdown folders (done), M6c Android shell/scaffold/APK build plus AutofillService and biometric unlock (implemented; device smoke test pending), M7 hardening and installers.
 
 ## License
 

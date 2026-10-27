@@ -7,7 +7,7 @@ This guide covers the user-facing frontends:
 - **CLI** (`glyx`), including a full-screen TUI (`glyx tui`)
 - **WebUI** (pages served by the local daemon)
 - **Desktop** (`glyx-tauri`, the WebUI plus tray, deep links, notifications, autostart, and a global quick-copy shortcut)
-- **Android** (`glyx-tauri` mobile, M6c paused)
+- **Android** (`glyx-tauri` mobile, M6c autofill + biometrics)
 - **Browser extension** (search, login/TOTP fill, and lock; requires an unlocked daemon)
 - **Git credential helper** (`git-credential-glyx`)
 
@@ -20,18 +20,19 @@ This guide covers the user-facing frontends:
 | Item create/edit/delete | Yes | Yes | Yes | Inherited | Inherited | No | Partial |
 | Notes/TOTP | Yes | Yes | Yes | Inherited | Inherited | Partial | No |
 | Clipboard copy | Yes | Partial | Partial | Inherited | No | No | No |
-| Web form fill | No | No | No | No | Planned | Yes | No |
+| Web form fill | No | No | No | No | Autofill | Yes | No |
 | SSH keys/agent | Yes | No | Partial | Inherited | Partial | No | No |
 | Favorites/recents/library/bulk/duplicates | Yes | No | Yes | Inherited | Inherited | No | No |
 | Devices/health/audit/generator | Yes | No | Yes | Inherited | Inherited | No | No |
 | Exports/injection | Yes | No | Yes | Inherited | Inherited | No | No |
 | Sync/conflicts/GC/doctor | Yes | No | Partial | Inherited | Inherited | No | No |
 | Desktop extras | No | No | No | Yes | No | No | No |
-| OS autofill/biometrics | No | No | No | No | Planned | No | No |
+| OS autofill/biometrics | No | No | No | No | Yes | No | No |
 | Extension/Git setup | Yes | No | No | No | No | No | No |
 
 `Inherited` means Desktop and Android reuse the WebUI pages (Android currently
-lacks clipboard, autofill, and biometrics). `Partial` details, known gaps, and
+lacks clipboard and a native file picker; AutofillService and biometric unlock
+are Android-specific). `Partial` details, known gaps, and
 code anchors live in `local/feature-parity.md` (local only).
 
 `*` The extension can Lock but cannot unlock; it requires the daemon to already
@@ -596,9 +597,10 @@ glyx fill github --dry-run
 
 The value is copied and cleared after the timeout if it is still on the clipboard. `--dry-run` resolves without touching the clipboard. In the GUI, item detail has Copy buttons that use the daemon's clipboard. The desktop quick palette (`Ctrl+Shift+G`) copies the password with auto-clear.
 
-On Android, clipboard access is unavailable in the current shell; Copy/Fill
-return an error until the `AutofillService` integration lands. The extension
-does not use the clipboard: it fills page inputs directly.
+On Android, clipboard Copy/Fill buttons are still unavailable. Use the system
+autofill UI instead: glyx registers an `AutofillService` that fills login fields
+from the selected vault. The extension does not use the clipboard: it fills page
+inputs directly.
 
 ---
 
@@ -714,7 +716,7 @@ Runtime directory: `GLYX_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/glyx`, else a temp
 
 **Clipboard unavailable**: install a clipboard backend for your session (`wl-clipboard` or X11 tools). `glyx doctor` reports the backend.
 
-**Android Copy/Fill fails**: expected in the current M6c shell; the Android clipboard backend is intentionally unavailable until `AutofillService` lands.
+**Android Copy/Fill fails**: expected; use the Android autofill UI instead. The clipboard backend is not wired into the mobile shell yet.
 
 **Android APK build fails**: use `nix develop .#android-fhs` (not the plain `.#android` shell). The FHS shell sets the AAPT2 override and `/usr/bin`; build arm64 only with `-t aarch64` unless the disk has several GB free.
 
@@ -733,26 +735,32 @@ Runtime directory: `GLYX_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/glyx`, else a temp
 
 ---
 
-## 21. Android (M6c paused)
+## 21. Android (M6c: autofill + biometrics)
 
 The Android app is the Tauri-mobile shell from `crates/glyx-tauri` plus the same
-WebUI. It is not feature-complete yet.
+WebUI. It starts an in-process daemon on loopback, stores the URL/token in the
+app-private `glyx-mobile.json`, and injects them into the WebView.
 
 What works today:
 
-- the app starts an in-process daemon on loopback with a random token and injects
-  the URL/token into the WebView, so the normal WebUI pages open without manual
-  configuration
 - vault onboarding, item browsing/editing, notes, TOTP display, exports,
   injection, sync, conflicts, GC, and doctor through the WebUI
-- a debug APK builds successfully (arm64); `adb install` is the remaining device step
+- an Android `AutofillService` that maps a web domain or package query to login
+  items and fills username/password fields; when the vault is locked or the
+  daemon is not running, the autofill UI offers **Unlock glyx**
+- biometric unlock using an Android Keystore key: enabling it adds a dedicated
+  random keyslot, encrypts the keyslot secret with a non-exportable,
+  biometric-bound AES key, and unlocks by decrypting that secret and calling the
+  normal `/v1/unlock` endpoint
+- an arm64 debug APK builds successfully
 
 Known limitations:
 
-- clipboard Copy/Fill is unavailable; `AutofillService` is not implemented yet
-- no biometric/Keystore unlock yet
+- clipboard Copy/Fill buttons are unavailable; use system autofill
 - no storage-access-framework picker; vault and export paths are typed text
 - no lock-on-background yet
+- biometric unlock is not offered for keyfile-required vaults (the biometric
+  secret cannot satisfy the keyfile requirement)
 - the browser extension and Git helper are desktop-only
 
 Build from the repository:
@@ -768,6 +776,14 @@ Omitting `-t aarch64` builds all four ABIs and needs several GB of disk space.
 The Android scaffold lives in `crates/glyx-tauri/gen/android`; do not re-run
 `cargo tauri android init` or the pinned Build-Tools/Gradle settings are lost.
 
-Next milestones: `AutofillService` (map app/domain to items), biometric unlock
-via an Android Keystore keyslot, then mobile polish (lock on background, safe
-areas, icons, file picker).
+After installing, enable glyx under **Settings -> System -> Languages & input ->
+Autofill service** (wording varies by vendor). Unlock the vault once, open
+**Settings**, and enable biometric unlock; the next unlock page and the autofill
+unlock flow offer the biometric prompt.
+
+Runtime device verification is still pending because the build host has no
+attached emulator/device. The APK, Kotlin compilation, merged manifest, and Rust
+cross-check are verified.
+
+Next milestones: lock on background, SAF picker, safe areas/icons, and device
+smoke testing.
