@@ -11,6 +11,17 @@ export function configured() {
   return base !== '' && token !== '';
 }
 
+export function isMobile() {
+  return (
+    typeof window !== 'undefined' &&
+    (window.__GLYX__?.mobile === true || window.__GLYX_MOBILE__ === true)
+  );
+}
+
+export function mobileDataDir() {
+  return typeof window !== 'undefined' ? window.__GLYX__?.dataDir || '' : '';
+}
+
 export function bootstrapDesktop() {
   if (typeof window !== 'undefined' && window.__GLYX__) {
     configure(window.__GLYX__.url, window.__GLYX__.token);
@@ -28,6 +39,7 @@ export function bootstrapError() {
 }
 
 export async function retryDesktopBootstrap() {
+  if (isMobile()) return configured();
   if (typeof window === 'undefined' || !window.__TAURI__?.core?.invoke) {
     return configured();
   }
@@ -46,6 +58,7 @@ export async function retryDesktopBootstrap() {
 }
 
 export async function pickFolder(title = 'Choose folder') {
+  if (isMobile()) return prompt(title) || '';
   if (typeof window !== 'undefined' && window.__TAURI__?.core?.invoke) {
     return (await window.__TAURI__.core.invoke('desktop_pick_folder', { title })) || '';
   }
@@ -53,6 +66,7 @@ export async function pickFolder(title = 'Choose folder') {
 }
 
 export async function pickFile(title = 'Choose file') {
+  if (isMobile()) return prompt(title) || '';
   if (typeof window !== 'undefined' && window.__TAURI__?.core?.invoke) {
     return (await window.__TAURI__.core.invoke('desktop_pick_file', { title })) || '';
   }
@@ -60,6 +74,7 @@ export async function pickFile(title = 'Choose file') {
 }
 
 export async function pickSave(title = 'Choose file', fileName = '') {
+  if (isMobile()) return prompt(title) || '';
   if (typeof window !== 'undefined' && window.__TAURI__?.core?.invoke) {
     return (
       (await window.__TAURI__.core.invoke('desktop_pick_save', {
@@ -174,6 +189,8 @@ export const api = {
   forgetVault: (path) => req('DELETE', `/v1/vaults?path=${encodeURIComponent(path)}`),
   createVault: (body) => req('POST', '/v1/vaults/create', body),
   selectVault: (path) => req('POST', '/v1/vaults/select', { path }),
+  addBiometricSlot: (keyfile) => req('POST', '/v1/vaults/slots', { keyfile }),
+  retireBiometricSlot: (id) => req('DELETE', `/v1/vaults/slots/${encodeURIComponent(id)}`),
   settings: () => req('GET', '/v1/settings'),
   saveSettings: (body) => req('POST', '/v1/settings', body),
   uploadBlob: async (file) => {

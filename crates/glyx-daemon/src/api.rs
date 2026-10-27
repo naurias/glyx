@@ -8,7 +8,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{middleware, Router};
 use futures_util::StreamExt as _;
 use serde::Deserialize;
@@ -205,6 +205,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(list_vaults).post(add_vault).delete(forget_vault),
         )
         .route("/v1/vaults/create", post(create_vault))
+        .route("/v1/vaults/slots", post(add_biometric_slot))
+        .route("/v1/vaults/slots/:id", delete(retire_biometric_slot))
         .route("/v1/vaults/select", post(select_vault))
         .route("/v1/vaults/rekey", post(rekey_vault))
         .route("/v1/vaults/backup", get(backup_vault))
@@ -2906,6 +2908,112 @@ async fn create_vault(
     .into_response()
 }
 
+#[derive(Deserialize)]
+struct BiometricSlotBody {
+    keyfile: Option<String>,
+}
+
+fn keyfile_for_slot(
+    uv: &glyx_store::UnlockedVault,
+    path: Option<&str>,
+) -> Result<[u8; 32], (StatusCode, Json<serde_json::Value>)> {
+    if !uv.config().keyfile_required {
+        return Ok(glyx_crypto::ZERO_KEYFILE);
+    }
+    let Some(path) = path else {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "keyfile required"})),
+        ));
+    };
+    match std::fs::read(path) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut keyfile = [0u8; 32];
+            keyfile.copy_from_slice(&bytes);
+            Ok(keyfile)
+        }
+        Ok(_) => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "bad keyfile"})),
+        )),
+        Err(e) => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )),
+    }
+}
+
+async fn add_biometric_slot(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<BiometricSlotBody>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let keyfile = match keyfile_for_slot(uv, body.keyfile.as_deref()) {
+        Ok(keyfile) => keyfile,
+        Err(response) => return response.into_response(),
+    };
+    let mut bytes = [0u8; 32];
+    if glyx_crypto::rand::fill_random(&mut bytes).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "cannot generate slot secret"})),
+        )
+            .into_response();
+    }
+    let secret = bytes.iter().fold(String::with_capacity(64), |mut out, b| {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+        out
+    });
+    match uv.add_slot(secret.as_bytes(), &keyfile) {
+        Ok(id) => {
+            audit(uv, "keyslot_add", None, None, "success", Some("biometric"));
+            Json(serde_json::json!({"ok": true, "slot_id": id, "secret": secret})).into_response()
+        }
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+async fn retire_biometric_slot(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let Ok(id) = uuid::Uuid::parse_str(&id) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "bad slot id"})),
+        )
+            .into_response();
+    };
+    match uv.retire_slot(&id) {
+        Ok(()) => {
+            audit(
+                uv,
+                "keyslot_retire",
+                None,
+                None,
+                "success",
+                Some("biometric"),
+            );
+            Json(serde_json::json!({"ok": true})).into_response()
+        }
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
 async fn select_vault(
     State(state): State<Arc<AppState>>,
     Json(body): Json<VaultSelectBody>,
@@ -3459,6 +3567,58 @@ mod tests {
         let vault = glyx_store::Vault::open(&dest).expect("restored vault");
         let uv = vault.unlock(b"pw", &[1u8; 32]).expect("unlock");
         assert_eq!(uv.list(false).expect("list").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn biometric_slot_add_unlock_and_retire() {
+        let cfg = tempfile::tempdir().expect("config dir");
+        std::env::set_var("GLYX_CONFIG", cfg.path().join("config.toml"));
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": "pw", "keyfile": kf_path.clone()})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/vaults/slots",
+            Some(serde_json::json!({"keyfile": kf_path.clone()})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let secret = body["secret"].as_str().expect("secret").to_owned();
+        let slot_id = body["slot_id"].as_str().expect("slot id").to_owned();
+        assert_eq!(secret.len(), 64);
+
+        let (status, _) = call(state.clone(), "POST", "/v1/lock", None, "test-token").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": secret, "keyfile": kf_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = call(
+            state.clone(),
+            "DELETE",
+            &format!("/v1/vaults/slots/{slot_id}"),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     #[tokio::test]

@@ -1,10 +1,11 @@
 #[cfg(not(mobile))]
 mod desktop;
+#[cfg(all(mobile, target_os = "android"))]
+mod mobile;
 
 #[cfg(not(mobile))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(not(mobile))]
 use tauri::Manager as _;
 
 #[cfg(not(mobile))]
@@ -32,6 +33,7 @@ pub struct BootstrapInfo {
     pub error: Option<String>,
 }
 
+#[cfg(not(mobile))]
 fn bootstrap_script(url: &str, token: &str) -> String {
     format!(
         "window.__GLYX__={{url:{},token:{}}};",
@@ -40,7 +42,6 @@ fn bootstrap_script(url: &str, token: &str) -> String {
     )
 }
 
-#[cfg(not(mobile))]
 fn bootstrap_error_script(error: &str) -> String {
     format!(
         "window.__GLYX_BOOT__={};",
@@ -161,11 +162,53 @@ async fn desktop_bootstrap() -> BootstrapInfo {
 }
 
 #[cfg(mobile)]
-fn mobile_script() -> String {
+fn mobile_data_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
+
+#[cfg(mobile)]
+fn mobile_session_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("glyx-mobile.json")
+}
+
+#[cfg(mobile)]
+fn write_mobile_session(data_dir: &std::path::Path, port: u16, token: &str) {
+    let path = mobile_session_path(data_dir);
+    let body = serde_json::json!({
+        "url": format!("http://127.0.0.1:{port}"),
+        "token": token,
+        "vault": current_vault().map(|p| p.to_string_lossy().into_owned()),
+        "pid": std::process::id(),
+    });
+    if std::fs::write(&path, serde_json::to_vec(&body).unwrap_or_default()).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+#[cfg(mobile)]
+fn remove_mobile_session(app: &tauri::AppHandle) {
+    if let Ok(data_dir) = app.path().app_data_dir() {
+        let _ = std::fs::remove_file(mobile_session_path(&data_dir));
+    }
+}
+
+#[cfg(mobile)]
+fn mobile_script(app: &tauri::AppHandle) -> String {
     use std::fmt::Write as _;
+    let data_dir = mobile_data_dir(app);
+    let runtime_dir = data_dir.join("runtime");
+    let _ = std::fs::create_dir_all(&runtime_dir);
+    std::env::set_var("GLYX_CONFIG", data_dir.join("config.toml"));
+    std::env::set_var("GLYX_RUNTIME_DIR", &runtime_dir);
     let mut bytes = [0u8; 32];
     let _ = glyx_crypto::fill_random(&mut bytes);
-    let token: String = bytes.iter().fold(String::new(), |mut out, b| {
+    let token: String = bytes.iter().fold(String::with_capacity(64), |mut out, b| {
         let _ = write!(out, "{b:02x}");
         out
     });
@@ -198,7 +241,19 @@ fn mobile_script() -> String {
     let port = rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .unwrap_or(0);
-    bootstrap_script(&format!("http://127.0.0.1:{port}"), &token)
+    if port == 0 {
+        return format!(
+            "window.__GLYX_MOBILE__=true;{}",
+            bootstrap_error_script("mobile daemon did not start within 10s")
+        );
+    }
+    write_mobile_session(&data_dir, port, &token);
+    format!(
+        "window.__GLYX__={{url:{},token:{},mobile:true,dataDir:{}}};",
+        serde_json::to_string(&format!("http://127.0.0.1:{port}")).unwrap_or_else(|_| "''".into()),
+        serde_json::to_string(&token).unwrap_or_else(|_| "''".into()),
+        serde_json::to_string(&data_dir.to_string_lossy()).unwrap_or_else(|_| "''".into())
+    )
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -207,7 +262,9 @@ pub fn run() {
     configure_linux_backend();
     #[cfg(not(mobile))]
     let mut builder = desktop::configure(tauri::Builder::default());
-    #[cfg(mobile)]
+    #[cfg(all(mobile, target_os = "android"))]
+    let builder = mobile::configure(tauri::Builder::default());
+    #[cfg(all(mobile, not(target_os = "android")))]
     let builder = tauri::Builder::default();
     #[cfg(not(mobile))]
     {
@@ -245,8 +302,7 @@ pub fn run() {
             }
             #[cfg(mobile)]
             {
-                let _ = app;
-                let script = mobile_script();
+                let script = mobile_script(app.handle());
                 tauri::WebviewWindowBuilder::new(
                     app,
                     "main",
@@ -273,6 +329,8 @@ pub fn run() {
                 }
             }
             #[cfg(mobile)]
-            let _ = (app, event);
+            if let tauri::RunEvent::Exit = event {
+                remove_mobile_session(app);
+            }
         });
 }
