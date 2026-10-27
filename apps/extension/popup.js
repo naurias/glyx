@@ -1,6 +1,8 @@
 const q = document.getElementById('q');
 const list = document.getElementById('list');
 const err = document.getElementById('err');
+const passkeys = document.getElementById('passkeys');
+const passkeyStatus = document.getElementById('passkey-status');
 
 function fail(e) {
   err.innerHTML = `<div class="err">${String((e && e.message) || e)}</div>`;
@@ -73,5 +75,38 @@ document.getElementById('lock').onclick = async () => {
     fail(e);
   }
 };
+
+function passkeyState(res) {
+  passkeys.checked = !!res.enabled;
+  passkeys.disabled = !res.available;
+  if (!res.available) {
+    passkeyStatus.textContent = 'Chromium only';
+  } else if (res.error) {
+    passkeyStatus.textContent = res.error;
+  } else if (res.enabled) {
+    passkeyStatus.textContent = res.attached ? 'active' : 'not attached';
+  } else {
+    passkeyStatus.textContent = 'off';
+  }
+}
+
+async function loadPasskeys() {
+  try {
+    passkeyState(await bg({ kind: 'passkey-settings' }));
+  } catch (e) {
+    passkeyStatus.textContent = String((e && e.message) || e);
+  }
+}
+
+passkeys.onchange = async () => {
+  passkeyStatus.textContent = '…';
+  try {
+    passkeyState(await bg({ kind: 'set-passkeys-enabled', enabled: passkeys.checked }));
+  } catch (e) {
+    passkeyStatus.textContent = String((e && e.message) || e);
+  }
+};
+
 q.oninput = () => refresh();
+loadPasskeys();
 refresh();

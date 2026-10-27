@@ -58,8 +58,13 @@ tauri-plugin-notification = "2"
 tauri-plugin-deep-link = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 base64 = "0.22"
+ciborium = "0.2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+psl = "2"
+sha2 = "0.10"
 tar = "0.4"
 flate2 = "1"
+url = "2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

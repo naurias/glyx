@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root { color-scheme: dark; }
+      body { margin: 0; font-family: system-ui, sans-serif; background: #14161a; color: #e8eaf0; }
+      header { padding: 14px 16px; border-bottom: 1px solid #2c313a; }
+      header strong { display: block; font-size: 16px; }
+      main { padding: 16px; }
+      h2 { margin: 0 0 6px; font-size: 18px; }
+      p { margin: 6px 0; line-height: 1.4; }
+      .dim { color: #9aa1b2; font-size: 13px; }
+      .item { border: 1px solid #2c313a; border-radius: 8px; padding: 10px; margin: 8px 0; }
+      .item .name { font-weight: 600; }
+      .row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+      button { background: #1c1f25; color: inherit; border: 1px solid #2c313a; border-radius: 6px; padding: 8px 10px; cursor: pointer; }
+      button.primary { background: #2b5cff; border-color: #2b5cff; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      .error { color: #ff7a7a; }
+      .success { color: #7ee2a8; }
+      .spacer { flex: 1; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <strong>glyx passkey</strong>
+      <span id="origin" class="dim"></span>
+    </header>
+    <main id="main">
+      <p class="dim">Loading passkey request…</p>
+    </main>
+    <script src="passkey.js"></script>
+  </body>
+</html>
