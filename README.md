@@ -4,7 +4,7 @@ Local-first password manager for Linux, Windows, and Android. CLI, full-screen T
 
 Full feature guide for every frontend, with examples: **[docs.md](docs.md)**. The frontend capability summary is under **[Frontends at a glance](docs.md#frontends-at-a-glance)**.
 
-> Status: M6e.1 passkeys. CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, encrypted attachments, item history reveal/compare/restore, safe backups, favorites/recents, tag and folder management, sorting/pagination, bulk actions, duplicate detection, device labels, password health, a local audit log, a standalone generator, and a polished Linux desktop with no-vault onboarding. M6c Android includes the Tauri-mobile shell, AutofillService, and Android Keystore-backed biometric unlock; APK build is verified, device smoke testing remains. M6e.1 adds synced passkey storage, a Chromium extension WebAuthn provider, and passkey management in the WebUI/CLI/desktop (Chrome manual matrix pending); Android passkeys are M6e.2.
+> Status: M6e.1 passkeys (committed at `293caf1`). CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, encrypted attachments, item history reveal/compare/restore, safe backups, favorites/recents, tag and folder management, sorting/pagination, bulk actions, duplicate detection, device labels, password health, a local audit log, a standalone generator, and a polished Linux desktop with no-vault onboarding. M6c Android includes the Tauri-mobile shell, AutofillService, and Android Keystore-backed biometric unlock; APK build is verified, device smoke testing remains. M6e.1 adds synced passkey storage, a Chromium extension WebAuthn provider, and passkey management in the WebUI/CLI/desktop (Chrome manual matrix pending); Android passkeys are M6e.2. The current development host is Arch Linux; see [Build from source](#build-from-source-linux-without-nix).
 
 ## What glyx will do
 
@@ -50,16 +50,90 @@ nix build .#release-bundle
 tar -tzf result
 ```
 
+## Build from source (Linux, without Nix)
+
+This is the Arch Linux path used by the current development host. NixOS users
+can use the flake above. A detailed component-by-component guide is kept in
+`local/build-without-nix.md` for the development checkout.
+
+### Arch packages
+
+```sh
+sudo pacman -S --needed \
+  base-devel git pkgconf openssl dbus glib2 gtk3 webkit2gtk-4.1 \
+  libsoup3 librsvg libappindicator-gtk3 patchelf \
+  nodejs npm rustup wl-clipboard xclip
+```
+
+Install `jdk17-openjdk`, `android-tools`, and the Android SDK/NDK only for
+Android builds. The Tauri tray uses `libappindicator-gtk3`; the AUR
+`libayatana-appindicator` is an alternative.
+
+### Toolchain
+
+```sh
+rustup default stable
+rustup component add rustfmt clippy rust-src
+
+mkdir -p "$HOME/.local/bin"
+corepack enable --install-directory "$HOME/.local/bin"
+corepack prepare pnpm@9 --activate
+export PATH="$HOME/.local/bin:$PATH"
+# If Corepack is unavailable: npm install -g pnpm@9
+
+cargo install cargo-nextest cargo-audit --locked
+cargo install tauri-cli --version "^2" --locked
+```
+
+### Build order
+
+The WebUI is embedded into the daemon and desktop at compile time, so build it
+first:
+
+```sh
+pnpm --dir apps/webui install --frozen-lockfile
+pnpm --dir apps/webui build
+
+cargo build --release -p glyx-cli -p glyx-daemon -p glyx-nm
+cargo build --release -p glyx-tauri --features glyx-tauri/custom-protocol
+```
+
+Install the CLI, daemon, native host, and desktop binary together so the CLI
+can find its siblings:
+
+```sh
+install -Dm755 target/release/glyx ~/.local/bin/glyx
+install -Dm755 target/release/glyx-daemon ~/.local/bin/glyx-daemon
+install -Dm755 target/release/glyx-native-host ~/.local/bin/glyx-native-host
+install -Dm755 target/release/glyx-tauri ~/.local/bin/glyx-tauri
+ln -sf glyx ~/.local/bin/git-credential-glyx
+```
+
+Then run `glyx daemon start`, `glyx-tauri`, and load `apps/extension` in
+Chromium. `glyx extension install` + `glyx extension allow <id>` registers the
+native host. Android needs the SDK/NDK; see `docs.md` and
+`local/build-without-nix.md`.
+
 ## Developer shells
+
+These are NixOS-only. On Arch use the build-from-source commands above.
 
 ```sh
 nix develop                # Linux dev and test shell
 nix develop .#cross        # Windows cross-compile helpers (zig, xwin)
 nix develop .#android       # Android SDK/NDK, Gradle, cargo-ndk (scripts only)
 nix develop .#android-fhs  # FHS shell for actual APK assembly
+nix develop .#full         # all of the above in one FHS shell (agents/opencode)
+nix run .#full -- <cmd>    # one-shot command inside the full FHS shell
 ```
 
-Inside the default shell:
+`.#full` is the single-shell option: Linux, cross, and Android tooling in one
+FHS environment. Use it interactively when you want one shell for an agent such
+as `opencode`; use `nix run .#full -- <cmd>` for one-shot commands.
+`nix develop .#full -c` does not enter the FHS wrapper, so use `nix run` for
+non-interactive work.
+
+Inside the default or full shell:
 
 ```sh
 cargo nextest run          # tests (preferred)
@@ -240,7 +314,7 @@ glyx daemon status
 Open the printed address in a browser, paste the token from the runtime dir (`daemon.json`), then manage vaults and unlock items, TOTP codes, conflicts, sync, GC, and doctor from the UI. Secrets stay in memory only and never touch `localStorage`. The desktop app (`glyx-tauri`, or `nix run .#glyx-desktop`) hosts the same UI: it starts the daemon for you, wires the URL and token automatically, and ships with onboarding for choosing, adding, or creating a vault. By default it stops the daemon it started when you close the app; change that under Settings. `daemon stop` (or Lock in the UI) drops the key.
 
 ```sh
-nix profile install .#bundle   # CLI, daemon, and desktop in one profile
+nix profile install .#bundle   # NixOS: CLI, daemon, and desktop in one profile
 ```
 
 ## Browser fill, Git, clipboard
@@ -299,12 +373,12 @@ crates/
   glyx-nm        NativeMessaging stdio bridge proxying to the daemon
   glyx-cli       Full CLI: items, sessions, rekey, sync, conflicts, gc, fill, git, extension
 apps/            webui, extension; Android scaffold lives in crates/glyx-tauri/gen/android
-local/           Agent and developer docs (gitignored, local only)
+local/           Agent/developer docs, Arch build guide, handoff prompt (gitignored)
 ```
 
 ## Roadmap
 
-Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 browser/Git/clipboard fill (done), M5 file agent plus SSH (done), M5.1 three-way file merge (done), M5.2 vault onboarding plus optional keyfiles plus self-starting desktop (done), M5.3 frontend parity plus CLI TUI (done), M5.4 parity gap closure (done), M5.5 parity foundation (done), M5.6 Linux desktop polish (done), M6a notes, M6b external Markdown folders (done), M6c Android shell/scaffold/APK build plus AutofillService and biometric unlock (implemented; device smoke test pending), M6e.1 synced passkeys plus Chromium extension create/get and WebUI/CLI/desktop management (implemented), M6e.2 Android Credential Manager (planned), M7 hardening and installers.
+Milestones M-1 through M7 live in `local/current-roadmap.md` (local only). Public summary: M-1 Nix scaffold (done), M0 foundation (done), M1 items plus sessions plus rekey (done), M2 sync merge (done), M3 daemon plus WebUI plus desktop (done), M4 browser/Git/clipboard fill (done), M5 file agent plus SSH (done), M5.1 three-way file merge (done), M5.2 vault onboarding plus optional keyfiles plus self-starting desktop (done), M5.3 frontend parity plus CLI TUI (done), M5.4 parity gap closure (done), M5.5 parity foundation (done), M5.6 Linux desktop polish (done), M6a notes, M6b external Markdown folders (done), M6c Android shell/scaffold/APK build plus AutofillService and biometric unlock (implemented; device smoke test pending), M6e.1 synced passkeys plus Chromium extension create/get and WebUI/CLI/desktop management (committed at `293caf1`; Chrome manual matrix pending), M6e.2 Android Credential Manager (planned), M6f non-Nix Arch build portability (docs done; host validation pending), M7 hardening and installers.
 
 ## License
 

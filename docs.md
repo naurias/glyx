@@ -45,7 +45,7 @@ no lock/PIN UI.
 
 ## 1. Install and first run
 
-With Nix:
+### With Nix
 
 ```sh
 nix run .#default -- --help        # run the CLI without installing
@@ -54,15 +54,94 @@ nix profile install .#bundle       # CLI, daemon, and desktop app
 nix build .#release-bundle         # tarball with checksums
 ```
 
-From a dev checkout:
+### Without Nix (Arch Linux)
+
+Install the system build and runtime packages:
 
 ```sh
-nix develop
+sudo pacman -S --needed \
+  base-devel git pkgconf openssl dbus glib2 gtk3 webkit2gtk-4.1 \
+  libsoup3 librsvg libappindicator-gtk3 patchelf \
+  nodejs npm rustup wl-clipboard xclip
+```
+
+Set up Rust and pnpm:
+
+```sh
+rustup default stable
+rustup component add rustfmt clippy rust-src
+
+mkdir -p "$HOME/.local/bin"
+corepack enable --install-directory "$HOME/.local/bin"
+corepack prepare pnpm@9 --activate
+export PATH="$HOME/.local/bin:$PATH"
+# If Corepack is unavailable: npm install -g pnpm@9
+
+cargo install cargo-nextest cargo-audit --locked
+cargo install tauri-cli --version "^2" --locked
+```
+
+Build the WebUI first, then the binaries:
+
+```sh
+pnpm --dir apps/webui install --frozen-lockfile
+pnpm --dir apps/webui build
+
+cargo build --release -p glyx-cli -p glyx-daemon -p glyx-nm
+cargo build --release -p glyx-tauri --features glyx-tauri/custom-protocol
+```
+
+Install all four binaries together so the CLI can find the daemon and native
+host:
+
+```sh
+install -Dm755 target/release/glyx ~/.local/bin/glyx
+install -Dm755 target/release/glyx-daemon ~/.local/bin/glyx-daemon
+install -Dm755 target/release/glyx-native-host ~/.local/bin/glyx-native-host
+install -Dm755 target/release/glyx-tauri ~/.local/bin/glyx-tauri
+ln -sf glyx ~/.local/bin/git-credential-glyx
+```
+
+Android needs JDK 17, Android SDK platform 36, Build-Tools 35 and 36, the NDK,
+and `cargo-ndk`; see section 21 and the local build guide in the development
+checkout.
+
+### From a dev checkout
+
+NixOS:
+
+```sh
+nix develop                # Linux dev and test shell
+nix develop .#full         # Linux, cross, and Android tooling in one FHS shell
 cargo nextest run
 pnpm --dir apps/webui build
 ```
 
-The Linux desktop tray uses the system StatusNotifierItem/AppIndicator library (`libayatana-appindicator3` or the legacy `libappindicator3`). Nix builds embed the library path in the binary. On non-Nix systems install the matching package; when running a `cargo`-built `glyx-tauri` directly, use `nix develop` or provide the library path yourself.
+`.#full` is intended for running an agent such as `opencode` inside a single
+shell. For non-interactive use, run `nix run .#full -- <command>`; `nix develop
+.#full -c` does not enter the FHS wrapper.
+
+Arch Linux: use the commands above, then run the gates below.
+
+The Linux desktop tray uses the system StatusNotifierItem/AppIndicator library
+(`libayatana-appindicator3` or the legacy `libappindicator3`). Nix builds embed
+the library path in the binary. On Arch install `libappindicator-gtk3` (or the
+AUR `libayatana-appindicator`); the normal loader finds `/usr/lib`. For a
+non-standard prefix, set `LD_LIBRARY_PATH`.
+
+### Build and test gates
+
+```sh
+cargo nextest run --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo audit
+pnpm --dir apps/webui build
+```
+
+Current expected count: **100/100 nextest** as of M6e.1. The detailed Arch
+component-by-component guide is `local/build-without-nix.md` in the development
+checkout; the public summary is in `README.md`.
 
 First run:
 
@@ -680,11 +759,11 @@ Secrets are kept in memory only and never written to `localStorage`.
 
 ## 17. Desktop app
 
-`glyx-tauri` (or `nix run .#glyx-desktop`) starts the daemon for the selected vault, injects the URL and token into the WebView, and opens the GUI. It closes the daemon on exit by default.
+`glyx-tauri` (the installed binary, or `nix run .#glyx-desktop` on NixOS) starts the daemon for the selected vault, injects the URL and token into the WebView, and opens the GUI. It closes the daemon on exit by default.
 
 With no vault selected, the desktop opens onboarding instead of failing to connect: it lists known vaults and offers **Open existing vault**, **Create new vault**, and **Restore from backup**. Folder/keyfile/archive selection uses native dialogs on desktop and text paths in the browser WebUI. Creating a vault auto-unlocks it and opens the item list. If the external daemon cannot be started, the desktop falls back to an in-process daemon and shows a retryable error card instead of a blank connection error.
 
-On Hyprland, the desktop starts through XWayland (`GDK_BACKEND=x11`) because WebKitGTK/GTK3 can compute a corrupted viewport after a Wayland tile resize. Set `GDK_BACKEND=wayland` explicitly to opt out. The Nix package embeds the production WebUI; `cargo build -p glyx-tauri --features glyx-tauri/custom-protocol` does the same for local builds.
+On Hyprland, the desktop starts through XWayland (`GDK_BACKEND=x11`) because WebKitGTK/GTK3 can compute a corrupted viewport after a Wayland tile resize. Set `GDK_BACKEND=wayland` explicitly to opt out. The Nix package embeds the production WebUI; `cargo build -p glyx-tauri --features glyx-tauri/custom-protocol` does the same for local Arch/Nix builds after `pnpm --dir apps/webui build`.
 
 Desktop behavior (Linux):
 
@@ -768,7 +847,7 @@ Runtime directory: `GLYX_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/glyx`, else a temp
 
 **Android Copy/Fill fails**: expected; use the Android autofill UI instead. The clipboard backend is not wired into the mobile shell yet.
 
-**Android APK build fails**: use `nix develop .#android-fhs` (not the plain `.#android` shell). The FHS shell sets the AAPT2 override and `/usr/bin`; build arm64 only with `-t aarch64` unless the disk has several GB free.
+**Android APK build fails**: on NixOS use `nix develop .#android-fhs` or `nix develop .#full` (not the plain `.#android` shell). The FHS shells set the AAPT2 override and `/usr/bin`. On Arch Linux use JDK 17, Android SDK platform 36, Build-Tools 35 and 36, the NDK, and `cargo-ndk`; no FHS shell is needed. Build arm64 only with `-t aarch64` unless the disk has several GB free.
 
 ---
 
@@ -818,14 +897,36 @@ Known limitations:
   M6e.2 (Android 14+) and will stay separate from the password `AutofillService`
 - the browser extension and Git helper are desktop-only
 
-Build from the repository:
+Build from the repository.
+
+NixOS:
 
 ```sh
-nix develop .#android-fhs
+nix develop .#android-fhs   # or .#full for the combined shell
 cd crates/glyx-tauri
 cargo tauri android build --debug --apk -t aarch64
 adb install -r gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
 ```
+
+Arch Linux:
+
+```sh
+export ANDROID_HOME="$HOME/Android/Sdk"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.0.12077973"
+export NDK_HOME="$ANDROID_NDK_HOME"
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+export PATH="${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/cmdline-tools/latest/bin:${PATH}"
+
+rustup target add aarch64-linux-android
+cd crates/glyx-tauri
+cargo tauri android build --debug --apk -t aarch64
+adb install -r gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+```
+
+Install Android SDK platform 36, Build-Tools 35 and 36, and the NDK with
+`sdkmanager`; see `local/build-without-nix.md` for the full package list.
+Replace the NDK version with the one installed on your host.
 
 Omitting `-t aarch64` builds all four ABIs and needs several GB of disk space.
 The Android scaffold lives in `crates/glyx-tauri/gen/android`; do not re-run
