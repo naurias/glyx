@@ -26,7 +26,7 @@ This guide covers the user-facing frontends:
 | SSH keys/agent | Yes | No | Partial | Inherited | Partial | No | No |
 | Favorites/recents/library/bulk/duplicates | Yes | No | Yes | Inherited | Inherited | No | No |
 | Devices/health/audit/generator | Yes | No | Yes | Inherited | Inherited | No | No |
-| Exports/injection | Yes | No | Yes | Inherited | Inherited | No | No |
+| Files & Injection | Yes | No | Yes | Inherited | Inherited | No | No |
 | Sync/conflicts/GC/doctor | Yes | No | Partial | Inherited | Inherited | No | No |
 | Desktop extras | No | No | No | Yes | No | No | No |
 | OS autofill/biometrics | No | No | No | No | Yes | No | No |
@@ -139,7 +139,7 @@ cargo audit
 pnpm --dir apps/webui build
 ```
 
-Current expected count: **100/100 nextest** as of M6e.1. The detailed Arch
+Current expected count: **103/103 nextest** on `refine-ui-files`. The detailed Arch
 component-by-component guide is `local/build-without-nix.md` in the development
 checkout; the public summary is in `README.md`.
 
@@ -320,9 +320,9 @@ Supported types:
 
 | Type | Fields |
 |------|--------|
-| `login` | username, password, url, notes |
-| `passkey` | relying_party, user_handle, credential_id, private_key, plus optional RP/user metadata and sync flags |
-| `totp` | seed or `otpauth://` URI, period, digits |
+| `login` | username, password, url, notes, plus optional TOTP seed, digits, period |
+| `passkey` | relying_party, user_handle, credential_id, private_key, plus optional RP/user metadata, sync flags, and `login_id` |
+| `totp` | seed or `otpauth://` URI, period, digits, optional `login_id` |
 | `identity` | full_name, email, phone, address |
 | `card` | number, holder, expiry, cvc |
 | `note` | markdown body |
@@ -452,7 +452,32 @@ glyx add totp --name github --field seed=otpauth://totp/GitHub:you?secret=...&is
 glyx totp github
 ```
 
-TOTP uses SHA1, 30 second steps, and 6 digits by default. The code is printed (or returned as JSON). GUI: open any item with a `seed` field and press TOTP code. TUI: press `t` in the item detail.
+A login can carry its own TOTP under the same fields, so one entry covers both
+password and code:
+
+```sh
+glyx add login --name github --field username=you --generate password \
+  --field seed=otpauth://totp/GitHub:you?secret=...&issuer=GitHub
+```
+
+Standalone `totp` and `passkey` items remain valid and can be linked to a login:
+
+```sh
+glyx link github github-totp
+glyx link github github-passkey
+glyx related github
+glyx unlink github github-totp
+glyx passkey ls --login github
+```
+
+`login_id` on the child stores the link. Creating a passkey auto-links it when
+exactly one login matches the relying-party host and the passkey username;
+otherwise link manually. Deleting a login does not cascade-delete children.
+
+TOTP uses SHA1, 30 second steps, and 6 digits by default; `digits` and `period`
+override this. The code is printed (or returned as JSON). GUI: open any item
+with a `seed` field and press TOTP code; a login shows its own seed and linked
+TOTP/passkey items in the same page. TUI: press `t` in the item detail.
 
 ---
 
@@ -502,29 +527,48 @@ The agent socket lives only while the daemon is unlocked. Private material never
 
 ---
 
-## 10. Full-file exports
+## 10. Managed files (full-file exports)
 
-Exports materialize a field, blob, or SSH key into a whole file:
+Managed files make the whole file a secret. glyx writes a plaintext copy from a
+vault item while unlocked and removes it on lock unless `--keep` is set.
 
 ```sh
 glyx export add ~/.aws/credentials --item aws --field secret_key
+glyx export add ~/Documents/report.pdf --item report   # file item, no --field
 glyx export add ~/.ssh/id_glyx --ssh deploy --keep
 glyx export add ./artifact.bin --blob blake3-<hex>
 glyx export ls
+glyx export show ~/.aws/credentials
+glyx export keep ~/.aws/credentials [--off]
+glyx export move ~/.aws/credentials ~/.config/aws/credentials
 glyx export recall ~/.aws/credentials     # wipe and forget
 glyx export enforce [--force]
 glyx export tamper
 ```
 
-Files without `--keep` are shredded on lock and re-created on unlock. `--force` overwrites a file that changed since the last unlock. `export tamper` lists findings.
+When `--item` points at a `file` item and no field is given, the source is the
+whole attached blob. Files without `--keep` are shredded on lock and re-created
+on unlock. `--force` overwrites a file that changed since the last unlock.
+`export tamper` lists findings.
 
-GUI: the Exports page adds exports (field, blob, or SSH) with a `perm` field, has a dedicated **Export an SSH key** form (item, target, perm), and lists tracked targets with Unlock, Lock, Move, and Recall. When tamper is detected it offers Force re-materialize and Keep (stop tracking without wiping).
+GUI: **Files & Injection → Managed files** materializes a file item or a single
+field with a native path picker, permissions, and a lock-behavior toggle. The
+list supports Materialize, Lock, Keep, Move, and Forget. When tamper is
+detected it offers Restore vault copy or Keep file.
 
 ---
 
-## 11. Injection (files, folders, pointers)
+## 11. In-place injection (files, folders, pointers)
 
-Injection edits a tracked text file in place, replacing placeholders with secrets while unlocked and restoring the locked form when locked.
+Injection keeps your own file and only swaps marked values. While unlocked glyx
+writes plaintext in place; on lock it restores each marked value to the chosen
+locked form. The canonical template uses plain readable references, never
+secrets, and is stored with the tracking row:
+
+```text
+user = abc
+password = {{glyx:<item-id>/password}}
+```
 
 Author a reference in the file:
 
@@ -581,7 +625,34 @@ glyx inject move <old> <new>
 
 `inject move` re-points the ledger entry and re-seals pointers for the new path, so the moved file unlocks normally. A folder target scopes its children.
 
-CLI `inject ls` lists folders first, then files. GUI: the Exports page shows tracked folders, exports, and injected files, each with Unlock, Lock, Move, and Forget or Recall. Settings toggles auto-materialize.
+### Editing references from the CLI
+
+```sh
+glyx inject show project/.env [--reveal]
+glyx inject preview project/.env [--reveal]
+glyx inject add-ref project/.env --line 4 --item github --field password
+glyx inject add-ref project/.env --line 4 --item github --field password \
+  --form masked --replace
+glyx inject rm-ref project/.env --item github --field password
+glyx inject form project/.env masked
+glyx inject save project/.env --template-file project.env.tpl [--locked]
+```
+
+`show` prints the canonical template and resolved references. `preview` renders
+both states. `add-ref` and `rm-ref` update the template, re-render the tracked
+file, and preserve the expected hash so concurrent edits are rejected rather
+than overwritten. Each reference may use its own locked form.
+
+CLI `inject ls` lists folders first, then files. GUI:
+**Files & Injection → In-place injection** opens a tracked file in a template
+editor with line numbers, reference chips, per-reference locked forms, insert
+and remove controls, and an unlocked/locked preview. Managed files and tracked
+folders live in sibling tabs, so the whole-file and in-place models are never
+mixed.
+
+On lock, an unchanged file is restored from the exact locked baseline. If the
+file changed while unlocked, glyx routes the difference through the same
+three-way merge as tamper handling; it never blindly replaces values.
 
 ### Tampering and merge
 
@@ -746,10 +817,12 @@ glyx daemon stop
 The daemon serves the GUI on loopback. The static pages are public; every `/v1` API call requires the bearer token. Open the printed URL, enter the token from `daemon.json`, and use the pages:
 
 - `/` unlock with password, keyfile, or PIN, with an Advanced section for per-unlock TTL and materialization; when unlocking with a password you can also set a PIN
-- `/items` and `/items/<id>` browse, search, reveal, copy, edit, delete, TOTP, and restore history
-- `/add` create any item type
+- the unlocked shell has a persistent sidebar (Items, Favorites, Recents, Passkeys, Files & Injection, Conflicts, Health, Devices, Audit, Generator, Settings, Vaults) and a top bar with global search, Add item, and Lock
+- `/items` and `/items/<id>` browse, filter, bulk-edit, reveal, copy, edit, delete, TOTP, linked items, used-by targets, and restore history; `/library` manages tags/folders
+- `/add` pick a type then create it
+- `/passkeys` manage passkey metadata and open the linked login
 - `/conflicts` compare and resolve
-- `/exports` exports with perm, SSH key export, injections, folders, per-target lock/unlock/move, merge
+- `/files` splits **Managed files** (whole-file materialization, perm, keep-on-lock) from **In-place injection** (template editor, reference chips, per-reference form, preview, merge); `/exports` redirects here
 - `/onboarding` select, add, create, or forget vaults
 - `/settings` session mode and TTL, idle auto-lock, auto-materialize, daemon behavior, rekey (including keeping old slots), sync, GC, doctor (rebuild + with-unlock), pairwise sync, and the SSH agent socket
 

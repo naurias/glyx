@@ -4,7 +4,7 @@ Local-first password manager for Linux, Windows, and Android. CLI, full-screen T
 
 Full feature guide for every frontend, with examples: **[docs.md](docs.md)**. The frontend capability summary is under **[Frontends at a glance](docs.md#frontends-at-a-glance)**.
 
-> Status: M6e.1 passkeys (committed at `293caf1`). CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, encrypted attachments, item history reveal/compare/restore, safe backups, favorites/recents, tag and folder management, sorting/pagination, bulk actions, duplicate detection, device labels, password health, a local audit log, a standalone generator, and a polished Linux desktop with no-vault onboarding. M6c Android includes the Tauri-mobile shell, AutofillService, and Android Keystore-backed biometric unlock; APK build is verified, device smoke testing remains. M6e.1 adds synced passkey storage, a Chromium extension WebAuthn provider, and passkey management in the WebUI/CLI/desktop (Chrome manual matrix pending); Android passkeys are M6e.2. The current development host is Arch Linux; see [Build from source](#build-from-source-linux-without-nix).
+> Status: M6e.1 passkeys (committed at `293caf1`). CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, encrypted attachments, item history reveal/compare/restore, safe backups, favorites/recents, tag and folder management, sorting/pagination, bulk actions, duplicate detection, device labels, password health, a local audit log, a standalone generator, and a polished Linux desktop with no-vault onboarding. M6c Android includes the Tauri-mobile shell, AutofillService, and Android Keystore-backed biometric unlock; APK build is verified, device smoke testing remains. M6e.1 adds synced passkey storage, a Chromium extension WebAuthn provider, and passkey management in the WebUI/CLI/desktop (Chrome manual matrix pending); Android passkeys are M6e.2. The current development host is NixOS; see [Build from source](#build-from-source-linux-without-nix).
 
 ## What glyx will do
 
@@ -233,10 +233,13 @@ Unlock needs a password, mandatory. A keyfile (a 32 byte random file you keep ap
 Two ways to let apps use secrets while the vault is unlocked. Files you do not mark `--keep` are shredded when the vault locks; `--keep` files (real exports) stay but are re-synced on unlock:
 
 ```sh
-# Full-file export: a field, blob, or SSH key lands at a path
+# Managed file: a file item, field, blob, or SSH key lands at a path
 glyx export add ~/.aws/credentials --item aws --field secret_key
+glyx export add ~/Documents/report.pdf --item report
 glyx export add ~/.ssh/id_glyx --ssh deploy --keep
 glyx export ls
+glyx export show ~/.aws/credentials
+glyx export keep ~/.aws/credentials    # survive lock (--off to revert)
 glyx export recall ~/.aws/credentials
 glyx export enforce [--force]
 
@@ -248,7 +251,19 @@ glyx inject add ~/notes/todo.md --form masked
 glyx inject add ~/Obsidian --glob '*.md'
 glyx inject scan
 glyx inject rm ~/Obsidian
+
+# Inspect and edit references without hand-authoring them
+glyx inject show ~/project/.env
+glyx inject preview ~/project/.env
+glyx inject add-ref ~/project/.env --line 4 --item github --field password
+glyx inject rm-ref ~/project/.env --item github --field password
+glyx inject form ~/project/.env masked
 ```
+
+The WebUI splits these into **Files & Injection → Managed files** and
+**In-place injection**. The injection editor opens the canonical reference
+template, lets you insert references from any item field, choose a locked form
+per reference, and preview both states before saving.
 
 Locked files show opaque encrypted pointers by default (`__GLYXENC:V1:…`, bound to their target path so copying them elsewhere fails closed). Where tooling must parse locked files, `--form masked` writes fixed-size `ENC[…]` tags instead. If a file changed while locked, unlock reports it instead of overwriting: `glyx export tamper`, then combine, keep, or overwrite:
 
