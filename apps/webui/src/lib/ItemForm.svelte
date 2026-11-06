@@ -17,7 +17,9 @@
   let form = { ...values };
   let tagText = (tags || []).join(', ');
 
-  $: fieldSpecs = templates.find((t) => t.type === item_type)?.fields ?? [];
+  $: fieldSpecs = (templates.find((t) => t.type === item_type)?.fields ?? []).filter(
+    (f) => f.name !== 'login_id'
+  );
   $: preview = renderMarkdown(form.body ?? '');
 
   function generate(field) {
@@ -65,6 +67,7 @@
         <input
           type={f.secret ? 'password' : 'text'}
           bind:value={form[f.name]}
+          placeholder={f.name === 'seed' ? 'base32 secret or otpauth:// URI' : ''}
           style="flex: 1"
         />
         {#if f.secret}

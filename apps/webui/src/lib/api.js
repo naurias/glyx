@@ -151,6 +151,9 @@ export const api = {
   edit: (id, body) => req('PATCH', `/v1/items/${id}`, body),
   remove: (id) => req('DELETE', `/v1/items/${id}`),
   totp: (id) => req('GET', `/v1/items/${id}/totp`),
+  related: (id) => req('GET', `/v1/items/${id}/related`),
+  link: (id, child) => req('POST', `/v1/items/${id}/link`, { child }),
+  unlink: (id, child) => req('POST', `/v1/items/${id}/unlink`, { child }),
   fill: (id, field, timeout = 15) => req('POST', `/v1/items/${id}/fill`, { field, timeout }),
   history: (id) => req('GET', `/v1/items/${id}/history`),
   historyItem: (id, file, reveal = false) =>
@@ -174,8 +177,20 @@ export const api = {
   },
   exports: () => req('GET', '/v1/exports'),
   recall: (target) => req('DELETE', `/v1/exports?target=${encodeURIComponent(target)}`),
+  updateExport: (target, body) => req('PATCH', '/v1/exports', { target, ...body }),
   enforce: (force) => req('POST', '/v1/exports/enforce', { force }),
   trackInject: (target, form, glob) => req('POST', '/v1/injects', { target, form, glob }),
+  injectContent: (target, reveal = false) =>
+    req(
+      'GET',
+      `/v1/injects/content?target=${encodeURIComponent(target)}&reveal=${reveal}`
+    ),
+  injectPreview: (target, reveal = false) =>
+    req(
+      'GET',
+      `/v1/injects/preview?target=${encodeURIComponent(target)}&reveal=${reveal}`
+    ),
+  saveInject: (body) => req('PUT', '/v1/injects/content', body),
   scanInjects: () => req('POST', '/v1/injects/scan'),
   targetUnlock: (target, force = false) => req('POST', '/v1/agent/unlock', { target, force }),
   targetLock: (target) => req('POST', '/v1/agent/lock', { target }),
