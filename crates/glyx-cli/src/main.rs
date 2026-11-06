@@ -231,6 +231,25 @@ enum Cmd {
         #[arg(help = "Id, id prefix, or exact name")]
         query: String,
     },
+    #[command(about = "Link a TOTP or passkey item to a login")]
+    Link {
+        #[arg(help = "Login item")]
+        login: String,
+        #[arg(help = "TOTP or passkey item")]
+        child: String,
+    },
+    #[command(about = "Unlink a TOTP or passkey item from a login")]
+    Unlink {
+        #[arg(help = "Login item")]
+        login: String,
+        #[arg(help = "TOTP or passkey item")]
+        child: String,
+    },
+    #[command(about = "Show items linked to a login or its parent login")]
+    Related {
+        #[arg(help = "Id, id prefix, or exact name")]
+        query: String,
+    },
     #[command(about = "Copy a field to the clipboard")]
     Fill {
         #[arg(help = "Id, id prefix, or exact name")]
@@ -379,7 +398,10 @@ enum ConfigCmd {
 #[derive(Debug, Subcommand)]
 enum PasskeyCmd {
     #[command(about = "List stored passkeys")]
-    Ls,
+    Ls {
+        #[arg(long, help = "Only passkeys linked to this login")]
+        login: Option<String>,
+    },
     #[command(about = "Show passkey metadata")]
     Show {
         #[arg(help = "Id, id prefix, or exact name")]
@@ -521,6 +543,25 @@ enum ExportCmd {
     },
     #[command(about = "List registered exports and injections")]
     Ls,
+    #[command(about = "Show one tracked export or injection")]
+    Show {
+        #[arg(help = "Target path")]
+        target: PathBuf,
+    },
+    #[command(about = "Move a tracked target to a new path")]
+    Move {
+        #[arg(help = "Current path")]
+        target: PathBuf,
+        #[arg(help = "New path")]
+        to: PathBuf,
+    },
+    #[command(about = "Change whether a managed file survives lock")]
+    Keep {
+        #[arg(help = "Target path")]
+        target: PathBuf,
+        #[arg(long, help = "Remove the file on lock instead of keeping it")]
+        off: bool,
+    },
     #[command(about = "Wipe a tracked file and forget it")]
     Recall {
         #[arg(help = "Target path")]
@@ -587,6 +628,62 @@ enum InjectCmd {
     },
     #[command(about = "List tracked injections")]
     Ls,
+    #[command(about = "Show a tracked file's injection template and references")]
+    Show {
+        #[arg(help = "Tracked file")]
+        target: PathBuf,
+        #[arg(long, help = "Reveal secret values")]
+        reveal: bool,
+    },
+    #[command(about = "Preview unlocked and locked forms")]
+    Preview {
+        #[arg(help = "Tracked file")]
+        target: PathBuf,
+        #[arg(long, help = "Reveal secret values")]
+        reveal: bool,
+    },
+    #[command(about = "Insert a secret reference at a line")]
+    AddRef {
+        #[arg(help = "Tracked file")]
+        target: PathBuf,
+        #[arg(long, help = "1-based line number")]
+        line: usize,
+        #[arg(long, help = "Source item")]
+        item: String,
+        #[arg(long, help = "Source field")]
+        field: String,
+        #[arg(long, default_value = "encrypted-pointer", help = "Locked form")]
+        form: String,
+        #[arg(long, help = "Replace the whole line instead of appending")]
+        replace: bool,
+    },
+    #[command(about = "Remove a secret reference")]
+    RmRef {
+        #[arg(help = "Tracked file")]
+        target: PathBuf,
+        #[arg(long, help = "Source item")]
+        item: String,
+        #[arg(long, help = "Source field")]
+        field: String,
+    },
+    #[command(about = "Change the locked form for a tracked file")]
+    Form {
+        #[arg(help = "Tracked file")]
+        target: PathBuf,
+        #[arg(help = "ref, masked, or encrypted-pointer")]
+        form: String,
+    },
+    #[command(about = "Save a template file and re-render it")]
+    Save {
+        #[arg(help = "Tracked file")]
+        target: PathBuf,
+        #[arg(long, help = "Template file containing {{glyx:...}} references")]
+        template_file: PathBuf,
+        #[arg(long, help = "Locked form override")]
+        form: Option<String>,
+        #[arg(long, help = "Write the locked form instead of the unlocked value")]
+        locked: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -930,6 +1027,9 @@ fn dispatch(ctx: &Ctx, cmd: Cmd) -> Result<()> {
         ),
         Cmd::Rm { query } => cmd_rm(ctx, &query),
         Cmd::Totp { query } => cmd_totp(ctx, &query),
+        Cmd::Link { login, child } => cmd_link(ctx, &login, &child, true),
+        Cmd::Unlink { login, child } => cmd_link(ctx, &login, &child, false),
+        Cmd::Related { query } => cmd_related(ctx, &query),
         Cmd::Fill {
             query,
             field,
@@ -1013,6 +1113,9 @@ fn dispatch_grouped(ctx: &Ctx, cmd: Cmd) -> Result<()> {
         | Cmd::Edit { .. }
         | Cmd::Rm { .. }
         | Cmd::Totp { .. }
+        | Cmd::Link { .. }
+        | Cmd::Unlink { .. }
+        | Cmd::Related { .. }
         | Cmd::Fill { .. }
         | Cmd::Passkey { .. }
         | Cmd::Tui => unreachable!("interactive commands handled in dispatch"),
@@ -1062,6 +1165,12 @@ fn dispatch_export(ctx: &Ctx, cmd: ExportCmd) -> Result<()> {
             )
         }
         ExportCmd::Ls => exports::cmd_ls(ctx.json),
+        ExportCmd::Show { target } => exports::cmd_show(&target, ctx.json),
+        ExportCmd::Move { target, to } => {
+            let uv = ctx.unlocked()?;
+            exports::cmd_move(&uv, &target, &to, ctx.json)
+        }
+        ExportCmd::Keep { target, off } => exports::cmd_keep(&target, !off, ctx.json),
         ExportCmd::Recall { target } => exports::cmd_recall(&target, ctx.json),
         ExportCmd::Enforce { force } => {
             let mut uv = ctx.unlocked()?;
@@ -1111,6 +1220,60 @@ fn dispatch_inject(ctx: &Ctx, cmd: InjectCmd) -> Result<()> {
         }
         InjectCmd::Rm { target } => exports::cmd_inject_rm(&target, ctx.json),
         InjectCmd::Ls => exports::cmd_ls(ctx.json),
+        InjectCmd::Show { target, reveal } => {
+            let uv = ctx.unlocked()?;
+            exports::cmd_inject_show(&uv, &target, reveal, ctx.json)
+        }
+        InjectCmd::Preview { target, reveal } => {
+            let uv = ctx.unlocked()?;
+            exports::cmd_inject_preview(&uv, &target, reveal, ctx.json)
+        }
+        InjectCmd::AddRef {
+            target,
+            line,
+            item,
+            field,
+            form,
+            replace,
+        } => {
+            let uv = ctx.unlocked()?;
+            let opts = exports::AddRefOpts {
+                line,
+                item: &item,
+                field: &field,
+                form: &form,
+                replace,
+            };
+            exports::cmd_inject_add_ref(&uv, &target, &opts, ctx.json)
+        }
+        InjectCmd::RmRef {
+            target,
+            item,
+            field,
+        } => {
+            let uv = ctx.unlocked()?;
+            exports::cmd_inject_rm_ref(&uv, &target, &item, &field, ctx.json)
+        }
+        InjectCmd::Form { target, form } => {
+            let uv = ctx.unlocked()?;
+            exports::cmd_inject_form(&uv, &target, &form, ctx.json)
+        }
+        InjectCmd::Save {
+            target,
+            template_file,
+            form,
+            locked,
+        } => {
+            let uv = ctx.unlocked()?;
+            exports::cmd_inject_save(
+                &uv,
+                &target,
+                &template_file,
+                form.as_deref(),
+                locked,
+                ctx.json,
+            )
+        }
     }
 }
 
@@ -2439,7 +2602,7 @@ fn cmd_edit(ctx: &Ctx, input: EditInput) -> Result<()> {
 
 fn dispatch_passkey(ctx: &Ctx, cmd: PasskeyCmd) -> Result<()> {
     match cmd {
-        PasskeyCmd::Ls => cmd_passkey_ls(ctx),
+        PasskeyCmd::Ls { login } => cmd_passkey_ls(ctx, login.as_deref()),
         PasskeyCmd::Show { query } => cmd_passkey_show(ctx, &query),
         PasskeyCmd::Rm { query } => cmd_passkey_rm(ctx, &query),
     }
@@ -2468,11 +2631,30 @@ fn resolve_passkey(uv: &glyx_store::UnlockedVault, query: &str) -> Result<glyx_c
     }
 }
 
-fn cmd_passkey_ls(ctx: &Ctx) -> Result<()> {
+fn cmd_passkey_ls(ctx: &Ctx, login: Option<&str>) -> Result<()> {
     let uv = ctx.unlocked()?;
+    let login_id = match login {
+        Some(query) => {
+            let login = items::resolve_query(&uv, query)?;
+            if login.item_type != glyx_core::ItemType::Login {
+                bail!("{} is not a login item", login.name);
+            }
+            Some(login.id.to_string())
+        }
+        None => None,
+    };
     let mut out = Vec::new();
     for row in uv.list(false)? {
         if let Some(item) = uv.get_item(&row.id)? {
+            if let Some(login_id) = &login_id {
+                let linked = item
+                    .fields
+                    .get("login_id")
+                    .map(|f| f.value.expose().trim().to_owned());
+                if linked.as_deref() != Some(login_id.as_str()) {
+                    continue;
+                }
+            }
             if let Some(meta) = glyx_daemon::passkey::metadata(&item) {
                 out.push(meta);
             }
@@ -2603,6 +2785,114 @@ fn cmd_fill(ctx: &Ctx, query: &str, field: &str, timeout: u64, dry_run: bool) ->
         } else {
             println!("clipboard changed, left alone");
         }
+    }
+    Ok(())
+}
+
+fn cmd_link(ctx: &Ctx, login_query: &str, child_query: &str, link: bool) -> Result<()> {
+    let mut uv = ctx.unlocked()?;
+    let login = items::resolve_query(&uv, login_query)?;
+    if login.item_type != glyx_core::ItemType::Login {
+        bail!("{} is not a login item", login.name);
+    }
+    let mut child = items::resolve_query(&uv, child_query)?;
+    if child.item_type != glyx_core::ItemType::Totp
+        && child.item_type != glyx_core::ItemType::Passkey
+    {
+        bail!("{} is not a TOTP or passkey item", child.name);
+    }
+    let login_id = login.id.to_string();
+    if link {
+        let values = BTreeMap::from([("login_id".to_owned(), login_id)]);
+        glyx_store::present::apply_fields(&mut uv, &mut child, values)?;
+    } else {
+        let linked = child
+            .fields
+            .get("login_id")
+            .map(|f| f.value.expose().trim().to_owned());
+        if linked.as_deref() != Some(login_id.as_str()) {
+            bail!("{} is not linked to {}", child.name, login.name);
+        }
+        child.fields.remove("login_id");
+        glyx_store::present::apply_fields(&mut uv, &mut child, BTreeMap::new())?;
+    }
+    uv.put_item(&child)?;
+    cli_audit(
+        &uv,
+        if link { "item_link" } else { "item_unlink" },
+        Some(child.id),
+        None,
+    );
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "login": login.id,
+                "child": child.id,
+                "linked": link,
+            })
+        );
+    } else if link {
+        println!("linked {} to {}", child.name, login.name);
+    } else {
+        println!("unlinked {} from {}", child.name, login.name);
+    }
+    Ok(())
+}
+
+fn cmd_related(ctx: &Ctx, query: &str) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    let item = items::resolve_query(&uv, query)?;
+    let item_id = item.id.to_string();
+    let parent = item
+        .fields
+        .get("login_id")
+        .map(|f| f.value.expose().trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let mut children = Vec::new();
+    let mut siblings = Vec::new();
+    for row in uv.list(false)? {
+        let Some(other) = uv.get_item(&row.id)? else {
+            continue;
+        };
+        let linked = other
+            .fields
+            .get("login_id")
+            .map(|f| f.value.expose().trim().to_owned());
+        if linked.as_deref() == Some(item_id.as_str()) {
+            children.push(other);
+        } else if let Some(parent) = &parent {
+            if other.id.to_string() == *parent {
+                continue;
+            }
+            if linked.as_deref() == Some(parent.as_str()) {
+                siblings.push(other);
+            }
+        }
+    }
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "item": items::item_json(&item, false),
+                "parent": parent,
+                "children": children.iter().map(|c| items::item_json(c, false)).collect::<Vec<_>>(),
+                "siblings": siblings.iter().map(|c| items::item_json(c, false)).collect::<Vec<_>>(),
+            })
+        );
+        return Ok(());
+    }
+    println!("{} [{}]", item.name, type_label(item.item_type));
+    if let Some(parent) = &parent {
+        println!("linked to login: {parent}");
+    }
+    for child in children.iter().chain(siblings.iter()) {
+        println!(
+            "  {}  {}  {}",
+            child.id,
+            type_label(child.item_type),
+            child.name
+        );
     }
     Ok(())
 }

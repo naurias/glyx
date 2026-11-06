@@ -180,6 +180,7 @@ fn cors_layer() -> CorsLayer {
         .allow_methods([
             Method::GET,
             Method::POST,
+            Method::PUT,
             Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
@@ -234,6 +235,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(show_item).patch(edit_item).delete(delete_item),
         )
         .route("/v1/items/:id/totp", get(totp_code))
+        .route("/v1/items/:id/related", get(item_related))
+        .route("/v1/items/:id/link", post(item_link))
+        .route("/v1/items/:id/unlink", post(item_unlink))
         .route("/v1/items/:id/rendered", get(rendered_item))
         .route("/v1/items/:id/fill", post(fill_item))
         .route("/v1/items/:id/history", get(item_history))
@@ -261,10 +265,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/doctor", get(doctor))
         .route(
             "/v1/exports",
-            get(list_exports).post(add_export).delete(recall_export),
+            get(list_exports)
+                .post(add_export)
+                .delete(recall_export)
+                .patch(update_export),
         )
         .route("/v1/exports/enforce", post(enforce_exports))
-        .route("/v1/injects", post(add_inject))
+        .route("/v1/injects", get(list_exports).post(add_inject))
+        .route("/v1/injects/content", get(inject_content).put(inject_save))
+        .route("/v1/injects/preview", get(inject_preview))
         .route("/v1/injects/scan", post(scan_injects))
         .route("/v1/agent/tamper", get(agent_tamper))
         .route("/v1/agent/resolve", post(agent_resolve))
@@ -488,7 +497,7 @@ async fn passkey_create(
     } else {
         format!("{} ({})", created.rp_name, created.user_name)
     };
-    let values = BTreeMap::from([
+    let mut values = BTreeMap::from([
         ("relying_party".to_owned(), created.rp_id.clone()),
         ("rp_name".to_owned(), created.rp_name.clone()),
         ("user_handle".to_owned(), created.user_handle.clone()),
@@ -506,6 +515,9 @@ async fn passkey_create(
         ("last_used_ms".to_owned(), now.to_string()),
         ("transports".to_owned(), "internal".to_owned()),
     ]);
+    if let Some(login) = unique_login_for(uv, &created.rp_id, &created.user_name) {
+        values.insert("login_id".to_owned(), login);
+    }
     let item = match glyx_store::present::build_new(
         uv,
         glyx_core::ItemType::Passkey,
@@ -1620,6 +1632,251 @@ async fn totp_code(
     }
 }
 
+fn url_host(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let host = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .split('@')
+        .next_back()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+fn unique_login_for(uv: &glyx_store::UnlockedVault, rp_id: &str, account: &str) -> Option<String> {
+    let rows = uv.list(false).ok()?;
+    let mut found = None;
+    for row in rows {
+        let Ok(Some(item)) = uv.get_item(&row.id) else {
+            continue;
+        };
+        if item.item_type != glyx_core::ItemType::Login {
+            continue;
+        }
+        let username = item
+            .fields
+            .get("username")
+            .map(|f| f.value.expose().trim().to_owned());
+        if username.as_deref() != Some(account.trim()) {
+            continue;
+        }
+        let host = item
+            .fields
+            .get("url")
+            .and_then(|f| url_host(f.value.expose()));
+        let Some(host) = host else {
+            continue;
+        };
+        if host != rp_id && !host.ends_with(&format!(".{rp_id}")) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(item.id.to_string());
+    }
+    found
+}
+
+fn linked_login(item: &glyx_core::Item) -> Option<String> {
+    item.fields
+        .get("login_id")
+        .map(|f| f.value.expose().trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn item_is_linked_to(item: &glyx_core::Item, login_id: &str) -> bool {
+    let Some(linked) = linked_login(item) else {
+        return false;
+    };
+    linked == login_id
+        || uuid::Uuid::parse_str(&linked).is_ok_and(|parsed| parsed.to_string() == login_id)
+}
+
+async fn item_related(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let item = match uv.resolve(&id) {
+        Ok(item) => item,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    let login_id = item.id.to_string();
+    let rows = match uv.list(false) {
+        Ok(rows) => rows,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    let mut children = Vec::new();
+    for row in rows {
+        match uv.get_item(&row.id) {
+            Ok(Some(other)) => {
+                if other.id != item.id && item_is_linked_to(&other, &login_id) {
+                    children.push(glyx_store::present::item_json(&other, false));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => return store_error(&e).into_response(),
+        }
+    }
+    let parent = linked_login(&item).and_then(|linked| {
+        uv.resolve(&linked)
+            .ok()
+            .map(|login| glyx_store::present::item_json(&login, false))
+    });
+    let mut injected = Vec::new();
+    let mut exported = Vec::new();
+    if let Ok(conn) = glyx_agent::ledger::open_db() {
+        if let Ok(injects) = glyx_agent::ledger::list_injects(&conn) {
+            for row in injects {
+                let refs: serde_json::Value =
+                    serde_json::from_str(&row.refs_json).unwrap_or_else(|_| serde_json::json!([]));
+                let hit = refs.as_array().is_some_and(|list| {
+                    list.iter().any(|entry| {
+                        entry
+                            .get("item_id")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|value| value == login_id)
+                    })
+                });
+                if hit {
+                    injected.push(row.target.to_string_lossy().into_owned());
+                }
+            }
+        }
+        if let Ok(exports) = glyx_agent::ledger::list_exports(&conn) {
+            for row in exports {
+                if row
+                    .item_id
+                    .is_some_and(|value| value.to_string() == login_id)
+                {
+                    exported.push(row.target.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    Json(serde_json::json!({
+        "item": glyx_store::present::item_json(&item, false),
+        "parent": parent,
+        "children": children,
+        "used_by": { "injects": injected, "exports": exported },
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct LinkBody {
+    child: String,
+}
+
+async fn item_link(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<LinkBody>,
+) -> impl IntoResponse {
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return locked_error().into_response();
+    };
+    let parent = match uv.resolve(&id) {
+        Ok(item) => item,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    if parent.item_type != glyx_core::ItemType::Login {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "only login items can own linked children"})),
+        )
+            .into_response();
+    }
+    let mut child = match uv.resolve(&body.child) {
+        Ok(item) => item,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    if child.item_type != glyx_core::ItemType::Totp
+        && child.item_type != glyx_core::ItemType::Passkey
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "only TOTP or passkey items can be linked"})),
+        )
+            .into_response();
+    }
+    let login_id = parent.id.to_string();
+    let values = BTreeMap::from([("login_id".to_owned(), login_id)]);
+    if let Err(e) = glyx_store::present::apply_fields(uv, &mut child, values) {
+        return store_error(&e).into_response();
+    }
+    match uv.put_item(&child) {
+        Ok(()) => {
+            audit(uv, "item_link", Some(child.id), None, "success", None);
+            Json(serde_json::json!({"ok": true, "child": child.id})).into_response()
+        }
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
+async fn item_unlink(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<LinkBody>,
+) -> impl IntoResponse {
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return locked_error().into_response();
+    };
+    let parent = match uv.resolve(&id) {
+        Ok(item) => item,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    let mut child = match uv.resolve(&body.child) {
+        Ok(item) => item,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    if !item_is_linked_to(&child, &parent.id.to_string()) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "item is not linked to this login"})),
+        )
+            .into_response();
+    }
+    child.fields.remove("login_id");
+    if let Err(e) = glyx_store::present::apply_fields(uv, &mut child, BTreeMap::new()) {
+        return store_error(&e).into_response();
+    }
+    match uv.put_item(&child) {
+        Ok(()) => {
+            audit(uv, "item_unlink", Some(child.id), None, "success", None);
+            Json(serde_json::json!({"ok": true, "child": child.id})).into_response()
+        }
+        Err(e) => store_error(&e).into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 struct SshGenBody {
     name: String,
@@ -2319,15 +2576,122 @@ async fn list_exports(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(serde_json::json!({
         "exports": exports.iter().map(|e| serde_json::json!({
             "target": e.target, "kind": e.kind, "keep": e.keep_on_lock,
+            "item_id": e.item_id, "field": e.field, "blob": e.blob_addr,
+            "perm": e.perm,
         })).collect::<Vec<_>>(),
-        "injects": injects.iter().map(|i| serde_json::json!({
-            "target": i.target, "form": i.form,
-        })).collect::<Vec<_>>(),
+        "injects": injects.iter().map(|i| {
+            let hash = std::fs::read(&i.target)
+                .ok()
+                .map(|bytes| glyx_crypto::blake3_hex(&bytes));
+            let status = if !i.target.exists() {
+                "missing"
+            } else if hash.as_deref() == i.locked_hash.as_deref() {
+                "locked"
+            } else if hash.as_deref() == i.unlocked_hash.as_deref() {
+                "unlocked"
+            } else {
+                "drift"
+            };
+            let refs: serde_json::Value =
+                serde_json::from_str(&i.refs_json).unwrap_or_else(|_| serde_json::json!([]));
+            serde_json::json!({
+                "target": i.target, "form": i.form, "status": status,
+                "template": i.template_text.is_some(), "refs": refs,
+            })
+        }).collect::<Vec<_>>(),
         "roots": roots.iter().map(|r| serde_json::json!({
             "root": r.root, "glob": r.glob, "form": r.form,
         })).collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct InjectQuery {
+    target: PathBuf,
+    reveal: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct InjectSaveBody {
+    target: PathBuf,
+    template: String,
+    form: String,
+    expected_hash: Option<String>,
+    materialized: Option<bool>,
+    ref_forms: Option<BTreeMap<String, String>>,
+}
+
+fn inject_error(e: glyx_agent::ledger::AgentError) -> Response {
+    let (status, message) = match e {
+        glyx_agent::ledger::AgentError::Tamper(message) => (StatusCode::CONFLICT, message),
+        glyx_agent::ledger::AgentError::Io(error) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        }
+        other => (StatusCode::UNPROCESSABLE_ENTITY, other.to_string()),
+    };
+    (status, Json(serde_json::json!({"error": message}))).into_response()
+}
+
+async fn inject_content(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<InjectQuery>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    match glyx_agent::inject_content(uv, &q.target, q.reveal.unwrap_or(false)) {
+        Ok(content) => Json(content).into_response(),
+        Err(e) => inject_error(e),
+    }
+}
+
+async fn inject_preview(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<InjectQuery>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    match glyx_agent::inject_preview(uv, &q.target, q.reveal.unwrap_or(false)) {
+        Ok(preview) => Json(preview).into_response(),
+        Err(e) => inject_error(e),
+    }
+}
+
+async fn inject_save(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<InjectSaveBody>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let empty = BTreeMap::new();
+    let ref_forms = body.ref_forms.as_ref().unwrap_or(&empty);
+    match glyx_agent::inject_save(
+        uv,
+        &body.target,
+        &body.template,
+        &body.form,
+        body.expected_hash.as_deref(),
+        body.materialized.unwrap_or(true),
+        ref_forms,
+    ) {
+        Ok(content) => Json(content).into_response(),
+        Err(e) => inject_error(e),
+    }
 }
 
 #[derive(Deserialize)]
@@ -2360,10 +2724,10 @@ async fn add_export(
         },
         (None, None) => None,
     };
-    if body.kind != "field" && body.kind != "blob" && body.kind != "ssh" {
+    if body.kind != "field" && body.kind != "blob" && body.kind != "ssh" && body.kind != "file" {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({"error": "kind must be field, blob, or ssh"})),
+            Json(serde_json::json!({"error": "kind must be field, file, blob, or ssh"})),
         )
             .into_response();
     }
@@ -2390,6 +2754,39 @@ async fn add_export(
         },
     ) {
         Ok(id) => Json(serde_json::json!({"ok": true, "id": id})).into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateExportBody {
+    target: PathBuf,
+    keep: Option<bool>,
+    perm: Option<u32>,
+}
+
+async fn update_export(Json(body): Json<UpdateExportBody>) -> impl IntoResponse {
+    let conn = match glyx_agent::ledger::open_db() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    match glyx_agent::ledger::update_export(&conn, &body.target, body.keep, body.perm) {
+        Ok(true) => Json(serde_json::json!({"ok": true})).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "export not tracked"})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -2430,7 +2827,24 @@ async fn recall_export(
                 .into_response(),
         };
     }
-    match glyx_agent::engine::recall_target(&q.target) {
+    let conn = match glyx_agent::ledger::open_db() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let is_export = glyx_agent::ledger::list_exports(&conn)
+        .is_ok_and(|rows| rows.iter().any(|row| row.target.as_path() == q.target));
+    let result = if is_export {
+        glyx_agent::engine::recall_target(&q.target)
+    } else {
+        glyx_agent::forget_target(&q.target)
+    };
+    match result {
         Ok(removed) => Json(serde_json::json!({"ok": true, "removed": removed})).into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -4724,5 +5138,276 @@ mod tests {
         assert!(body["events"]
             .as_array()
             .is_some_and(|events| !events.is_empty()));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn links_totp_and_passkey_to_login() {
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": "pw", "keyfile": kf_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/items",
+            Some(serde_json::json!({
+                "type": "login",
+                "name": "example login",
+                "fields": {
+                    "username": "alice@example.com",
+                    "password": "hunter2",
+                    "url": "https://example.com/login",
+                    "seed": "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+                }
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let login_id = body["id"].as_str().expect("login id").to_owned();
+
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            &format!("/v1/items/{login_id}/totp"),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/items",
+            Some(serde_json::json!({
+                "type": "totp",
+                "name": "standalone totp",
+                "fields": {"seed": "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"}
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let totp_id = body["id"].as_str().expect("totp id").to_owned();
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            &format!("/v1/items/{login_id}/link"),
+            Some(serde_json::json!({"child": totp_id})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            &format!("/v1/items/{login_id}/related"),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["children"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["children"][0]["id"], totp_id);
+
+        let creation = serde_json::json!({
+            "rp": {"id": "example.com", "name": "Example"},
+            "user": {
+                "id": "dXNlcg",
+                "name": "alice@example.com",
+                "displayName": "Alice"
+            },
+            "challenge": "Y2hhbGxlbmdl",
+            "pubKeyCredParams": [{"type": "public-key", "alg": -7}],
+            "excludeCredentials": [],
+            "authenticatorSelection": {
+                "residentKey": "required",
+                "userVerification": "required"
+            },
+            "extensions": {"credProps": true}
+        });
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/passkeys/create",
+            Some(serde_json::json!({
+                "origin": "https://example.com",
+                "request": creation,
+                "user_verified": true
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let passkey_id = body["item_id"].as_str().expect("passkey id").to_owned();
+
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            &format!("/v1/items/{login_id}/related"),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let children = body["children"].as_array().expect("children");
+        assert_eq!(children.len(), 2, "{body}");
+        assert!(children.iter().any(|child| child["id"] == passkey_id));
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            &format!("/v1/items/{login_id}/unlink"),
+            Some(serde_json::json!({"child": totp_id})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            &format!("/v1/items/{login_id}/related"),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["children"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn inject_editor_saves_and_restores_baseline() {
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": "pw", "keyfile": kf_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/items",
+            Some(serde_json::json!({
+                "type": "login",
+                "name": "inject source",
+                "fields": {"username": "alice", "password": "hunter2"}
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let item_id = body["id"].as_str().expect("item id").to_owned();
+
+        let work = tempfile::tempdir().expect("tempdir");
+        let target = work.path().join("app.env");
+        std::fs::write(&target, "user = alice\npassword = \n").expect("write");
+        let target_str = target.to_string_lossy().into_owned();
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/injects",
+            Some(serde_json::json!({"target": target_str, "form": "encrypted-pointer"})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            &format!("/v1/injects/content?target={}", urlencoding(&target_str)),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let hash = body["hash"].as_str().expect("hash").to_owned();
+
+        let (status, body) = call(
+            state.clone(),
+            "PUT",
+            "/v1/injects/content",
+            Some(serde_json::json!({
+                "target": target_str,
+                "template": format!("user = alice\npassword = {{{{glyx:{item_id}/password}}}}\n"),
+                "form": "encrypted-pointer",
+                "expected_hash": hash,
+                "materialized": true,
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "unlocked");
+        assert_eq!(body["refs"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read"),
+            "user = alice\npassword = hunter2\n"
+        );
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/agent/lock",
+            Some(serde_json::json!({"target": target_str})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let locked = std::fs::read_to_string(&target).expect("read");
+        assert!(locked.contains("__GLYXENC:V1:"), "{locked}");
+        assert!(!locked.contains("hunter2"));
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/agent/unlock",
+            Some(serde_json::json!({"target": target_str})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read"),
+            "user = alice\npassword = hunter2\n"
+        );
+
+        let (status, body) = call(
+            state.clone(),
+            "DELETE",
+            &format!("/v1/exports?target={}", urlencoding(&target_str)),
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            target.exists(),
+            "forgetting an injection must keep the file"
+        );
+    }
+
+    fn urlencoding(path: &str) -> String {
+        path.replace('/', "%2F")
     }
 }

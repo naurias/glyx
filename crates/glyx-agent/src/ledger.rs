@@ -27,6 +27,17 @@ pub struct RefInfo {
     pub item_id: Uuid,
     pub field: String,
     pub locked: String,
+    #[serde(default)]
+    pub form: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+impl RefInfo {
+    #[must_use]
+    pub fn form_or<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.form.as_deref().unwrap_or(fallback)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +57,7 @@ pub struct InjectRow {
     pub target: PathBuf,
     pub form: String,
     pub refs_json: String,
+    pub template_text: Option<String>,
     pub locked_text: Option<String>,
     pub locked_hash: Option<String>,
     pub unlocked_hash: Option<String>,
@@ -74,13 +86,14 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), AgentError> {
            keep_on_lock INTEGER NOT NULL DEFAULT 0, perm INTEGER NOT NULL DEFAULT 384);
          CREATE TABLE IF NOT EXISTS injects(
            target TEXT PRIMARY KEY, form TEXT NOT NULL DEFAULT 'encrypted-pointer',
-           refs_json TEXT NOT NULL DEFAULT '[]', locked_text TEXT,
+           refs_json TEXT NOT NULL DEFAULT '[]', template_text TEXT, locked_text TEXT,
            locked_hash TEXT, unlocked_hash TEXT, mtime INTEGER, size INTEGER, root TEXT);
          CREATE TABLE IF NOT EXISTS inject_roots(
            root TEXT PRIMARY KEY, glob TEXT NOT NULL DEFAULT '*.md',
            form TEXT NOT NULL DEFAULT 'ref');",
     )?;
     let _ = conn.execute("ALTER TABLE injects ADD COLUMN root TEXT", []);
+    let _ = conn.execute("ALTER TABLE injects ADD COLUMN template_text TEXT", []);
     Ok(())
 }
 
@@ -217,6 +230,24 @@ pub fn register_export(conn: &Connection, spec: &ExportSpec) -> Result<String, A
         ],
     )?;
     Ok(id)
+}
+
+pub fn update_export(
+    conn: &Connection,
+    target: &Path,
+    keep_on_lock: Option<bool>,
+    perm: Option<u32>,
+) -> Result<bool, AgentError> {
+    let changed = conn.execute(
+        "UPDATE exports SET keep_on_lock = COALESCE(?1, keep_on_lock),
+           perm = COALESCE(?2, perm) WHERE target = ?3",
+        rusqlite::params![
+            keep_on_lock.map(i64::from),
+            perm.map(i64::from),
+            target.to_string_lossy(),
+        ],
+    )?;
+    Ok(changed > 0)
 }
 
 pub fn register_inject(
@@ -412,7 +443,7 @@ pub fn list_exports(conn: &Connection) -> Result<Vec<ExportRow>, AgentError> {
 
 pub fn list_injects(conn: &Connection) -> Result<Vec<InjectRow>, AgentError> {
     let mut stmt = conn.prepare(
-        "SELECT target, form, refs_json, locked_text, locked_hash, unlocked_hash FROM injects ORDER BY target",
+        "SELECT target, form, refs_json, template_text, locked_text, locked_hash, unlocked_hash FROM injects ORDER BY target",
     )?;
     let rows = stmt.query_map([], |r| {
         let target: String = r.get(0)?;
@@ -420,13 +451,35 @@ pub fn list_injects(conn: &Connection) -> Result<Vec<InjectRow>, AgentError> {
             target: PathBuf::from(target),
             form: r.get(1)?,
             refs_json: r.get(2)?,
-            locked_text: r.get(3)?,
-            locked_hash: r.get(4)?,
-            unlocked_hash: r.get(5)?,
+            template_text: r.get(3)?,
+            locked_text: r.get(4)?,
+            locked_hash: r.get(5)?,
+            unlocked_hash: r.get(6)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(AgentError::from)
+}
+
+pub fn get_inject(conn: &Connection, target: &Path) -> Result<Option<InjectRow>, AgentError> {
+    Ok(list_injects(conn)?
+        .into_iter()
+        .find(|row| row.target.as_path() == target))
+}
+
+pub fn update_inject_template(
+    conn: &Connection,
+    target: &Path,
+    form: &str,
+    template: &str,
+    refs_json: &str,
+) -> Result<(), AgentError> {
+    parse_form(form)?;
+    conn.execute(
+        "UPDATE injects SET form = ?1, template_text = ?2, refs_json = ?3 WHERE target = ?4",
+        rusqlite::params![form, template, refs_json, target.to_string_lossy()],
+    )?;
+    Ok(())
 }
 
 pub fn recall_target(conn: &Connection, target: &Path) -> Result<bool, AgentError> {

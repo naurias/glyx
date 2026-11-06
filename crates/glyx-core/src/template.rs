@@ -28,6 +28,21 @@ const LOGIN: &[FieldSpec] = &[
         secret: false,
         required: false,
     },
+    FieldSpec {
+        name: "seed",
+        secret: true,
+        required: false,
+    },
+    FieldSpec {
+        name: "digits",
+        secret: false,
+        required: false,
+    },
+    FieldSpec {
+        name: "period",
+        secret: false,
+        required: false,
+    },
 ];
 
 const PASSKEY: &[FieldSpec] = &[
@@ -111,6 +126,11 @@ const PASSKEY: &[FieldSpec] = &[
         secret: false,
         required: false,
     },
+    FieldSpec {
+        name: "login_id",
+        secret: false,
+        required: false,
+    },
 ];
 
 const TOTP: &[FieldSpec] = &[
@@ -126,6 +146,11 @@ const TOTP: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "period",
+        secret: false,
+        required: false,
+    },
+    FieldSpec {
+        name: "login_id",
         secret: false,
         required: false,
     },

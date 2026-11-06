@@ -22,12 +22,16 @@ pub fn cmd_add(input: ExportAdd, uv: &glyx_store::UnlockedVault, as_json: bool) 
         ("blob", None, None, Some(addr))
     } else if let Some(query) = input.item {
         let found = uv.resolve(&query).map_err(|e| anyhow::anyhow!(e))?;
-        (
-            "field",
-            Some(found.id),
-            Some(input.field.unwrap_or_else(|| "password".to_owned())),
-            None,
-        )
+        if found.item_type == glyx_core::ItemType::File && input.field.is_none() {
+            ("file", Some(found.id), None, None)
+        } else {
+            (
+                "field",
+                Some(found.id),
+                Some(input.field.unwrap_or_else(|| "password".to_owned())),
+                None,
+            )
+        }
     } else {
         anyhow::bail!("pass --item, --blob, or --ssh");
     };
@@ -89,6 +93,129 @@ pub fn cmd_ls(as_json: bool) -> Result<()> {
         if exports.is_empty() && injects.is_empty() && roots.is_empty() {
             println!("no exports registered");
         }
+    }
+    Ok(())
+}
+
+pub fn cmd_show(target: &std::path::Path, as_json: bool) -> Result<()> {
+    let conn = glyx_agent::ledger::open_db()?;
+    let export = glyx_agent::ledger::list_exports(&conn)?
+        .into_iter()
+        .find(|row| row.target.as_path() == target);
+    let inject = glyx_agent::ledger::get_inject(&conn, target)?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "export": export.as_ref().map(|row| serde_json::json!({
+                    "target": row.target, "kind": row.kind, "keep": row.keep_on_lock,
+                    "item_id": row.item_id, "field": row.field, "blob": row.blob_addr,
+                    "perm": row.perm,
+                })),
+                "inject": inject.as_ref().map(|row| serde_json::json!({
+                    "target": row.target, "form": row.form, "template": row.template_text,
+                    "refs": serde_json::from_str::<serde_json::Value>(&row.refs_json)
+                        .unwrap_or_else(|_| serde_json::json!([])),
+                })),
+            })
+        );
+        return Ok(());
+    }
+    match (export, inject) {
+        (None, None) => println!("nothing tracked at {}", target.display()),
+        (export, inject) => {
+            if let Some(row) = export {
+                println!(
+                    "{} [{}] keep={} perm={:o}",
+                    row.target.display(),
+                    row.kind,
+                    row.keep_on_lock,
+                    row.perm
+                );
+                if let Some(item) = row.item_id {
+                    println!("  item: {item}");
+                }
+                if let Some(field) = row.field {
+                    println!("  field: {field}");
+                }
+                if let Some(blob) = row.blob_addr {
+                    println!("  blob: {blob}");
+                }
+            }
+            if let Some(row) = inject {
+                println!("{} [inject:{}]", row.target.display(), row.form);
+                println!(
+                    "  template: {}",
+                    if row.template_text.is_some() {
+                        "stored"
+                    } else {
+                        "derived from file"
+                    }
+                );
+                let refs: serde_json::Value =
+                    serde_json::from_str(&row.refs_json).unwrap_or_else(|_| serde_json::json!([]));
+                if let Some(list) = refs.as_array() {
+                    for entry in list {
+                        println!(
+                            "  {}:{} [{}]",
+                            entry.get("item_id").and_then(|v| v.as_str()).unwrap_or("?"),
+                            entry.get("field").and_then(|v| v.as_str()).unwrap_or("?"),
+                            entry
+                                .get("form")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("default"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn cmd_move(
+    uv: &glyx_store::UnlockedVault,
+    target: &std::path::Path,
+    to: &std::path::Path,
+    as_json: bool,
+) -> Result<()> {
+    if to.exists() {
+        bail!("{} already exists", to.display());
+    }
+    let report = glyx_agent::relocate_target(uv, target, to).map_err(|e| anyhow::anyhow!(e))?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "exports": report.exports, "injects": report.injects,
+                "roots": report.roots,
+            })
+        );
+    } else {
+        println!(
+            "moved {} to {} ({} export(s), {} injection(s))",
+            target.display(),
+            to.display(),
+            report.exports,
+            report.injects
+        );
+    }
+    Ok(())
+}
+
+pub fn cmd_keep(target: &std::path::Path, keep: bool, as_json: bool) -> Result<()> {
+    let conn = glyx_agent::ledger::open_db()?;
+    if !glyx_agent::ledger::update_export(&conn, target, Some(keep), None)? {
+        bail!("{} is not a managed export", target.display());
+    }
+    if as_json {
+        println!("{}", serde_json::json!({"ok": true, "keep": keep}));
+    } else {
+        println!(
+            "{} will {} on lock",
+            target.display(),
+            if keep { "be kept" } else { "be removed" }
+        );
     }
     Ok(())
 }
@@ -464,6 +591,232 @@ pub fn cmd_target_move(
             rep.roots,
             rep.injects
         );
+    }
+    Ok(())
+}
+
+fn ref_form_map(content: &glyx_agent::InjectContent) -> BTreeMap<String, String> {
+    content
+        .refs
+        .iter()
+        .map(|r| (format!("{}/{}", r.item_id, r.field), r.form.clone()))
+        .collect()
+}
+
+fn is_materialized(content: &glyx_agent::InjectContent) -> bool {
+    content.status == "unlocked"
+}
+
+fn show_content(content: &glyx_agent::InjectContent, as_json: bool) -> Result<()> {
+    if as_json {
+        println!("{}", serde_json::to_string(content)?);
+        return Ok(());
+    }
+    println!(
+        "{} [{}] form={} hash={}",
+        content.target, content.status, content.form, content.hash
+    );
+    for r in &content.refs {
+        println!("  {}:{} [{}] {}", r.item_name, r.field, r.form, r.value);
+    }
+    if !content.refs.is_empty() {
+        println!("template:\n{}", content.template);
+    }
+    Ok(())
+}
+
+pub fn cmd_inject_show(
+    uv: &glyx_store::UnlockedVault,
+    target: &std::path::Path,
+    reveal: bool,
+    as_json: bool,
+) -> Result<()> {
+    let content = glyx_agent::inject_content(uv, target, reveal).map_err(|e| anyhow::anyhow!(e))?;
+    show_content(&content, as_json)
+}
+
+pub fn cmd_inject_preview(
+    uv: &glyx_store::UnlockedVault,
+    target: &std::path::Path,
+    reveal: bool,
+    as_json: bool,
+) -> Result<()> {
+    let preview = glyx_agent::inject_preview(uv, target, reveal).map_err(|e| anyhow::anyhow!(e))?;
+    if as_json {
+        println!("{}", serde_json::to_string(&preview)?);
+    } else {
+        println!("unlocked:\n{}", preview.unlocked);
+        println!("locked:\n{}", preview.locked);
+    }
+    Ok(())
+}
+
+pub struct AddRefOpts<'a> {
+    pub line: usize,
+    pub item: &'a str,
+    pub field: &'a str,
+    pub form: &'a str,
+    pub replace: bool,
+}
+
+pub fn cmd_inject_add_ref(
+    uv: &glyx_store::UnlockedVault,
+    target: &std::path::Path,
+    opts: &AddRefOpts<'_>,
+    as_json: bool,
+) -> Result<()> {
+    let AddRefOpts {
+        line,
+        item: item_query,
+        field,
+        form,
+        replace,
+    } = *opts;
+    let content = glyx_agent::inject_content(uv, target, false).map_err(|e| anyhow::anyhow!(e))?;
+    let item = uv.resolve(item_query).map_err(|e| anyhow::anyhow!(e))?;
+    if !item.fields.contains_key(field) {
+        bail!("field {field} is not present on {}", item.name);
+    }
+    let placeholder = glyx_core::ref_placeholder(&item.id, field);
+    let trailing = content.template.ends_with('\n');
+    let mut lines: Vec<String> = content.template.lines().map(str::to_owned).collect();
+    if line == 0 || line > lines.len() {
+        bail!(
+            "line {line} is out of range (file has {} line(s))",
+            lines.len()
+        );
+    }
+    if replace {
+        lines[line - 1].clone_from(&placeholder);
+    } else {
+        lines[line - 1].push_str(&placeholder);
+    }
+    let mut template = lines.join("\n");
+    if trailing {
+        template.push('\n');
+    }
+    let mut ref_forms = ref_form_map(&content);
+    ref_forms.insert(format!("{}/{}", item.id, field), form.to_owned());
+    let saved = glyx_agent::inject_save(
+        uv,
+        target,
+        &template,
+        &content.form,
+        Some(&content.hash),
+        is_materialized(&content),
+        &ref_forms,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    if as_json {
+        println!("{}", serde_json::to_string(&saved)?);
+    } else {
+        println!(
+            "added {}:{} at line {line} of {} ({})",
+            item.name,
+            field,
+            target.display(),
+            saved.status
+        );
+    }
+    Ok(())
+}
+
+pub fn cmd_inject_rm_ref(
+    uv: &glyx_store::UnlockedVault,
+    target: &std::path::Path,
+    item_query: &str,
+    field: &str,
+    as_json: bool,
+) -> Result<()> {
+    let content = glyx_agent::inject_content(uv, target, false).map_err(|e| anyhow::anyhow!(e))?;
+    let item = uv.resolve(item_query).map_err(|e| anyhow::anyhow!(e))?;
+    let placeholder = glyx_core::ref_placeholder(&item.id, field);
+    if !content.template.contains(&placeholder) {
+        bail!(
+            "{}:{} is not referenced by {}",
+            item.name,
+            field,
+            target.display()
+        );
+    }
+    let template = content.template.replace(&placeholder, "");
+    let mut ref_forms = ref_form_map(&content);
+    ref_forms.remove(&format!("{}/{}", item.id, field));
+    let saved = glyx_agent::inject_save(
+        uv,
+        target,
+        &template,
+        &content.form,
+        Some(&content.hash),
+        is_materialized(&content),
+        &ref_forms,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    if as_json {
+        println!("{}", serde_json::to_string(&saved)?);
+    } else {
+        println!("removed {}:{} from {}", item.name, field, target.display());
+    }
+    Ok(())
+}
+
+pub fn cmd_inject_form(
+    uv: &glyx_store::UnlockedVault,
+    target: &std::path::Path,
+    form: &str,
+    as_json: bool,
+) -> Result<()> {
+    let content = glyx_agent::inject_content(uv, target, false).map_err(|e| anyhow::anyhow!(e))?;
+    let mut ref_forms = ref_form_map(&content);
+    for r in &content.refs {
+        ref_forms.insert(format!("{}/{}", r.item_id, r.field), form.to_owned());
+    }
+    let saved = glyx_agent::inject_save(
+        uv,
+        target,
+        &content.template,
+        form,
+        Some(&content.hash),
+        is_materialized(&content),
+        &ref_forms,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    if as_json {
+        println!("{}", serde_json::to_string(&saved)?);
+    } else {
+        println!("{} now uses {form}", target.display());
+    }
+    Ok(())
+}
+
+pub fn cmd_inject_save(
+    uv: &glyx_store::UnlockedVault,
+    target: &std::path::Path,
+    template_file: &std::path::Path,
+    form: Option<&str>,
+    locked: bool,
+    as_json: bool,
+) -> Result<()> {
+    let template = std::fs::read_to_string(template_file)
+        .with_context(|| format!("read template {}", template_file.display()))?;
+    let content = glyx_agent::inject_content(uv, target, false).map_err(|e| anyhow::anyhow!(e))?;
+    let form = form.unwrap_or(&content.form);
+    let ref_forms = ref_form_map(&content);
+    let materialized = !locked && is_materialized(&content);
+    let saved = glyx_agent::inject_save(
+        uv,
+        target,
+        &template,
+        form,
+        Some(&content.hash),
+        materialized,
+        &ref_forms,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    if as_json {
+        println!("{}", serde_json::to_string(&saved)?);
+    } else {
+        println!("saved {} ({})", target.display(), saved.status);
     }
     Ok(())
 }

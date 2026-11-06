@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -81,6 +81,23 @@ impl UnlockedVault {
         };
         let mut issues: BTreeMap<Uuid, (glyx_core::Item, Vec<String>)> = BTreeMap::new();
         let mut reuse: BTreeMap<String, Vec<Uuid>> = BTreeMap::new();
+        let mut linked_totp = BTreeSet::new();
+        for row in self.list(false)? {
+            let Some(item) = self.get_item(&row.id)? else {
+                continue;
+            };
+            if item.item_type != glyx_core::ItemType::Totp {
+                continue;
+            }
+            if let Some(login) = item
+                .fields
+                .get("login_id")
+                .map(|f| f.value.expose().trim().to_owned())
+                .filter(|value| !value.is_empty())
+            {
+                linked_totp.insert(login);
+            }
+        }
         for row in self.list(false)? {
             let Some(item) = self.get_item(&row.id)? else {
                 continue;
@@ -102,7 +119,7 @@ impl UnlockedVault {
                 found.push("old".to_owned());
                 report.summary.old += 1;
             }
-            if !item.fields.contains_key("seed") {
+            if !item.fields.contains_key("seed") && !linked_totp.contains(&item.id.to_string()) {
                 found.push("no_totp".to_owned());
                 report.summary.no_totp += 1;
             }

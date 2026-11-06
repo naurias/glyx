@@ -1,13 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::ledger::{
-    blake_hex, expand_inject_roots, list_exports, list_injects, open_db, parse_form,
-    recall_target as ledger_recall, scan_pointers, scan_refs, shred_file, AgentError, ExpandReport,
-    ExportRow, InjectRow, RefInfo,
+    blake_hex, expand_inject_roots, get_inject, list_exports, list_injects, open_db, parse_form,
+    recall_target as ledger_recall, scan_pointers, scan_refs, shred_file, update_inject_template,
+    AgentError, ExpandReport, ExportRow, InjectRow, RefInfo,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -62,6 +63,22 @@ fn fetch_value(uv: &glyx_store::UnlockedVault, row: &ExportRow) -> Result<Vec<u8
             let addr = row.blob_addr.clone().ok_or_else(|| {
                 AgentError::Crypto(glyx_crypto::CryptoError::Param("export lacks blob".into()))
             })?;
+            Ok(uv.get_blob(&addr)?.to_vec())
+        }
+        "file" => {
+            let id = row.item_id.ok_or_else(|| {
+                AgentError::Crypto(glyx_crypto::CryptoError::Param("export lacks item".into()))
+            })?;
+            let item = uv
+                .get_item(&id)?
+                .ok_or_else(|| AgentError::Tamper(format!("item {id} gone")))?;
+            let addr = item
+                .fields
+                .get("blob")
+                .ok_or_else(|| AgentError::Tamper("file item lacks blob".into()))?
+                .value
+                .expose()
+                .to_owned();
             Ok(uv.get_blob(&addr)?.to_vec())
         }
         "ssh" => {
@@ -135,10 +152,433 @@ fn adopt_pointers(
             item_id: id,
             field,
             locked: token,
+            form: Some("encrypted-pointer".to_owned()),
+            label: None,
         });
         changed += 1;
     }
     Ok(changed)
+}
+
+fn plain_ref(id: &Uuid, field: &str) -> String {
+    glyx_core::ref_placeholder(id, field)
+}
+
+fn unique_refs(text: &str) -> Vec<(Uuid, String)> {
+    scan_refs(text)
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn field_is_secret(item: &glyx_core::Item, field: &str) -> bool {
+    glyx_core::template::spec(item.item_type)
+        .iter()
+        .any(|spec| spec.name == field && spec.secret)
+}
+
+fn read_text_limited(path: &Path) -> Result<String, AgentError> {
+    let meta = std::fs::metadata(path)?;
+    if meta.len() > crate::ledger::MAX_INJECT_BYTES {
+        return Err(AgentError::Tamper(format!(
+            "{} is larger than the injection limit",
+            path.display()
+        )));
+    }
+    let bytes = std::fs::read(path)?;
+    if bytes.contains(&0) {
+        return Err(AgentError::Tamper(format!(
+            "{} is binary, not text",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes).map_err(|_| AgentError::NotUtf8(path.display().to_string()))
+}
+
+fn validate_template(text: &str) -> Result<(), AgentError> {
+    if text.len() as u64 > crate::ledger::MAX_INJECT_BYTES {
+        return Err(AgentError::Tamper("template is too large".to_owned()));
+    }
+    if text.contains('\0') {
+        return Err(AgentError::Tamper(
+            "template contains a NUL byte".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn derive_template(
+    uv: &glyx_store::UnlockedVault,
+    text: &str,
+    mut refs: Vec<RefInfo>,
+    target: &str,
+) -> (String, Vec<RefInfo>) {
+    let mut out = text.to_owned();
+    for r in &refs {
+        if !r.locked.is_empty() {
+            out = out.replace(&r.locked, &plain_ref(&r.item_id, &r.field));
+        }
+    }
+    for token in scan_pointers(&out) {
+        if refs.iter().any(|r| r.locked == token) {
+            continue;
+        }
+        let Ok((id, field)) = uv.open_locked_pointer(&token, target) else {
+            continue;
+        };
+        out = out.replace(&token, &plain_ref(&id, &field));
+        refs.push(RefInfo {
+            item_id: id,
+            field,
+            locked: token,
+            form: Some("encrypted-pointer".to_owned()),
+            label: None,
+        });
+    }
+    for (id, field) in unique_refs(&out) {
+        if !refs.iter().any(|r| r.item_id == id && r.field == field) {
+            refs.push(RefInfo {
+                item_id: id,
+                field,
+                locked: String::new(),
+                form: None,
+                label: None,
+            });
+        }
+    }
+    (out, refs)
+}
+
+fn render_values_from_template(
+    uv: &glyx_store::UnlockedVault,
+    template: &str,
+    mask: bool,
+) -> Result<String, AgentError> {
+    let mut out = template.to_owned();
+    for (id, field) in unique_refs(template) {
+        let item = uv
+            .get_item(&id)?
+            .ok_or_else(|| AgentError::Tamper(format!("item {id} gone")))?;
+        let value = item
+            .fields
+            .get(&field)
+            .ok_or_else(|| AgentError::Tamper(format!("field {field} gone")))?
+            .value
+            .expose()
+            .to_owned();
+        let shown = if mask && field_is_secret(&item, &field) {
+            "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}".to_owned()
+        } else {
+            value
+        };
+        out = out.replace(&plain_ref(&id, &field), &shown);
+    }
+    Ok(out)
+}
+
+fn render_locked_from_template(
+    uv: &glyx_store::UnlockedVault,
+    template: &str,
+    refs: &[RefInfo],
+    default_form: &str,
+    target: &str,
+    regenerate: bool,
+) -> Result<(String, Vec<RefInfo>), AgentError> {
+    let mut out = template.to_owned();
+    let mut out_refs = Vec::new();
+    for (id, field) in unique_refs(template) {
+        let existing = refs.iter().find(|r| r.item_id == id && r.field == field);
+        let form_text = existing
+            .and_then(|r| r.form.clone())
+            .unwrap_or_else(|| default_form.to_owned());
+        let form = parse_form(&form_text)?;
+        let locked = if regenerate {
+            uv.render_locked(&id, &field, target, form)?
+        } else {
+            existing
+                .map(|r| r.locked.clone())
+                .filter(|locked| !locked.is_empty())
+                .unwrap_or(uv.render_locked(&id, &field, target, form)?)
+        };
+        out = out.replace(&plain_ref(&id, &field), &locked);
+        out_refs.push(RefInfo {
+            item_id: id,
+            field,
+            locked,
+            form: Some(form_text),
+            label: existing.and_then(|r| r.label.clone()),
+        });
+    }
+    Ok((out, out_refs))
+}
+
+fn persist_unlocked_state(
+    uv: &glyx_store::UnlockedVault,
+    conn: &Connection,
+    target: &Path,
+    template: &str,
+    refs: &[RefInfo],
+    default_form: &str,
+    unlocked_text: &str,
+) -> Result<Vec<RefInfo>, AgentError> {
+    let target_str = target.to_string_lossy().into_owned();
+    let (locked_text, refs) =
+        render_locked_from_template(uv, template, refs, default_form, &target_str, false)?;
+    let refs_json = serde_json::to_string(&refs).unwrap_or_default();
+    let meta = std::fs::metadata(target)?;
+    conn.execute(
+        "UPDATE injects SET template_text = ?1, refs_json = ?2, locked_text = ?3,
+           locked_hash = ?4, unlocked_hash = ?5, mtime = ?6, size = ?7 WHERE target = ?8",
+        rusqlite::params![
+            template,
+            refs_json,
+            locked_text,
+            blake_hex(locked_text.as_bytes()),
+            blake_hex(unlocked_text.as_bytes()),
+            meta.modified().ok().and_then(|t| t
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs().cast_signed())),
+            meta.len().cast_signed(),
+            target.to_string_lossy(),
+        ],
+    )?;
+    Ok(refs)
+}
+
+type InjectState = (Option<InjectRow>, String, Vec<RefInfo>, String, bool);
+
+fn load_inject_state(
+    uv: &glyx_store::UnlockedVault,
+    target: &Path,
+) -> Result<InjectState, AgentError> {
+    let conn = open_db()?;
+    let row = get_inject(&conn, target)?;
+    let exists = target.exists();
+    let disk_text = if exists {
+        read_text_limited(target)?
+    } else {
+        String::new()
+    };
+    let mut refs: Vec<RefInfo> = row
+        .as_ref()
+        .map(|r| serde_json::from_str(&r.refs_json).unwrap_or_default())
+        .unwrap_or_default();
+    let target_str = target.to_string_lossy().into_owned();
+    let template = if let Some(template) = row.as_ref().and_then(|r| r.template_text.clone()) {
+        template
+    } else {
+        let (template, updated) = derive_template(uv, &disk_text, refs, &target_str);
+        refs = updated;
+        template
+    };
+    Ok((row, template, refs, disk_text, exists))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InjectRefView {
+    pub item_id: String,
+    pub field: String,
+    pub item_name: String,
+    pub secret: bool,
+    pub form: String,
+    pub locked: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InjectContent {
+    pub target: String,
+    pub tracked: bool,
+    pub form: String,
+    pub status: String,
+    pub template: String,
+    pub hash: String,
+    pub refs: Vec<InjectRefView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InjectPreview {
+    pub template: String,
+    pub unlocked: String,
+    pub locked: String,
+}
+
+pub fn inject_content(
+    uv: &glyx_store::UnlockedVault,
+    target: &Path,
+    reveal: bool,
+) -> Result<InjectContent, AgentError> {
+    let (row, template, refs, disk_text, exists) = load_inject_state(uv, target)?;
+    let form = row
+        .as_ref()
+        .map_or_else(|| "encrypted-pointer".to_owned(), |r| r.form.clone());
+    let status = if !exists {
+        "missing"
+    } else if let Some(r) = &row {
+        let hash = blake_hex(disk_text.as_bytes());
+        if r.unlocked_hash.as_deref() == Some(hash.as_str()) {
+            "unlocked"
+        } else if r.locked_hash.as_deref() == Some(hash.as_str()) {
+            "locked"
+        } else {
+            "drift"
+        }
+    } else {
+        "untracked"
+    };
+    let mut views = Vec::new();
+    for (id, field) in unique_refs(&template) {
+        let item = uv
+            .get_item(&id)?
+            .ok_or_else(|| AgentError::Tamper(format!("item {id} gone")))?;
+        let secret = field_is_secret(&item, &field);
+        let value = item
+            .fields
+            .get(&field)
+            .ok_or_else(|| AgentError::Tamper(format!("field {field} gone")))?
+            .value
+            .expose()
+            .to_owned();
+        let existing = refs.iter().find(|r| r.item_id == id && r.field == field);
+        views.push(InjectRefView {
+            item_id: id.to_string(),
+            field: field.clone(),
+            item_name: item.name.clone(),
+            secret,
+            form: existing
+                .and_then(|r| r.form.clone())
+                .unwrap_or_else(|| form.clone()),
+            locked: existing.map(|r| r.locked.clone()).unwrap_or_default(),
+            value: if secret && !reveal {
+                "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}".to_owned()
+            } else {
+                value
+            },
+        });
+    }
+    Ok(InjectContent {
+        target: target.to_string_lossy().into_owned(),
+        tracked: row.is_some(),
+        form,
+        status: status.to_owned(),
+        template,
+        hash: blake_hex(disk_text.as_bytes()),
+        refs: views,
+    })
+}
+
+pub fn inject_preview(
+    uv: &glyx_store::UnlockedVault,
+    target: &Path,
+    reveal: bool,
+) -> Result<InjectPreview, AgentError> {
+    let (row, template, refs, _, _) = load_inject_state(uv, target)?;
+    let form = row
+        .as_ref()
+        .map_or_else(|| "encrypted-pointer".to_owned(), |r| r.form.clone());
+    let target_str = target.to_string_lossy().into_owned();
+    let unlocked = render_values_from_template(uv, &template, !reveal)?;
+    let (locked, _) = render_locked_from_template(uv, &template, &refs, &form, &target_str, false)?;
+    Ok(InjectPreview {
+        template,
+        unlocked,
+        locked,
+    })
+}
+
+pub fn inject_save(
+    uv: &glyx_store::UnlockedVault,
+    target: &Path,
+    template: &str,
+    form: &str,
+    expected_hash: Option<&str>,
+    materialized: bool,
+    ref_forms: &BTreeMap<String, String>,
+) -> Result<InjectContent, AgentError> {
+    validate_template(template)?;
+    if target.is_dir() {
+        return Err(AgentError::Tamper(format!(
+            "{} is a directory",
+            target.display()
+        )));
+    }
+    let conn = open_db()?;
+    let row = get_inject(&conn, target)?;
+    if target.exists() {
+        let current = read_text_limited(target)?;
+        let current_hash = blake_hex(current.as_bytes());
+        if let Some(expected) = expected_hash {
+            if expected != current_hash {
+                return Err(AgentError::Tamper(
+                    "file changed since it was opened; reload before saving".to_owned(),
+                ));
+            }
+        }
+    }
+    if row.is_none() {
+        crate::ledger::register_inject(&conn, target, form, None)?;
+    }
+    let old_refs: Vec<RefInfo> = row
+        .as_ref()
+        .map(|r| serde_json::from_str(&r.refs_json).unwrap_or_default())
+        .unwrap_or_default();
+    let mut refs = Vec::new();
+    for (id, field) in unique_refs(template) {
+        let item = uv
+            .get_item(&id)?
+            .ok_or_else(|| AgentError::Tamper(format!("item {id} gone")))?;
+        if !item.fields.contains_key(&field) {
+            return Err(AgentError::Tamper(format!("field {field} gone")));
+        }
+        let key = format!("{id}/{field}");
+        let existing = old_refs
+            .iter()
+            .find(|r| r.item_id == id && r.field == field);
+        refs.push(RefInfo {
+            item_id: id,
+            field,
+            locked: String::new(),
+            form: Some(
+                ref_forms
+                    .get(&key)
+                    .cloned()
+                    .or_else(|| existing.and_then(|r| r.form.clone()))
+                    .unwrap_or_else(|| form.to_owned()),
+            ),
+            label: existing.and_then(|r| r.label.clone()),
+        });
+    }
+    let target_str = target.to_string_lossy().into_owned();
+    let (locked_text, refs) =
+        render_locked_from_template(uv, template, &refs, form, &target_str, true)?;
+    let unlocked_text = render_values_from_template(uv, template, false)?;
+    let write_text = if materialized {
+        &unlocked_text
+    } else {
+        &locked_text
+    };
+    std::fs::write(target, write_text.as_bytes())?;
+    let meta = std::fs::metadata(target)?;
+    let refs_json = serde_json::to_string(&refs).unwrap_or_default();
+    update_inject_template(&conn, target, form, template, &refs_json)?;
+    conn.execute(
+        "UPDATE injects SET locked_text = ?1, locked_hash = ?2, unlocked_hash = ?3,
+           mtime = ?4, size = ?5 WHERE target = ?6",
+        rusqlite::params![
+            locked_text,
+            blake_hex(locked_text.as_bytes()),
+            blake_hex(unlocked_text.as_bytes()),
+            meta.modified().ok().and_then(|t| t
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs().cast_signed())),
+            meta.len().cast_signed(),
+            target.to_string_lossy(),
+        ],
+    )?;
+    inject_content(uv, target, false)
 }
 
 pub fn materialize_inject(
@@ -148,20 +588,15 @@ pub fn materialize_inject(
     force: bool,
 ) -> Result<usize, AgentError> {
     let target = &row.target;
-    let text = std::fs::read_to_string(target)
-        .map_err(|_| AgentError::Tamper(format!("{} unreadable", target.display())))?;
-    if row.locked_text.is_none() {
-        conn.execute(
-            "UPDATE injects SET locked_text = ?1, locked_hash = ?2 WHERE target = ?3",
-            rusqlite::params![text, blake_hex(text.as_bytes()), target.to_string_lossy()],
-        )?;
-    }
+    let text = read_text_limited(target)?;
     let form = parse_form(&row.form)?;
     let target_str = target.to_string_lossy().into_owned();
     let mut refs: Vec<RefInfo> = serde_json::from_str(&row.refs_json).unwrap_or_default();
     let mut by_locked: BTreeMap<String, (Uuid, String)> = BTreeMap::new();
     for r in &refs {
-        by_locked.insert(r.locked.clone(), (r.item_id, r.field.clone()));
+        if !r.locked.is_empty() {
+            by_locked.insert(r.locked.clone(), (r.item_id, r.field.clone()));
+        }
     }
     let mut changed = 0;
     let mut new_text = text.clone();
@@ -213,6 +648,8 @@ pub fn materialize_inject(
             item_id: id,
             field: field.clone(),
             locked: locked.clone(),
+            form: Some(row.form.clone()),
+            label: None,
         });
         let placeholder = glyx_core::ref_placeholder(&id, &field);
         if new_text.contains(&placeholder) {
@@ -221,23 +658,23 @@ pub fn materialize_inject(
         }
     }
     changed += adopt_pointers(uv, &mut refs, &mut new_text, &target_str)?;
+    let (derived_template, derived_refs) = derive_template(uv, &text, refs, &target_str);
+    refs = derived_refs;
     if changed == 0 && new_text == text {
+        if row.template_text.is_none() || row.locked_text.is_none() {
+            persist_unlocked_state(uv, conn, target, &derived_template, &refs, &row.form, &text)?;
+        }
         return Ok(0);
     }
     std::fs::write(target, new_text.as_bytes())?;
-    let meta = std::fs::metadata(target)?;
-    conn.execute(
-        "UPDATE injects SET refs_json = ?1, unlocked_hash = ?2, mtime = ?3, size = ?4 WHERE target = ?5",
-        rusqlite::params![
-            serde_json::to_string(&refs).unwrap_or_default(),
-            blake_hex(new_text.as_bytes()),
-            meta.modified().ok().and_then(|t| t
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .map(|d| d.as_secs().cast_signed())),
-            meta.len().cast_signed(),
-            target.to_string_lossy(),
-        ],
+    persist_unlocked_state(
+        uv,
+        conn,
+        target,
+        &derived_template,
+        &refs,
+        &row.form,
+        &new_text,
     )?;
     Ok(changed)
 }
@@ -377,6 +814,107 @@ pub fn teardown_all(uv: &glyx_store::UnlockedVault) -> Result<TeardownReport, Ag
     teardown_targets(uv, None)
 }
 
+fn auto_merge_lock(
+    uv: &glyx_store::UnlockedVault,
+    row: &InjectRow,
+    template: &str,
+    text: &str,
+) -> Result<Option<String>, AgentError> {
+    let refs: Vec<RefInfo> = serde_json::from_str(&row.refs_json).unwrap_or_default();
+    let target_str = row.target.to_string_lossy().into_owned();
+    let base = render_values_from_template(uv, template, false)?;
+    let (ours, _) =
+        render_locked_from_template(uv, template, &refs, &row.form, &target_str, false)?;
+    let mut spans = Vec::new();
+    for r in &refs {
+        if let Some(item) = uv.get_item(&r.item_id)? {
+            if let Some(field) = item.fields.get(&r.field) {
+                spans.push(field.value.expose().to_owned());
+            }
+        }
+        if !r.locked.is_empty() {
+            spans.push(r.locked.clone());
+        }
+    }
+    let hunks = crate::merge::diff_hunks(&base, text, &ours, &spans);
+    if hunks
+        .iter()
+        .any(|hunk| hunk.kind == crate::merge::HunkKind::Conflict)
+    {
+        return Ok(None);
+    }
+    let merged = crate::merge::apply_hunks(&hunks, &BTreeMap::new(), base.ends_with('\n'))
+        .map_err(|_| AgentError::Tamper("merge needs a manual pick".to_owned()))?;
+    Ok(Some(merged))
+}
+
+fn persist_merged_lock(
+    uv: &glyx_store::UnlockedVault,
+    conn: &Connection,
+    row: &InjectRow,
+    merged: &str,
+) -> Result<(), AgentError> {
+    let refs: Vec<RefInfo> = serde_json::from_str(&row.refs_json).unwrap_or_default();
+    let target_str = row.target.to_string_lossy().into_owned();
+    let (merged_template, new_refs) = derive_template(uv, merged, refs, &target_str);
+    std::fs::write(&row.target, merged.as_bytes())?;
+    let meta = std::fs::metadata(&row.target)?;
+    conn.execute(
+        "UPDATE injects SET template_text = ?1, refs_json = ?2, locked_text = ?3,
+           locked_hash = ?4, mtime = ?5, size = ?6 WHERE target = ?7",
+        rusqlite::params![
+            merged_template,
+            serde_json::to_string(&new_refs).unwrap_or_default(),
+            merged,
+            blake_hex(merged.as_bytes()),
+            meta.modified().ok().and_then(|t| t
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs().cast_signed())),
+            meta.len().cast_signed(),
+            row.target.to_string_lossy(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn restore_locked_baseline(
+    uv: &glyx_store::UnlockedVault,
+    conn: &Connection,
+    row: &InjectRow,
+    refs: &mut Vec<RefInfo>,
+    current_hash: &str,
+) -> Result<bool, AgentError> {
+    if row.unlocked_hash.as_deref() != Some(current_hash) {
+        return Ok(false);
+    }
+    let Some(template) = &row.template_text else {
+        return Ok(false);
+    };
+    let target_str = row.target.to_string_lossy().into_owned();
+    let (locked_text, new_refs) =
+        render_locked_from_template(uv, template, refs, &row.form, &target_str, false)?;
+    *refs = new_refs;
+    std::fs::write(&row.target, locked_text.as_bytes())?;
+    let meta = std::fs::metadata(&row.target)?;
+    conn.execute(
+        "UPDATE injects SET refs_json = ?1, locked_text = ?2, locked_hash = ?3,
+           mtime = ?4, size = ?5 WHERE target = ?6",
+        rusqlite::params![
+            serde_json::to_string(&refs).unwrap_or_default(),
+            locked_text,
+            blake_hex(locked_text.as_bytes()),
+            meta.modified().ok().and_then(|t| t
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs().cast_signed())),
+            meta.len().cast_signed(),
+            row.target.to_string_lossy(),
+        ],
+    )?;
+    Ok(true)
+}
+
 pub fn teardown_targets(
     uv: &glyx_store::UnlockedVault,
     target: Option<&Path>,
@@ -396,10 +934,26 @@ pub fn teardown_targets(
         if !in_scope(target, &row.target) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&row.target) else {
+        let Ok(text) = read_text_limited(&row.target) else {
             continue;
         };
-        let refs: Vec<RefInfo> = serde_json::from_str(&row.refs_json).unwrap_or_default();
+        let mut refs: Vec<RefInfo> = serde_json::from_str(&row.refs_json).unwrap_or_default();
+        let current_hash = blake_hex(text.as_bytes());
+        if row.locked_hash.as_deref() == Some(current_hash.as_str()) {
+            continue;
+        }
+        let target_str = row.target.to_string_lossy().into_owned();
+        if restore_locked_baseline(uv, &conn, &row, &mut refs, &current_hash)? {
+            report.restored += 1;
+            continue;
+        }
+        if let Some(template) = &row.template_text {
+            if let Some(merged) = auto_merge_lock(uv, &row, template, &text)? {
+                persist_merged_lock(uv, &conn, &row, &merged)?;
+                report.restored += 1;
+                continue;
+            }
+        }
         let mut locked_text = text.clone();
         let mut missing = Vec::new();
         for r in &refs {
@@ -427,11 +981,18 @@ pub fn teardown_targets(
             ));
             continue;
         }
+        let template = if let Some(template) = row.template_text.clone() {
+            template
+        } else {
+            derive_template(uv, &locked_text, refs, &target_str).0
+        };
         std::fs::write(&row.target, locked_text.as_bytes())?;
         let meta = std::fs::metadata(&row.target)?;
         conn.execute(
-            "UPDATE injects SET locked_text = ?1, locked_hash = ?2, mtime = ?3, size = ?4 WHERE target = ?5",
+            "UPDATE injects SET template_text = ?1, locked_text = ?2, locked_hash = ?3,
+               mtime = ?4, size = ?5 WHERE target = ?6",
             rusqlite::params![
+                template,
                 locked_text,
                 blake_hex(locked_text.as_bytes()),
                 meta.modified().ok().and_then(|t| t
@@ -616,6 +1177,8 @@ pub fn apply_merge(
             item_id: id,
             field,
             locked,
+            form: Some(row.form.clone()),
+            label: None,
         });
     }
     std::fs::write(target, merged.as_bytes())?;
@@ -751,6 +1314,38 @@ mod tests {
         let tampers = check_all(&conn, true).expect("check");
         assert_eq!(tampers.len(), 1);
         assert_eq!(tampers[0].kind, TamperKind::Residue);
+    }
+
+    #[test]
+    fn drift_merges_into_locked_template() {
+        let _env = ENV_LOCK.lock().expect("lock");
+        let runtime = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
+        let work = tempfile::tempdir().expect("tempdir");
+        let (mut uv, id) = login_vault(work.path());
+        let conn = open_db().expect("db");
+        let env_file = work.path().join("drift.env");
+        std::fs::write(
+            &env_file,
+            format!("user=bob\npass={{{{glyx:{id}/password}}}}\n"),
+        )
+        .expect("write");
+        register_inject(&conn, &env_file, "encrypted-pointer", None).expect("register");
+        drop(conn);
+        materialize_all(&mut uv, false).expect("materialize");
+        let injected = std::fs::read_to_string(&env_file).expect("read");
+        std::fs::write(&env_file, format!("{injected}added=yes\n")).expect("edit");
+        let rep = teardown_all(&uv).expect("teardown");
+        assert_eq!(rep.restored, 1);
+        assert!(rep.drifted.is_empty());
+        let locked = std::fs::read_to_string(&env_file).expect("read");
+        assert!(locked.contains("added=yes"));
+        assert!(locked.contains("__GLYXENC:V1:"));
+        assert!(!locked.contains("s3cret"));
+        materialize_all(&mut uv, false).expect("materialize");
+        let unlocked = std::fs::read_to_string(&env_file).expect("read");
+        assert!(unlocked.contains("s3cret"));
+        assert!(unlocked.contains("added=yes"));
     }
 
     #[test]
