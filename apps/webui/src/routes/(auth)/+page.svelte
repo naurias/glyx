@@ -154,7 +154,7 @@
   }
 </script>
 
-<main>
+<div class="auth-card">
   <h1>glyx</h1>
   <p class="dim">Local-first password manager. The daemon holds your vault; this page keeps secrets in memory only.</p>
   {#if error}<p style="color: var(--danger)">{error}</p>{/if}
@@ -232,7 +232,7 @@
   </div>
   {#if !desktop && !configured()}<p class="dim">Find the port and token in your runtime dir: <code>daemon-&lt;vault&gt;.json</code> (run <code>glyx daemon start</code>), or enter them to manage vaults.</p>{/if}
   {/if}
-</main>
+</div>
 
 <style>
   .selected { border-color: var(--accent); }
