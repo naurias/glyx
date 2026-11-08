@@ -164,6 +164,11 @@ export const api = {
     req('POST', `/v1/items/${id}/history/${encodeURIComponent(file)}`),
   rekey: (body) => req('POST', '/v1/vaults/rekey', body),
   addExport: (body) => req('POST', '/v1/exports', body),
+  ssh: () => req('GET', '/v1/ssh'),
+  sshToggle: (id, agentEnabled) =>
+    req('PATCH', `/v1/ssh/keys/${id}`, { agent_enabled: agentEnabled }),
+  sshAgent: (action) => req('POST', `/v1/ssh/agent/${action}`),
+  sshImport: (body) => req('POST', '/v1/ssh/import', body),
   sshGen: (body) => req('POST', '/v1/ssh-gen', body),
   sshExport: (body) => req('POST', '/v1/ssh/export', body),
   sync: (body = {}) => req('POST', '/v1/sync', body),

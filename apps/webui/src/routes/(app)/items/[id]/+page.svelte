@@ -32,6 +32,9 @@
   let historyCompare = null;
   let attachInput = null;
   let uploading = false;
+  let sshInfo = null;
+  let sshExportOpen = false;
+  let sshExportTarget = '';
 
   let confirmOpen = false;
   let confirmTitle = '';
@@ -49,7 +52,11 @@
 
   $: id = $page.params.id;
   $: fields = item?.fields || {};
-  $: fieldEntries = Object.entries(fields).filter(([key]) => key !== 'body');
+  $: fieldEntries = Object.entries(fields).filter(([key]) => {
+    if (key === 'body') return false;
+    if (item?.type !== 'ssh_key') return true;
+    return !['private', 'public', 'comment', 'agent_enabled', 'kind'].includes(key);
+  });
   $: renderedHtml = renderMarkdown(rendered);
   $: hasSeed = item?.type === 'totp' || fields.seed !== undefined;
   $: linkable = allItems.filter(
@@ -67,6 +74,12 @@
       historyPreview = null;
       if (item.type === 'note') {
         rendered = (await api.rendered(id, reveal)).body;
+      }
+      if (item.type === 'ssh_key') {
+        const ssh = await api.ssh();
+        sshInfo = ssh.keys.find((key) => key.id === id) || null;
+      } else {
+        sshInfo = null;
       }
       related = await api.related(id);
       allItems = await api.items();
@@ -235,6 +248,48 @@
     }
   }
 
+  async function copyText(text, label) {
+    error = '';
+    try {
+      await navigator.clipboard.writeText(text);
+      notice = label;
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  async function toggleSshAgent() {
+    if (!sshInfo) return;
+    error = '';
+    try {
+      const res = await api.sshToggle(sshInfo.id, !sshInfo.agent_enabled);
+      sshInfo = res.key;
+      notice = sshInfo.agent_enabled ? 'Key added to agent' : 'Key removed from agent';
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
+  function askSshExport() {
+    sshExportTarget = '';
+    sshExportOpen = true;
+  }
+
+  async function exportSsh(target) {
+    sshExportOpen = false;
+    if (!sshInfo) return;
+    error = '';
+    try {
+      const body = { item: sshInfo.id };
+      if (target?.trim()) body.to = target.trim();
+      await api.sshExport(body);
+      notice = target?.trim() ? `Exported to ${target.trim()}` : 'Exported to the default ~/.ssh path';
+      await load();
+    } catch (e) {
+      error = e.message;
+    }
+  }
+
   async function startEdit() {
     error = '';
     try {
@@ -375,6 +430,60 @@
             {#if item.fields.user_name}<button on:click={() => copy('user_name')}>Copy username</button>{/if}
             <button on:click={renameItem}>Rename</button>
           </div>
+        {:else if item.type === 'ssh_key'}
+          <div class="section-title"><h3>SSH key</h3><span class="dim">managed by the SSH section</span></div>
+          {#if sshInfo}
+            <div class="card">
+              <div class="row">
+                <span class="badge ssh_key">{sshInfo.algorithm}</span>
+                <span class="dim">{sshInfo.comment || 'no comment'}</span>
+                <span style="flex: 1"></span>
+                {#if sshInfo.agent_supported}
+                  <button class:active={sshInfo.agent_enabled} class="chip" on:click={toggleSshAgent}>
+                    {sshInfo.agent_enabled ? 'In agent' : 'Add to agent'}
+                  </button>
+                {:else}
+                  <span class="chip">export only</span>
+                {/if}
+              </div>
+              <div class="row" style="margin-top: 10px">
+                <span class="dim">Fingerprint</span>
+                <button class="ghost fingerprint" on:click={() => copyText(sshInfo.fingerprint, 'Fingerprint copied')}>
+                  {sshInfo.fingerprint}
+                </button>
+              </div>
+              {#if sshInfo.exports?.length}
+                <div style="margin-top: 10px">
+                  <span class="dim">Materialized to</span>
+                  {#each sshInfo.exports as target}
+                    <div class="item-sub" style="overflow-wrap: anywhere">{target.target}{target.keep ? ' · keep' : ''}</div>
+                  {/each}
+                </div>
+              {/if}
+              <div class="row" style="margin-top: 12px">
+                <button on:click={() => copyText(sshInfo.public, 'Public key copied')}>Copy public key</button>
+                <button on:click={askSshExport}>Export private key</button>
+                <a class="button-link" href="/ssh">Open SSH section</a>
+              </div>
+              {#if !sshInfo.agent_supported}
+                <p class="dim">RSA keys are export-only; the agent supports Ed25519.</p>
+              {/if}
+            </div>
+            {#if fieldEntries.length}
+              <div class="section-title"><h3>Extra fields</h3></div>
+              <div class="field-table">
+                {#each fieldEntries as [key, value]}
+                  <div class="field-row">
+                    <span class="field-key">{key}</span>
+                    <span class="field-value">{value}</span>
+                    <span class="field-actions"><button on:click={() => copy(key)}>Copy</button></span>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          {:else}
+            <div class="empty"><strong>This SSH key is unreadable.</strong><span>Check the private/public fields.</span></div>
+          {/if}
         {:else}
           <div class="section-title"><h3>Fields</h3><span class="dim">{fieldEntries.length}</span></div>
           {#if fieldEntries.length}
@@ -581,5 +690,14 @@
   confirmLabel={promptConfirmLabel}
   onconfirm={submitPrompt}
   onclose={() => (promptOpen = false)}
+/>
+<PromptDialog
+  bind:open={sshExportOpen}
+  title={sshInfo ? `Export ${sshInfo.name}` : 'Export SSH key'}
+  label="Target path (leave empty for ~/.ssh/glyx_<name>)"
+  value={sshExportTarget}
+  confirmLabel="Export"
+  onconfirm={exportSsh}
+  onclose={() => (sshExportOpen = false)}
 />
 <Toast message={notice} onclose={() => (notice = '')} />

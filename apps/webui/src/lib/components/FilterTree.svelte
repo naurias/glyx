@@ -102,6 +102,7 @@
 
   <div class="filter-group">
     <div class="filter-title">Manage</div>
+    <a class="filter-item" href="/ssh"><span>⚷</span><span>SSH keys</span></a>
     <a class="filter-item" href="/library"><span>⚙</span><span>Tags & folders</span></a>
     <a class="filter-item" href="/items/duplicates"><span>⧉</span><span>Duplicates</span></a>
   </div>

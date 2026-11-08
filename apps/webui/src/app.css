@@ -433,6 +433,18 @@ label > textarea {
   box-shadow: 0 0 0 3px rgba(109, 214, 161, 0.12);
 }
 
+.vault-dot.off {
+  background: var(--dim);
+  box-shadow: 0 0 0 3px rgba(152, 161, 178, 0.1);
+}
+
+.fingerprint {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.76rem;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
 .app-content {
   width: 100%;
   max-width: 1240px;
@@ -502,6 +514,22 @@ label > textarea {
   border-color: #3d5f8e;
   background: var(--accent-soft);
   color: #dceaff;
+}
+
+a.button-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm, 8px);
+  background: var(--panel-2);
+  color: var(--text);
+  text-decoration: none;
+  font-size: 0.85rem;
+}
+
+a.button-link:hover {
+  border-color: var(--accent);
 }
 
 .badge {

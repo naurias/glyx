@@ -13,7 +13,8 @@
         { href: '/items', label: 'Items', icon: '▤' },
         { href: '/items?favorite=1', label: 'Favorites', icon: '★' },
         { href: '/items?recents=1', label: 'Recents', icon: '◷' },
-        { href: '/passkeys', label: 'Passkeys', icon: '⚿' }
+        { href: '/passkeys', label: 'Passkeys', icon: '⚿' },
+        { href: '/ssh', label: 'SSH keys', icon: '⚷' }
       ]
     },
     {
