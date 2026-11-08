@@ -8,7 +8,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{middleware, Router};
 use futures_util::StreamExt as _;
 use serde::Deserialize;
@@ -26,7 +26,7 @@ pub struct AppState {
     pub port: Mutex<u16>,
     pub idle_lock_ms: std::sync::atomic::AtomicU64,
     pub last_activity_ms: Mutex<u64>,
-    pub agent_stop: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+    pub ssh_agent: Mutex<Option<Arc<glyx_agent::ssh_agent::AgentState>>>,
     pub tamper: Mutex<Vec<String>>,
 }
 
@@ -193,6 +193,7 @@ fn cors_layer() -> CorsLayer {
         .max_age(std::time::Duration::from_secs(600))
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn router(state: Arc<AppState>) -> Router {
     let api = Router::new()
         .route("/v1/health", get(health))
@@ -255,6 +256,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/blobs/gc", post(gc_blobs))
         .route("/v1/blobs/:addr", get(download_blob))
+        .route("/v1/ssh", get(ssh_keys))
+        .route("/v1/ssh/keys/:id", patch(ssh_toggle))
+        .route("/v1/ssh/agent/start", post(ssh_agent_start))
+        .route("/v1/ssh/agent/stop", post(ssh_agent_stop))
+        .route("/v1/ssh/agent/reload", post(ssh_agent_reload))
+        .route("/v1/ssh/import", post(ssh_import))
         .route("/v1/ssh-gen", post(ssh_gen))
         .route("/v1/ssh/export", post(ssh_export))
         .route("/v1/sync", post(sync))
@@ -792,19 +799,9 @@ async fn unlock(
             } else {
                 Vec::new()
             };
-            let identities = glyx_agent::ssh_agent::load_identities(&uv).unwrap_or_default();
-            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            if !identities.is_empty() {
-                let sock = glyx_agent::ssh_agent::socket_path(&vault_id);
-                let run_flag = flag.clone();
-                std::thread::spawn(move || {
-                    glyx_agent::ssh_agent::serve_until(&sock, &identities, &run_flag).ok();
-                });
+            if let Err(e) = start_ssh_agent(&state, &uv) {
+                eprintln!("ssh agent start failed: {e}");
             }
-            *state
-                .agent_stop
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(flag);
             *state
                 .tamper
                 .lock()
@@ -835,15 +832,66 @@ async fn unlock(
     }
 }
 
-fn stop_agent_socket(state: &AppState) {
-    if let Some(flag) = state
-        .agent_stop
+fn stop_ssh_agent(state: &AppState) {
+    if let Some(agent) = state
+        .ssh_agent
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
     {
-        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        agent.stop();
     }
+}
+
+fn start_ssh_agent(
+    state: &AppState,
+    uv: &glyx_store::UnlockedVault,
+) -> Result<Arc<glyx_agent::ssh_agent::AgentState>, glyx_agent::ssh_agent::SshAgentError> {
+    stop_ssh_agent(state);
+    let identities = glyx_agent::ssh_agent::load_identities(uv)?;
+    let agent = Arc::new(glyx_agent::ssh_agent::AgentState::new(identities));
+    let sock = glyx_agent::ssh_agent::socket_path(&uv.config().vault_id);
+    let run = agent.clone();
+    std::thread::spawn(move || {
+        glyx_agent::ssh_agent::serve_until_state(&sock, &run).ok();
+    });
+    *state
+        .ssh_agent
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(agent.clone());
+    Ok(agent)
+}
+
+fn reload_ssh_agent(
+    state: &AppState,
+    uv: &glyx_store::UnlockedVault,
+) -> Result<Arc<glyx_agent::ssh_agent::AgentState>, glyx_agent::ssh_agent::SshAgentError> {
+    let existing = state
+        .ssh_agent
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(agent) = existing {
+        agent.replace(glyx_agent::ssh_agent::load_identities(uv)?);
+        Ok(agent)
+    } else {
+        start_ssh_agent(state, uv)
+    }
+}
+
+fn ssh_agent_status(state: &AppState, uv: &glyx_store::UnlockedVault) -> serde_json::Value {
+    let socket = glyx_agent::ssh_agent::socket_path(&uv.config().vault_id);
+    let handle = state
+        .ssh_agent
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let running = handle.as_ref().is_some_and(|agent| agent.running());
+    serde_json::json!({
+        "running": running,
+        "socket": socket,
+        "identities": handle.as_ref().map_or(0, |agent| agent.count()),
+    })
 }
 
 fn release_vault(uv: &glyx_store::UnlockedVault) {
@@ -861,7 +909,7 @@ fn do_lock(state: &AppState) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
-    stop_agent_socket(state);
+    stop_ssh_agent(state);
     if let Some(uv) = taken.as_ref() {
         audit(uv, "lock", None, None, "success", None);
         release_vault(uv);
@@ -1877,12 +1925,311 @@ async fn item_unlink(
     }
 }
 
+async fn ssh_keys(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let keys = match glyx_agent::ssh_agent::load_key_meta(uv) {
+        Ok(keys) => keys,
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let exports = glyx_agent::ledger::open_db()
+        .ok()
+        .and_then(|conn| glyx_agent::ledger::list_exports(&conn).ok())
+        .unwrap_or_default();
+    let keys = keys
+        .into_iter()
+        .map(|meta| {
+            let targets = exports
+                .iter()
+                .filter(|row| row.kind == "ssh" && row.item_id.is_some_and(|id| id == meta.item_id))
+                .map(|row| {
+                    serde_json::json!({
+                        "target": row.target,
+                        "keep": row.keep_on_lock,
+                        "perm": row.perm,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "id": meta.item_id,
+                "name": meta.name,
+                "algorithm": meta.algorithm,
+                "fingerprint": meta.fingerprint,
+                "public": meta.public,
+                "comment": meta.comment,
+                "agent_enabled": meta.agent_enabled,
+                "agent_supported": meta.agent_supported,
+                "exports": targets,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({
+        "agent": ssh_agent_status(&state, uv),
+        "keys": keys,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct SshToggleBody {
+    agent_enabled: bool,
+}
+
+async fn ssh_toggle(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<SshToggleBody>,
+) -> impl IntoResponse {
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return locked_error().into_response();
+    };
+    let mut item = match uv.resolve(&id) {
+        Ok(item) => item,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    if item.item_type != glyx_core::ItemType::SshKey {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "item is not an SSH key"})),
+        )
+            .into_response();
+    }
+    let Some(meta) = glyx_agent::ssh_agent::key_meta(&item) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "SSH key is unreadable"})),
+        )
+            .into_response();
+    };
+    if body.agent_enabled && !meta.agent_supported {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "the SSH agent supports Ed25519 keys only; RSA keys are export-only"
+            })),
+        )
+            .into_response();
+    }
+    let values = BTreeMap::from([("agent_enabled".to_owned(), body.agent_enabled.to_string())]);
+    if let Err(e) = glyx_store::present::apply_fields(uv, &mut item, values) {
+        return store_error(&e).into_response();
+    }
+    if let Err(e) = uv.put_item(&item) {
+        return store_error(&e).into_response();
+    }
+    if let Err(e) = reload_ssh_agent(&state, uv) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    audit(
+        uv,
+        if body.agent_enabled {
+            "ssh_agent_add"
+        } else {
+            "ssh_agent_revoke"
+        },
+        Some(item.id),
+        None,
+        "success",
+        None,
+    );
+    Json(serde_json::json!({
+        "ok": true,
+        "agent": ssh_agent_status(&state, uv),
+        "key": glyx_agent::ssh_agent::key_meta(&item),
+    }))
+    .into_response()
+}
+
+async fn ssh_agent_start(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    if let Err(e) = start_ssh_agent(&state, uv) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    audit(uv, "ssh_agent_start", None, None, "success", None);
+    Json(serde_json::json!({"ok": true, "agent": ssh_agent_status(&state, uv)})).into_response()
+}
+
+async fn ssh_agent_stop(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    stop_ssh_agent(&state);
+    glyx_agent::ssh_agent::stop(&glyx_agent::ssh_agent::socket_path(&uv.config().vault_id));
+    audit(uv, "ssh_agent_stop", None, None, "success", None);
+    Json(serde_json::json!({"ok": true, "agent": ssh_agent_status(&state, uv)})).into_response()
+}
+
+async fn ssh_agent_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    if let Err(e) = reload_ssh_agent(&state, uv) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({"ok": true, "agent": ssh_agent_status(&state, uv)})).into_response()
+}
+
+#[derive(Deserialize)]
+struct SshImportBody {
+    private_key: String,
+    passphrase: Option<String>,
+    name: Option<String>,
+    comment: Option<String>,
+    folder: Option<String>,
+    tags: Option<Vec<String>>,
+    add_to_agent: Option<bool>,
+}
+
+async fn ssh_import(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SshImportBody>,
+) -> impl IntoResponse {
+    let mut guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_mut() else {
+        return locked_error().into_response();
+    };
+    let imported = match glyx_crypto::ssh::import(&body.private_key, body.passphrase.as_deref()) {
+        Ok(imported) => imported,
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let add_to_agent = body.add_to_agent.unwrap_or(false);
+    if add_to_agent && imported.algorithm != "ed25519" {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "the SSH agent supports Ed25519 keys only; import this RSA key without adding it to the agent"
+            })),
+        )
+            .into_response();
+    }
+    let comment = body
+        .comment
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(imported.comment);
+    let public = normalized_public(&imported.pair.openssh_public, &comment);
+    let name = body
+        .name
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if comment.is_empty() {
+                "imported ssh key".to_owned()
+            } else {
+                comment.clone()
+            }
+        });
+    let values = BTreeMap::from([
+        ("private".to_owned(), imported.pair.openssh_private),
+        ("public".to_owned(), public),
+        ("comment".to_owned(), comment),
+        ("kind".to_owned(), imported.algorithm),
+        ("agent_enabled".to_owned(), add_to_agent.to_string()),
+    ]);
+    let item = match glyx_store::present::build_new(
+        uv,
+        glyx_core::ItemType::SshKey,
+        name,
+        body.folder.unwrap_or_default(),
+        body.tags.unwrap_or_default(),
+        values,
+    ) {
+        Ok(item) => item,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    let id = item.id;
+    if let Err(e) = uv.put_item(&item) {
+        return store_error(&e).into_response();
+    }
+    if add_to_agent {
+        if let Err(e) = reload_ssh_agent(&state, uv) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    }
+    audit(uv, "ssh_import", Some(id), None, "success", None);
+    Json(serde_json::json!({
+        "ok": true,
+        "id": id,
+        "key": glyx_agent::ssh_agent::key_meta(&item),
+        "agent": ssh_agent_status(&state, uv),
+    }))
+    .into_response()
+}
+
+fn normalized_public(public: &str, comment: &str) -> String {
+    let mut parts = public.split_whitespace();
+    let algorithm = parts.next().unwrap_or_default();
+    let key = parts.next().unwrap_or_default();
+    if key.is_empty() {
+        return public.to_owned();
+    }
+    if comment.is_empty() {
+        format!("{algorithm} {key}")
+    } else {
+        format!("{algorithm} {key} {comment}")
+    }
+}
+
 #[derive(Deserialize)]
 struct SshGenBody {
     name: String,
     kind: Option<String>,
     comment: Option<String>,
     folder: Option<String>,
+    tags: Option<Vec<String>>,
+    add_to_agent: Option<bool>,
 }
 
 async fn ssh_gen(
@@ -1897,6 +2244,16 @@ async fn ssh_gen(
         return locked_error().into_response();
     };
     let kind = body.kind.unwrap_or_else(|| "ed25519".to_owned());
+    let add_to_agent = body.add_to_agent.unwrap_or(false);
+    if add_to_agent && kind != "ed25519" {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "the SSH agent supports Ed25519 keys only; generate this key without adding it to the agent"
+            })),
+        )
+            .into_response();
+    }
     let pair = match glyx_crypto::ssh::generate(&kind, body.comment.as_deref().unwrap_or("")) {
         Ok(p) => p,
         Err(e) => {
@@ -1912,20 +2269,35 @@ async fn ssh_gen(
     values.insert("public".to_owned(), pair.openssh_public.clone());
     values.insert("comment".to_owned(), body.comment.unwrap_or_default());
     values.insert("kind".to_owned(), kind);
+    values.insert("agent_enabled".to_owned(), add_to_agent.to_string());
     match glyx_store::present::build_new(
         uv,
         glyx_core::ItemType::SshKey,
         body.name,
         body.folder.unwrap_or_default(),
-        Vec::new(),
+        body.tags.unwrap_or_default(),
         values,
     ) {
         Ok(item) => {
             let id = item.id;
             match uv.put_item(&item) {
                 Ok(()) => {
-                    Json(serde_json::json!({"ok": true, "id": id, "public": pair.openssh_public}))
-                        .into_response()
+                    if add_to_agent {
+                        if let Err(e) = reload_ssh_agent(&state, uv) {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({"error": e.to_string()})),
+                            )
+                                .into_response();
+                        }
+                    }
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "id": id,
+                        "public": pair.openssh_public,
+                        "key": glyx_agent::ssh_agent::key_meta(&item),
+                    }))
+                    .into_response()
                 }
                 Err(e) => store_error(&e).into_response(),
             }
@@ -3253,14 +3625,27 @@ async fn agent_merge_apply(
 }
 
 async fn ssh_env(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let _ = state;
-    match glyx_agent::ssh_agent::live_socket() {
-        Some(sock) => Json(serde_json::json!({"sock": sock})).into_response(),
-        None => (
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let status = ssh_agent_status(&state, uv);
+    if status["running"].as_bool() == Some(true) {
+        Json(serde_json::json!({
+            "sock": status["socket"],
+            "running": true,
+            "identities": status["identities"],
+        }))
+        .into_response()
+    } else {
+        (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "no agent socket"})),
+            Json(serde_json::json!({"error": "no agent socket", "running": false})),
         )
-            .into_response(),
+            .into_response()
     }
 }
 
@@ -4019,7 +4404,7 @@ pub async fn serve(
         port: Mutex::new(addr.port()),
         idle_lock_ms: std::sync::atomic::AtomicU64::new(config.idle_lock_ms),
         last_activity_ms: Mutex::new(now_ms()),
-        agent_stop: Mutex::new(None),
+        ssh_agent: Mutex::new(None),
         tamper: Mutex::new(Vec::new()),
     });
     state.publish_record();
@@ -4079,7 +4464,7 @@ mod tests {
             port: Mutex::new(0),
             idle_lock_ms: std::sync::atomic::AtomicU64::new(0),
             last_activity_ms: Mutex::new(now_ms()),
-            agent_stop: Mutex::new(None),
+            ssh_agent: Mutex::new(None),
             tamper: Mutex::new(Vec::new()),
         })
     }
@@ -5405,6 +5790,171 @@ mod tests {
             target.exists(),
             "forgetting an injection must keep the file"
         );
+    }
+
+    #[tokio::test]
+    async fn ssh_keys_and_agent_toggle() {
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": "pw", "keyfile": kf_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(state.clone(), "GET", "/v1/ssh", None, "test-token").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["agent"]["running"], true);
+        assert_eq!(body["agent"]["identities"], 0);
+        assert_eq!(body["keys"].as_array().map(Vec::len), Some(0));
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/ssh-gen",
+            Some(serde_json::json!({
+                "name": "deploy",
+                "comment": "deploy@host",
+                "folder": "ops",
+                "tags": ["prod"]
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let id = body["id"].as_str().expect("id").to_owned();
+        assert_eq!(body["key"]["agent_enabled"], false);
+        assert_eq!(body["key"]["agent_supported"], true);
+        assert!(body["key"]["fingerprint"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("SHA256:")));
+
+        let (status, body) = call(
+            state.clone(),
+            "PATCH",
+            &format!("/v1/ssh/keys/{id}"),
+            Some(serde_json::json!({"agent_enabled": true})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["agent"]["identities"], 1);
+        assert_eq!(body["key"]["agent_enabled"], true);
+
+        let (status, body) = call(
+            state.clone(),
+            "PATCH",
+            &format!("/v1/ssh/keys/{id}"),
+            Some(serde_json::json!({"agent_enabled": false})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["agent"]["identities"], 0);
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/ssh/agent/stop",
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["agent"]["running"], false);
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/ssh/agent/start",
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["agent"]["running"], true);
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/ssh/agent/reload",
+            None,
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = call(state.clone(), "GET", "/v1/ssh/env", None, "test-token").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["running"], true);
+    }
+
+    #[tokio::test]
+    async fn ssh_import_ed25519_and_rsa() {
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": "pw", "keyfile": kf_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let pair = glyx_crypto::ssh::generate("ed25519", "imported@host").expect("generate");
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/ssh/import",
+            Some(serde_json::json!({
+                "private_key": pair.openssh_private,
+                "name": "imported",
+                "add_to_agent": true
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["key"]["agent_enabled"], true);
+        assert_eq!(body["key"]["algorithm"], "ed25519");
+        assert_eq!(body["agent"]["identities"], 1);
+
+        let rsa_pem = include_str!("../tests/fixtures/rsa_test_key").to_owned();
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/ssh/import",
+            Some(serde_json::json!({
+                "private_key": rsa_pem,
+                "name": "rsa key",
+                "add_to_agent": true
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/ssh/import",
+            Some(serde_json::json!({
+                "private_key": rsa_pem,
+                "name": "rsa key",
+                "add_to_agent": false
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["key"]["algorithm"], "rsa");
+        assert_eq!(body["key"]["agent_supported"], false);
+        assert_eq!(body["agent"]["identities"], 1);
     }
 
     fn urlencoding(path: &str) -> String {
