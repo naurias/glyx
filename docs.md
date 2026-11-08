@@ -23,7 +23,7 @@ This guide covers the user-facing frontends:
 | Web form fill | No | No | No | No | Autofill | Yes | No |
 | Passkey storage/management | Yes | Partial | Yes | Inherited | Inherited | No | No |
 | Passkey WebAuthn | No | No | Manage | Inherited | No | Chromium | No |
-| SSH keys/agent | Yes | No | Partial | Inherited | Partial | No | No |
+| SSH keys/agent | Yes | No | Yes | Inherited | Partial | No | No |
 | Favorites/recents/library/bulk/duplicates | Yes | No | Yes | Inherited | Inherited | No | No |
 | Devices/health/audit/generator | Yes | No | Yes | Inherited | Inherited | No | No |
 | Files & Injection | Yes | No | Yes | Inherited | Inherited | No | No |
@@ -508,6 +508,33 @@ Generate a key pair into a new item:
 
 ```sh
 glyx ssh gen --name deploy --kind ed25519 --comment you@host
+glyx ssh gen --name deploy --comment you@host --add-to-agent
+```
+
+Import an existing OpenSSH private key. Encrypted keys take a passphrase from an
+environment variable; the passphrase is used only to decrypt and is never stored:
+
+```sh
+GLYX_KEY_PASS='...' glyx ssh import \
+  --private-file ~/.ssh/id_ed25519 --passphrase-env GLYX_KEY_PASS \
+  --name deploy --add-to-agent
+```
+
+List and inspect keys (algorithm, SHA256 fingerprint, agent state):
+
+```sh
+glyx ssh ls
+glyx ssh show deploy
+```
+
+The agent is opt-in per key. New and existing keys start disabled; add or revoke
+them without relocking:
+
+```sh
+glyx ssh agent status
+glyx ssh agent add deploy
+glyx ssh agent rm deploy
+glyx ssh agent start|stop|reload
 ```
 
 Export a key to a file (ledger-tracked, shredded on lock unless `--keep`):
@@ -523,7 +550,13 @@ eval $(glyx ssh agent-env)
 ssh-add -L
 ```
 
-The agent socket lives only while the daemon is unlocked. Private material never touches disk through the agent path. GUI: choose the `ssh_key` type on the Add page and press Generate SSH key pair. Copy the public key from the item. Settings can show the current agent socket path (the same value as `glyx ssh agent-env`).
+The agent socket starts on unlock even with zero identities and lives only while
+the daemon is unlocked. Private material never touches disk through the agent
+path. The WebUI **SSH keys** section shows agent status, per-key fingerprints,
+generate/import wizards, add/revoke, reload, and export targets. RSA keys are
+export-only for now; the agent supports Ed25519. The item page has an SSH
+section, and the TUI shows algorithm, fingerprint, and agent intent (agent
+start/stop stays in the CLI/WebUI).
 
 ---
 

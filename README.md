@@ -292,12 +292,20 @@ The same refs work in files you track outside the vault: point glyx at a folder 
 ## SSH agent
 
 ```sh
+glyx ssh gen --name deploy --comment you@host --add-to-agent
+GLYX_KEY_PASS='...' glyx ssh import --private-file ~/.ssh/id_ed25519 --passphrase-env GLYX_KEY_PASS
+glyx ssh ls                                   # algorithm, SHA256 fingerprint, agent state
+glyx ssh agent add deploy                     # opt-in per key, reloads without relocking
 glyx ssh export deploy --to ~/.ssh/id_glyx   # file export, ledger-tracked
 eval $(glyx ssh agent-env)                    # daemon socket, sign-only
 ssh-add -L                                    # lists glyx:<name> identities
 ```
 
-The agent socket serves Ed25519 keys while the daemon is unlocked and vanishes on lock; private material never touches disk through this path.
+The agent is opt-in per key, starts on unlock even with zero identities, and
+serves Ed25519 keys while the daemon is unlocked; it vanishes on lock and private
+material never touches disk through this path. RSA keys are export-only for now.
+The WebUI **SSH keys** page covers generation, import (file or paste, optional
+passphrase), fingerprints, add/revoke, reload, and per-key export targets.
 
 ## Sync
 
