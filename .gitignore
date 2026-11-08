@@ -12,3 +12,4 @@ apps/webui/build/
 crates/glyx-tauri/gen/*
 !crates/glyx-tauri/gen/android
 !crates/glyx-tauri/gen/android/**
+.cortexkit/magic-context/
