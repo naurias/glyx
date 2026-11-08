@@ -1,8 +1,11 @@
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use ed25519_dalek::Signer as _;
+use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -17,9 +20,138 @@ pub enum SshAgentError {
 }
 
 pub struct AgentIdentity {
+    pub item_id: Uuid,
     pub name: String,
     pub public_blob: Vec<u8>,
     pub signing_key: ed25519_dalek::SigningKey,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SshKeyMeta {
+    pub item_id: Uuid,
+    pub name: String,
+    pub algorithm: String,
+    pub fingerprint: String,
+    pub public: String,
+    pub comment: String,
+    pub agent_enabled: bool,
+    pub agent_supported: bool,
+}
+
+pub struct AgentState {
+    identities: RwLock<Vec<AgentIdentity>>,
+    stop: AtomicBool,
+}
+
+impl std::fmt::Debug for AgentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentState")
+            .field("identities", &self.count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AgentState {
+    #[must_use]
+    pub fn new(identities: Vec<AgentIdentity>) -> Self {
+        Self {
+            identities: RwLock::new(identities),
+            stop: AtomicBool::new(false),
+        }
+    }
+
+    pub fn replace(&self, identities: Vec<AgentIdentity>) {
+        *self
+            .identities
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = identities;
+    }
+
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn running(&self) -> bool {
+        !self.stop.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.identities
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+#[must_use]
+pub fn is_agent_enabled(item: &glyx_core::Item) -> bool {
+    item.fields.get("agent_enabled").is_some_and(|field| {
+        matches!(
+            field.value.expose().trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes"
+        )
+    })
+}
+
+fn public_key_of(item: &glyx_core::Item) -> Option<ssh_key::PublicKey> {
+    if let Some(public) = item.fields.get("public") {
+        if let Ok(key) = ssh_key::PublicKey::from_openssh(public.value.expose().trim()) {
+            return Some(key);
+        }
+    }
+    let private = item.fields.get("private")?.value.expose();
+    let key = ssh_key::PrivateKey::from_openssh(private.trim()).ok()?;
+    Some(key.public_key().clone())
+}
+
+fn algorithm_label(algorithm: &ssh_key::Algorithm) -> String {
+    match algorithm {
+        ssh_key::Algorithm::Ed25519 => "ed25519".to_owned(),
+        ssh_key::Algorithm::Rsa { .. } => "rsa".to_owned(),
+        other => other.as_str().to_owned(),
+    }
+}
+
+#[must_use]
+pub fn key_meta(item: &glyx_core::Item) -> Option<SshKeyMeta> {
+    let public = public_key_of(item)?;
+    let algorithm = public.algorithm();
+    let fingerprint = public.fingerprint(ssh_key::HashAlg::Sha256).to_string();
+    let comment = item
+        .fields
+        .get("comment")
+        .map(|field| field.value.expose().trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| public.comment().to_owned());
+    Some(SshKeyMeta {
+        item_id: item.id,
+        name: item.name.clone(),
+        algorithm: algorithm_label(&algorithm),
+        fingerprint,
+        public: public.to_openssh().unwrap_or_default(),
+        comment,
+        agent_enabled: is_agent_enabled(item),
+        agent_supported: matches!(algorithm, ssh_key::Algorithm::Ed25519),
+    })
+}
+
+pub fn load_key_meta(uv: &glyx_store::UnlockedVault) -> Result<Vec<SshKeyMeta>, SshAgentError> {
+    let mut out = Vec::new();
+    for row in uv.list(false)? {
+        if row.item_type != "ssh_key" {
+            continue;
+        }
+        let Some(item) = uv.get_item(&row.id)? else {
+            continue;
+        };
+        if let Some(meta) = key_meta(&item) {
+            out.push(meta);
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
 }
 
 impl std::fmt::Debug for AgentIdentity {
@@ -46,6 +178,9 @@ pub fn load_identities(
         let Some(item) = uv.get_item(&row.id)? else {
             continue;
         };
+        if !is_agent_enabled(&item) {
+            continue;
+        }
         let Some(private) = item
             .fields
             .get("private")
@@ -66,6 +201,7 @@ pub fn load_identities(
             .to_bytes()
             .map_err(|e| SshAgentError::Key(e.to_string()))?;
         out.push(AgentIdentity {
+            item_id: item.id,
             name: format!("glyx:{}", item.name),
             public_blob,
             signing_key,
@@ -164,6 +300,55 @@ fn serve_conn(identities: &[AgentIdentity], stream: &mut UnixStream) {
     }
 }
 
+fn serve_conn_state(state: &AgentState, stream: &mut UnixStream) {
+    loop {
+        let mut len = [0u8; 4];
+        if stream.read_exact(&mut len).is_err() {
+            break;
+        }
+        let len = u32::from_be_bytes(len) as usize;
+        if len == 0 || len > 1024 * 1024 {
+            break;
+        }
+        let mut msg = vec![0u8; len];
+        if stream.read_exact(&mut msg).is_err() {
+            break;
+        }
+        let reply = {
+            let identities = state
+                .identities
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            handle(&identities, &msg)
+        };
+        if stream.write_all(&reply).is_err() {
+            break;
+        }
+    }
+}
+
+pub fn serve_until_state(path: &Path, state: &Arc<AgentState>) -> Result<(), SshAgentError> {
+    if path.exists() {
+        std::fs::remove_file(path).ok();
+    }
+    let listener = UnixListener::bind(path)?;
+    listener.set_nonblocking(true)?;
+    while !state.stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream.set_nonblocking(false).ok();
+                serve_conn_state(state, &mut stream);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(SshAgentError::Io(e)),
+        }
+    }
+    std::fs::remove_file(path).ok();
+    Ok(())
+}
+
 pub fn serve(path: &Path, identities: &[AgentIdentity]) -> Result<(), SshAgentError> {
     if path.exists() {
         std::fs::remove_file(path).ok();
@@ -237,6 +422,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn list_and_sign_roundtrip() {
         let dir = tempfile::tempdir().expect("tempdir");
         let vpath = dir.path().join("v.glyx");
@@ -255,6 +441,7 @@ mod tests {
         for (k, v) in [
             ("private", pair.openssh_private),
             ("public", pair.openssh_public),
+            ("agent_enabled", "true".to_owned()),
         ] {
             fields.insert(
                 k.to_owned(),
@@ -281,6 +468,12 @@ mod tests {
         let identities = load_identities(&uv).expect("load");
         assert_eq!(identities.len(), 1);
         assert_eq!(identities[0].name, "glyx:deploy");
+        let meta = load_key_meta(&uv).expect("meta");
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].algorithm, "ed25519");
+        assert!(meta[0].fingerprint.starts_with("SHA256:"));
+        assert!(meta[0].agent_enabled);
+        assert!(meta[0].agent_supported);
         let sock = dir.path().join("agent.sock");
         let thread_ids = load_identities(&uv).expect("reload");
         let thread_sock = sock.clone();
