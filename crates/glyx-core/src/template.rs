@@ -237,6 +237,11 @@ const SSH_KEY: &[FieldSpec] = &[
         secret: false,
         required: false,
     },
+    FieldSpec {
+        name: "agent_enabled",
+        secret: false,
+        required: false,
+    },
 ];
 
 const GENERIC_KEY: &[FieldSpec] = &[
