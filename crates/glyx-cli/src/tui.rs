@@ -379,6 +379,28 @@ fn draw_detail(f: &mut Frame, app: &App) {
         )),
         Line::from(""),
     ];
+    if item.item_type == glyx_core::ItemType::SshKey {
+        if let Some(meta) = glyx_agent::ssh_agent::key_meta(item) {
+            lines.push(Line::from(format!(
+                "algorithm: {}  fingerprint: {}",
+                meta.algorithm, meta.fingerprint
+            )));
+            lines.push(Line::from(format!(
+                "agent: {}",
+                if !meta.agent_supported {
+                    "unsupported (export only)".to_owned()
+                } else if meta.agent_enabled {
+                    "enabled".to_owned()
+                } else {
+                    "disabled".to_owned()
+                }
+            )));
+            if !meta.comment.is_empty() {
+                lines.push(Line::from(format!("comment: {}", meta.comment)));
+            }
+            lines.push(Line::from(""));
+        }
+    }
     if item.item_type == glyx_core::ItemType::Note && app.render {
         match glyx_store::present::note_rendered(&app.uv, item, app.reveal) {
             Ok(text) => {
@@ -390,6 +412,11 @@ fn draw_detail(f: &mut Frame, app: &App) {
         }
     } else {
         for (k, f) in &item.fields {
+            if item.item_type == glyx_core::ItemType::SshKey
+                && matches!(k.as_str(), "agent_enabled" | "kind" | "comment")
+            {
+                continue;
+            }
             let show = glyx_store::present::display_value(item.item_type, k, app.reveal);
             lines.push(Line::from(format!(
                 "{k}: {}",

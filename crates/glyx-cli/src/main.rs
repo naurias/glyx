@@ -1,5 +1,6 @@
 mod auth;
 mod daemon;
+mod daemon_client;
 mod exports;
 mod extension;
 mod gitcred;
@@ -510,6 +511,39 @@ enum SshCmd {
         comment: Option<String>,
         #[arg(long, help = "Folder path")]
         folder: Option<String>,
+        #[arg(long, help = "Add a tag (repeatable)")]
+        tag: Vec<String>,
+        #[arg(long, help = "Add the new Ed25519 key to the agent")]
+        add_to_agent: bool,
+    },
+    #[command(about = "Import an existing OpenSSH private key")]
+    Import {
+        #[arg(long, help = "Private key file (OpenSSH format)")]
+        private_file: PathBuf,
+        #[arg(long, help = "Read the passphrase from this env var")]
+        passphrase_env: Option<String>,
+        #[arg(long, help = "Display name")]
+        name: Option<String>,
+        #[arg(long, help = "Public key comment")]
+        comment: Option<String>,
+        #[arg(long, help = "Folder path")]
+        folder: Option<String>,
+        #[arg(long, help = "Add a tag (repeatable)")]
+        tag: Vec<String>,
+        #[arg(long, help = "Add the key to the agent (Ed25519 only)")]
+        add_to_agent: bool,
+    },
+    #[command(about = "List SSH keys")]
+    Ls,
+    #[command(about = "Show one SSH key")]
+    Show {
+        #[arg(help = "Id, id prefix, or exact name")]
+        query: String,
+    },
+    #[command(about = "Control the SSH agent")]
+    Agent {
+        #[command(subcommand)]
+        cmd: SshAgentCmd,
     },
     #[command(about = "Print SSH_AUTH_SOCK for the daemon agent")]
     AgentEnv,
@@ -519,6 +553,28 @@ enum SshCmd {
         query: String,
         #[arg(long, help = "Target path")]
         to: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SshAgentCmd {
+    #[command(about = "Show agent status")]
+    Status,
+    #[command(about = "Start the agent for the unlocked vault")]
+    Start,
+    #[command(about = "Stop the agent")]
+    Stop,
+    #[command(about = "Reload identities from the vault")]
+    Reload,
+    #[command(about = "Add a key to the agent")]
+    Add {
+        #[arg(help = "Id, id prefix, or exact name")]
+        query: String,
+    },
+    #[command(about = "Remove a key from the agent")]
+    Rm {
+        #[arg(help = "Id, id prefix, or exact name")]
+        query: String,
     },
 }
 
@@ -1129,13 +1185,217 @@ fn dispatch_ssh(ctx: &Ctx, cmd: SshCmd) -> Result<()> {
             kind,
             comment,
             folder,
-        } => cmd_ssh_gen(ctx, name, kind, comment, folder),
+            tag,
+            add_to_agent,
+        } => cmd_ssh_gen(ctx, name, kind, comment, folder, tag, add_to_agent),
+        SshCmd::Import {
+            private_file,
+            passphrase_env,
+            name,
+            comment,
+            folder,
+            tag,
+            add_to_agent,
+        } => cmd_ssh_import(
+            ctx,
+            &private_file,
+            passphrase_env.as_deref(),
+            name,
+            comment,
+            folder,
+            tag,
+            add_to_agent,
+        ),
+        SshCmd::Ls => cmd_ssh_ls(ctx),
+        SshCmd::Show { query } => cmd_ssh_show(ctx, &query),
+        SshCmd::Agent { cmd } => cmd_ssh_agent(ctx, cmd),
         SshCmd::AgentEnv => exports::cmd_agent_env(ctx.json),
         SshCmd::Export { query, to } => {
             let mut uv = ctx.unlocked()?;
             exports::cmd_ssh_export(&mut uv, &query, to, ctx.json)
         }
     }
+}
+
+fn cmd_ssh_agent(ctx: &Ctx, cmd: SshAgentCmd) -> Result<()> {
+    match cmd {
+        SshAgentCmd::Status => {
+            let Some(body) = daemon_client::agent_status()? else {
+                bail!("daemon offline: run `glyx daemon start` and unlock the vault");
+            };
+            if ctx.json {
+                println!("{}", body["agent"]);
+            } else {
+                let agent = &body["agent"];
+                println!(
+                    "agent: {}",
+                    if agent["running"].as_bool() == Some(true) {
+                        "running"
+                    } else {
+                        "stopped"
+                    }
+                );
+                println!("socket: {}", agent["socket"].as_str().unwrap_or("-"));
+                println!("identities: {}", agent["identities"]);
+                if let Some(keys) = body["keys"].as_array() {
+                    for key in keys
+                        .iter()
+                        .filter(|key| key["agent_enabled"].as_bool() == Some(true))
+                    {
+                        println!(
+                            "  {}  {}",
+                            key["name"].as_str().unwrap_or("-"),
+                            key["fingerprint"].as_str().unwrap_or("-")
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        SshAgentCmd::Start => cmd_ssh_agent_action(ctx, "start"),
+        SshAgentCmd::Stop => cmd_ssh_agent_action(ctx, "stop"),
+        SshAgentCmd::Reload => cmd_ssh_agent_action(ctx, "reload"),
+        SshAgentCmd::Add { query } => cmd_ssh_set_agent(ctx, &query, true),
+        SshAgentCmd::Rm { query } => cmd_ssh_set_agent(ctx, &query, false),
+    }
+}
+
+fn cmd_ssh_agent_action(ctx: &Ctx, action: &str) -> Result<()> {
+    let Some(body) = daemon_client::agent_action(action)? else {
+        bail!("daemon offline: run `glyx daemon start` first");
+    };
+    if ctx.json {
+        println!("{}", body["agent"]);
+    } else {
+        println!("agent {action} complete");
+    }
+    Ok(())
+}
+
+fn cmd_ssh_set_agent(ctx: &Ctx, query: &str, enabled: bool) -> Result<()> {
+    let mut uv = ctx.unlocked()?;
+    let mut item = items::resolve_query(&uv, query)?;
+    if item.item_type != glyx_core::ItemType::SshKey {
+        bail!("{} is not an SSH key", item.name);
+    }
+    let meta = glyx_agent::ssh_agent::key_meta(&item).context("SSH key is unreadable")?;
+    if enabled && !meta.agent_supported {
+        bail!(
+            "the SSH agent supports Ed25519 keys only; {} is {}",
+            item.name,
+            meta.algorithm
+        );
+    }
+    let values = BTreeMap::from([("agent_enabled".to_owned(), enabled.to_string())]);
+    glyx_store::present::apply_fields(&mut uv, &mut item, values)?;
+    uv.put_item(&item)?;
+    let reloaded = daemon_client::agent_action("reload")?.is_some();
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "id": item.id,
+                "agent_enabled": enabled,
+                "agent_reloaded": reloaded,
+            })
+        );
+    } else {
+        println!(
+            "{} {} {}",
+            if enabled { "added" } else { "removed" },
+            item.name,
+            if enabled { "to agent" } else { "from agent" }
+        );
+        if !reloaded {
+            println!("preference saved; the agent applies it on the next unlock");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_ssh_ls(ctx: &Ctx) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    let keys = glyx_agent::ssh_agent::load_key_meta(&uv)?;
+    let status = daemon_client::agent_status()?;
+    let agent = status.as_ref().map(|body| &body["agent"]);
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "agent": agent.cloned(),
+                "keys": keys,
+            })
+        );
+        return Ok(());
+    }
+    if let Some(agent) = agent {
+        println!(
+            "agent: {}  socket: {}  identities: {}",
+            if agent["running"].as_bool() == Some(true) {
+                "running"
+            } else {
+                "stopped"
+            },
+            agent["socket"].as_str().unwrap_or("-"),
+            agent["identities"]
+        );
+    }
+    if keys.is_empty() {
+        println!("no SSH keys stored");
+        return Ok(());
+    }
+    for key in keys {
+        println!(
+            "{}  {}  {}  {}{}  {}",
+            key.item_id,
+            key.algorithm,
+            key.fingerprint,
+            if key.agent_enabled {
+                "agent"
+            } else {
+                "no-agent"
+            },
+            if key.agent_supported {
+                ""
+            } else {
+                " (export-only)"
+            },
+            key.name
+        );
+    }
+    Ok(())
+}
+
+fn cmd_ssh_show(ctx: &Ctx, query: &str) -> Result<()> {
+    let uv = ctx.unlocked()?;
+    let item = items::resolve_query(&uv, query)?;
+    if item.item_type != glyx_core::ItemType::SshKey {
+        bail!("{} is not an SSH key", item.name);
+    }
+    let meta = glyx_agent::ssh_agent::key_meta(&item).context("SSH key is unreadable")?;
+    if ctx.json {
+        println!("{}", serde_json::to_string_pretty(&meta)?);
+    } else {
+        println!("{} [{}]", meta.name, meta.algorithm);
+        println!("id: {}", meta.item_id);
+        println!("fingerprint: {}", meta.fingerprint);
+        println!(
+            "agent: {}",
+            if !meta.agent_supported {
+                "unsupported (export-only)"
+            } else if meta.agent_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        if !meta.comment.is_empty() {
+            println!("comment: {}", meta.comment);
+        }
+        println!("{}", meta.public);
+    }
+    Ok(())
 }
 
 fn dispatch_export(ctx: &Ctx, cmd: ExportCmd) -> Result<()> {
@@ -2920,38 +3180,142 @@ fn cmd_ssh_gen(
     kind: SshKind,
     comment: Option<String>,
     folder: Option<String>,
+    tags: Vec<String>,
+    add_to_agent: bool,
 ) -> Result<()> {
     let mut uv = ctx.unlocked()?;
     let kind_str = match kind {
         SshKind::Ed25519 => "ed25519",
         SshKind::Rsa4096 => "rsa4096",
     };
+    if add_to_agent && kind_str != "ed25519" {
+        bail!("the SSH agent supports Ed25519 keys only; omit --add-to-agent for RSA");
+    }
     let pair = glyx_crypto::ssh::generate(kind_str, comment.as_deref().unwrap_or(""))?;
     let mut values = BTreeMap::new();
     values.insert("private".to_owned(), pair.openssh_private);
     values.insert("public".to_owned(), pair.openssh_public.clone());
     values.insert("comment".to_owned(), comment.unwrap_or_default());
     values.insert("kind".to_owned(), kind_str.to_owned());
+    values.insert("agent_enabled".to_owned(), add_to_agent.to_string());
     let item = items::build_new(
         &mut uv,
         glyx_core::ItemType::SshKey,
         name,
         folder.unwrap_or_default(),
-        Vec::new(),
+        tags,
         values,
     )?;
     let id = item.id;
     uv.put_item(&item)?;
+    let reloaded = if add_to_agent {
+        daemon_client::agent_action("reload")?.is_some()
+    } else {
+        false
+    };
     if ctx.json {
         println!(
             "{}",
-            serde_json::json!({"ok": true, "id": id, "public": pair.openssh_public})
+            serde_json::json!({
+                "ok": true, "id": id, "public": pair.openssh_public,
+                "agent_enabled": add_to_agent, "agent_reloaded": reloaded,
+            })
         );
     } else {
         println!("added {id}");
         println!("{}", pair.openssh_public);
+        if add_to_agent && !reloaded {
+            println!("key enabled for the agent; it applies on the next unlock");
+        }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_ssh_import(
+    ctx: &Ctx,
+    private_file: &Path,
+    passphrase_env: Option<&str>,
+    name: Option<String>,
+    comment: Option<String>,
+    folder: Option<String>,
+    tags: Vec<String>,
+    add_to_agent: bool,
+) -> Result<()> {
+    let private = std::fs::read_to_string(private_file)
+        .with_context(|| format!("read {}", private_file.display()))?;
+    let passphrase = match passphrase_env {
+        Some(var) => Some(std::env::var(var).with_context(|| format!("read env {var}"))?),
+        None => None,
+    };
+    let imported = glyx_crypto::ssh::import(&private, passphrase.as_deref())?;
+    if add_to_agent && imported.algorithm != "ed25519" {
+        bail!("the SSH agent supports Ed25519 keys only; omit --add-to-agent for RSA");
+    }
+    let comment = comment
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(imported.comment);
+    let public = normalized_public(&imported.pair.openssh_public, &comment);
+    let name = name
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if comment.is_empty() {
+                "imported ssh key".to_owned()
+            } else {
+                comment.clone()
+            }
+        });
+    let mut uv = ctx.unlocked()?;
+    let mut values = BTreeMap::new();
+    values.insert("private".to_owned(), imported.pair.openssh_private);
+    values.insert("public".to_owned(), public);
+    values.insert("comment".to_owned(), comment);
+    values.insert("kind".to_owned(), imported.algorithm);
+    values.insert("agent_enabled".to_owned(), add_to_agent.to_string());
+    let item = items::build_new(
+        &mut uv,
+        glyx_core::ItemType::SshKey,
+        name,
+        folder.unwrap_or_default(),
+        tags,
+        values,
+    )?;
+    let id = item.id;
+    uv.put_item(&item)?;
+    let reloaded = if add_to_agent {
+        daemon_client::agent_action("reload")?.is_some()
+    } else {
+        false
+    };
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true, "id": id, "agent_enabled": add_to_agent,
+                "agent_reloaded": reloaded,
+            })
+        );
+    } else {
+        println!("imported {id}");
+        if add_to_agent && !reloaded {
+            println!("key enabled for the agent; it applies on the next unlock");
+        }
+    }
+    Ok(())
+}
+
+fn normalized_public(public: &str, comment: &str) -> String {
+    let mut parts = public.split_whitespace();
+    let algorithm = parts.next().unwrap_or_default();
+    let key = parts.next().unwrap_or_default();
+    if key.is_empty() {
+        return public.to_owned();
+    }
+    if comment.is_empty() {
+        format!("{algorithm} {key}")
+    } else {
+        format!("{algorithm} {key} {comment}")
+    }
 }
 
 fn cmd_sync_status(ctx: &Ctx) -> Result<()> {
