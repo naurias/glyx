@@ -60,7 +60,11 @@ export async function retryDesktopBootstrap() {
 export async function pickFolder(title = 'Choose folder') {
   if (isMobile()) return prompt(title) || '';
   if (typeof window !== 'undefined' && window.__TAURI__?.core?.invoke) {
-    return (await window.__TAURI__.core.invoke('desktop_pick_folder', { title })) || '';
+    try {
+      return (await window.__TAURI__.core.invoke('desktop_pick_folder', { title })) || '';
+    } catch {
+      // Fall through to the daemon host picker.
+    }
   }
   const picked = await hostPick('folder', title);
   if (picked !== null) return picked;
@@ -70,7 +74,11 @@ export async function pickFolder(title = 'Choose folder') {
 export async function pickFile(title = 'Choose file') {
   if (isMobile()) return prompt(title) || '';
   if (typeof window !== 'undefined' && window.__TAURI__?.core?.invoke) {
-    return (await window.__TAURI__.core.invoke('desktop_pick_file', { title })) || '';
+    try {
+      return (await window.__TAURI__.core.invoke('desktop_pick_file', { title })) || '';
+    } catch {
+      // Fall through to the daemon host picker.
+    }
   }
   const picked = await hostPick('file', title);
   if (picked !== null) return picked;
@@ -80,12 +88,16 @@ export async function pickFile(title = 'Choose file') {
 export async function pickSave(title = 'Choose file', fileName = '') {
   if (isMobile()) return prompt(title) || '';
   if (typeof window !== 'undefined' && window.__TAURI__?.core?.invoke) {
-    return (
-      (await window.__TAURI__.core.invoke('desktop_pick_save', {
-        title,
-        fileName: fileName || undefined
-      })) || ''
-    );
+    try {
+      return (
+        (await window.__TAURI__.core.invoke('desktop_pick_save', {
+          title,
+          fileName: fileName || undefined
+        })) || ''
+      );
+    } catch {
+      // Fall through to the daemon host picker.
+    }
   }
   const picked = await hostPick('save', title, fileName);
   if (picked !== null) return picked;

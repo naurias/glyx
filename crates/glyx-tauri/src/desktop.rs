@@ -74,50 +74,65 @@ fn save_settings(settings: &DesktopSettings) -> Result<(), String> {
     glyx_store::vault::atomic_write(&path, &bytes).map_err(|e| e.to_string())
 }
 
-#[allow(clippy::needless_pass_by_value)]
 #[tauri::command]
-fn desktop_pick_folder(app: AppHandle, title: Option<String>) -> Option<String> {
-    let mut dialog = app.dialog().file();
+async fn desktop_pick_folder(
+    window: tauri::WebviewWindow,
+    title: Option<String>,
+) -> Result<Option<String>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut dialog = window.dialog().file();
     if let Some(title) = title {
         dialog = dialog.set_title(title);
     }
-    dialog
-        .blocking_pick_folder()
-        .and_then(|path| path.into_path().ok())
-        .map(|path| path.to_string_lossy().into_owned())
+    dialog.set_parent(&window).pick_folder(move |path| {
+        let _ = tx.send(
+            path.and_then(|p| p.into_path().ok())
+                .map(|p| p.to_string_lossy().into_owned()),
+        );
+    });
+    rx.await.map_err(|e| e.to_string())
 }
 
-#[allow(clippy::needless_pass_by_value)]
 #[tauri::command]
-fn desktop_pick_save(
-    app: AppHandle,
+async fn desktop_pick_save(
+    window: tauri::WebviewWindow,
     title: Option<String>,
     file_name: Option<String>,
-) -> Option<String> {
-    let mut dialog = app.dialog().file();
+) -> Result<Option<String>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut dialog = window.dialog().file();
     if let Some(title) = title {
         dialog = dialog.set_title(title);
     }
     if let Some(file_name) = file_name {
         dialog = dialog.set_file_name(file_name);
     }
-    dialog
-        .blocking_save_file()
-        .and_then(|path| path.into_path().ok())
-        .map(|path| path.to_string_lossy().into_owned())
+    dialog.set_parent(&window).save_file(move |path| {
+        let _ = tx.send(
+            path.and_then(|p| p.into_path().ok())
+                .map(|p| p.to_string_lossy().into_owned()),
+        );
+    });
+    rx.await.map_err(|e| e.to_string())
 }
 
-#[allow(clippy::needless_pass_by_value)]
 #[tauri::command]
-fn desktop_pick_file(app: AppHandle, title: Option<String>) -> Option<String> {
-    let mut dialog = app.dialog().file();
+async fn desktop_pick_file(
+    window: tauri::WebviewWindow,
+    title: Option<String>,
+) -> Result<Option<String>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut dialog = window.dialog().file();
     if let Some(title) = title {
         dialog = dialog.set_title(title);
     }
-    dialog
-        .blocking_pick_file()
-        .and_then(|path| path.into_path().ok())
-        .map(|path| path.to_string_lossy().into_owned())
+    dialog.set_parent(&window).pick_file(move |path| {
+        let _ = tx.send(
+            path.and_then(|p| p.into_path().ok())
+                .map(|p| p.to_string_lossy().into_owned()),
+        );
+    });
+    rx.await.map_err(|e| e.to_string())
 }
 
 pub fn configure(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
