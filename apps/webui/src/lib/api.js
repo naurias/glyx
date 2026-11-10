@@ -62,6 +62,8 @@ export async function pickFolder(title = 'Choose folder') {
   if (typeof window !== 'undefined' && window.__TAURI__?.core?.invoke) {
     return (await window.__TAURI__.core.invoke('desktop_pick_folder', { title })) || '';
   }
+  const picked = await hostPick('folder', title);
+  if (picked !== null) return picked;
   return prompt(title) || '';
 }
 
@@ -70,6 +72,8 @@ export async function pickFile(title = 'Choose file') {
   if (typeof window !== 'undefined' && window.__TAURI__?.core?.invoke) {
     return (await window.__TAURI__.core.invoke('desktop_pick_file', { title })) || '';
   }
+  const picked = await hostPick('file', title);
+  if (picked !== null) return picked;
   return prompt(title) || '';
 }
 
@@ -83,7 +87,21 @@ export async function pickSave(title = 'Choose file', fileName = '') {
       })) || ''
     );
   }
+  const picked = await hostPick('save', title, fileName);
+  if (picked !== null) return picked;
   return prompt(title) || '';
+}
+
+async function hostPick(kind, title, fileName = '') {
+  try {
+    const res = await req('POST', `/v1/pick/${kind}`, {
+      title,
+      file_name: fileName || null
+    });
+    return res.path || '';
+  } catch {
+    return null;
+  }
 }
 
 async function reqPage(method, path) {
@@ -185,6 +203,8 @@ export const api = {
   updateExport: (target, body) => req('PATCH', '/v1/exports', { target, ...body }),
   enforce: (force) => req('POST', '/v1/exports/enforce', { force }),
   trackInject: (target, form, glob) => req('POST', '/v1/injects', { target, form, glob }),
+  updateInject: (target, lockOnExit) =>
+    req('PATCH', '/v1/injects', { target, lock_on_exit: lockOnExit }),
   injectContent: (target, reveal = false) =>
     req(
       'GET',

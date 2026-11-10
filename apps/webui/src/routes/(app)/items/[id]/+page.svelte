@@ -2,6 +2,7 @@
   import { api, downloadBlob } from '$lib/api.js';
   import { renderMarkdown } from '$lib/markdown.js';
   import ItemForm from '$lib/ItemForm.svelte';
+  import PointerEditor from '$lib/components/PointerEditor.svelte';
   import PageHeader from '$lib/components/PageHeader.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import PromptDialog from '$lib/components/PromptDialog.svelte';
@@ -35,6 +36,12 @@
   let sshInfo = null;
   let sshExportOpen = false;
   let sshExportTarget = '';
+  let pointerEditor = null;
+  let pointerFields = {};
+  let pointerName = '';
+  let pointerFolder = '';
+  let pointerTags = '';
+  let pointerOriginalKeys = [];
 
   let confirmOpen = false;
   let confirmTitle = '';
@@ -52,6 +59,21 @@
 
   $: id = $page.params.id;
   $: fields = item?.fields || {};
+  $: pointerRows =
+    item?.type === 'pointer'
+      ? Object.entries(fields).map(([key, value]) => {
+          const match = String(value)
+            .trim()
+            .match(/^\{\{glyx:([0-9a-fA-F-]{36})\/([a-z0-9_]+)\}\}$/);
+          const target = match ? allItems.find((candidate) => candidate.id === match[1]) : null;
+          return {
+            key,
+            value,
+            targetName: target?.name || match?.[1] || '',
+            targetField: match?.[2] || ''
+          };
+        })
+      : [];
   $: fieldEntries = Object.entries(fields).filter(([key]) => {
     if (key === 'body') return false;
     if (item?.type !== 'ssh_key') return true;
@@ -295,6 +317,13 @@
     try {
       const full = await api.show(id, true);
       editValues = { ...full.fields };
+      if (full.type === 'pointer') {
+        pointerFields = { ...full.fields };
+        pointerOriginalKeys = Object.keys(full.fields || {});
+        pointerName = full.name;
+        pointerFolder = full.folder;
+        pointerTags = (full.tags || []).join(', ');
+      }
       editing = true;
     } catch (e) {
       error = e.message;
@@ -323,6 +352,36 @@
         folder: payload.folder,
         tags: payload.tags,
         fields: payload.fields
+      });
+      editing = false;
+      notice = 'Changes saved';
+      await load();
+    } catch (e) {
+      error = e.message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function savePointer() {
+    error = '';
+    const fields = pointerEditor?.fields() || {};
+    if (!Object.keys(fields).length) {
+      error = 'Add at least one alias with a target item and field.';
+      return;
+    }
+    const removed = pointerOriginalKeys.filter((key) => !(key in fields));
+    busy = true;
+    try {
+      await api.edit(id, {
+        rename: pointerName,
+        folder: pointerFolder,
+        tags: pointerTags
+          .split(',')
+          .map((tag) => tag.trim())
+          .filter(Boolean),
+        fields,
+        delete_fields: removed
       });
       editing = false;
       notice = 'Changes saved';
@@ -391,19 +450,36 @@
 {#if item}
   {#if editing}
     <div class="card">
-      <ItemForm
-        {templates}
-        item_type={item.type}
-        name={item.name}
-        folder={item.folder}
-        values={editValues}
-        tags={item.tags}
-        lockType
-        submitLabel="Save changes"
-        {busy}
-        onsubmit={save}
-        oncancel={() => (editing = false)}
-      />
+      {#if item.type === 'pointer'}
+        <label>Name<input bind:value={pointerName} /></label>
+        <label>Folder<input bind:value={pointerFolder} /></label>
+        <label>Tags<input bind:value={pointerTags} placeholder="comma, separated" /></label>
+        <PointerEditor
+          items={allItems}
+          initialFields={pointerFields}
+          bind:this={pointerEditor}
+          onchange={(fields) => (pointerFields = fields)}
+          disabled={busy}
+        />
+        <div class="row" style="margin-top: 8px">
+          <button class="primary" on:click={savePointer} disabled={busy}>Save changes</button>
+          <button on:click={() => (editing = false)}>Cancel</button>
+        </div>
+      {:else}
+        <ItemForm
+          {templates}
+          item_type={item.type}
+          name={item.name}
+          folder={item.folder}
+          values={editValues}
+          tags={item.tags}
+          lockType
+          submitLabel="Save changes"
+          {busy}
+          onsubmit={save}
+          oncancel={() => (editing = false)}
+        />
+      {/if}
     </div>
   {:else}
     <div class="detail-grid">
@@ -483,6 +559,28 @@
             {/if}
           {:else}
             <div class="empty"><strong>This SSH key is unreadable.</strong><span>Check the private/public fields.</span></div>
+          {/if}
+        {:else if item.type === 'pointer'}
+          <div class="section-title"><h3>Pointer aliases</h3><span class="dim">{pointerRows.length}</span></div>
+          {#if pointerRows.length}
+            <div class="field-table">
+              {#each pointerRows as row}
+                <div class="field-row">
+                  <span class="field-key">{row.key}</span>
+                  <span class="field-value">
+                    {row.targetName}{row.targetField ? `:${row.targetField}` : ''}
+                  </span>
+                  <span class="field-actions">
+                    {#if row.targetName && row.targetField}
+                      <button on:click={() => copyText(row.value, 'Reference copied')}>Copy ref</button>
+                    {/if}
+                  </span>
+                </div>
+              {/each}
+            </div>
+            <p class="dim">Pointer aliases expand when inserted into an in-place injection template.</p>
+          {:else}
+            <div class="empty"><strong>No aliases.</strong><span>Edit this pointer item to add aliases.</span></div>
           {/if}
         {:else}
           <div class="section-title"><h3>Fields</h3><span class="dim">{fieldEntries.length}</span></div>

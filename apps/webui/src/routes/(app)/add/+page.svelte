@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
   import ItemForm from '$lib/ItemForm.svelte';
+  import PointerEditor from '$lib/components/PointerEditor.svelte';
   import PageHeader from '$lib/components/PageHeader.svelte';
 
   let templates = [];
@@ -11,6 +12,10 @@
   let folder = '';
   let error = '';
   let busy = false;
+  let allItems = [];
+  let pointerFields = {};
+  let pointerTags = '';
+  let pointerEditor = null;
 
   const labels = {
     login: ['Login', 'Username, password, URL, and notes'],
@@ -21,12 +26,13 @@
     note: ['Note', 'Markdown with secret references'],
     file: ['File', 'Encrypted attachment'],
     ssh_key: ['SSH key', 'Ed25519 or RSA key pair'],
-    generic_key: ['Generic key', 'Any other secret material']
+    generic_key: ['Generic key', 'Any other secret material'],
+    pointer: ['Pointer', 'Named aliases to other item fields']
   };
 
   onMount(async () => {
     try {
-      templates = await api.templates();
+      [templates, allItems] = await Promise.all([api.templates(), api.items()]);
     } catch (e) {
       error = e.message;
     }
@@ -50,6 +56,37 @@
     busy = true;
     try {
       const res = await api.sshGen({ name: name || 'ssh key', folder });
+      goto(`/items/${res.id}`);
+    } catch (e) {
+      error = e.message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function savePointer() {
+    error = '';
+    if (!name.trim()) {
+      error = 'Name is required.';
+      return;
+    }
+    const fields = pointerEditor?.fields() || {};
+    if (!Object.keys(fields).length) {
+      error = 'Add at least one alias with a target item and field.';
+      return;
+    }
+    busy = true;
+    try {
+      const res = await api.create({
+        type: 'pointer',
+        name,
+        folder,
+        tags: pointerTags
+          .split(',')
+          .map((tag) => tag.trim())
+          .filter(Boolean),
+        fields
+      });
       goto(`/items/${res.id}`);
     } catch (e) {
       error = e.message;
@@ -84,19 +121,29 @@
   </div>
 
   <div class="card">
-    <ItemForm
-      {templates}
-      bind:item_type
-      bind:name
-      bind:folder
-      submitLabel="Create item"
-      {busy}
-      onsubmit={save}
-    />
-    {#if item_type === 'ssh_key'}
-      <div class="row" style="margin-top: 12px">
-        <button on:click={genSsh} disabled={busy}>Generate SSH key pair instead</button>
+    {#if item_type === 'pointer'}
+      <label>Name<input bind:value={name} /></label>
+      <label>Folder<input bind:value={folder} /></label>
+      <label>Tags<input bind:value={pointerTags} placeholder="comma, separated" /></label>
+      <PointerEditor items={allItems} bind:this={pointerEditor} onchange={(fields) => (pointerFields = fields)} />
+      <div class="row" style="margin-top: 8px">
+        <button class="primary" on:click={savePointer} disabled={busy}>Create pointer item</button>
       </div>
+    {:else}
+      <ItemForm
+        {templates}
+        bind:item_type
+        bind:name
+        bind:folder
+        submitLabel="Create item"
+        {busy}
+        onsubmit={save}
+      />
+      {#if item_type === 'ssh_key'}
+        <div class="row" style="margin-top: 12px">
+          <button on:click={genSsh} disabled={busy}>Generate SSH key pair instead</button>
+        </div>
+      {/if}
     {/if}
   </div>
 {/if}

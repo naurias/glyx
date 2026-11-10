@@ -128,6 +128,14 @@
       error = e.message;
     }
   }
+  async function setLockOnExit(value) {
+    error = '';
+    try {
+      settings = await api.saveSettings({ lock_on_exit: value });
+    } catch (e) {
+      error = e.message;
+    }
+  }
   async function setMode(value) {
     error = '';
     try {
@@ -309,6 +317,18 @@
         </button>
       </div>
       <p class="dim">With auto off, unlock writes no secrets to disk; use the Exports page (or CLI) to unlock individual targets.</p>
+    </div>
+    <div class="card">
+      <div>On crash or exit:</div>
+      <div class="row">
+        <button class:selected={settings.lock_on_exit} on:click={() => setLockOnExit(true)}>
+          Lock in-place files
+        </button>
+        <button class:selected={!settings.lock_on_exit} on:click={() => setLockOnExit(false)}>
+          Leave them as-is
+        </button>
+      </div>
+      <p class="dim">Applies to tracked in-place files when the daemon exits or recovers after a crash. Each file can override this from the Files page.</p>
     </div>
     <div class="card">
       <div>Session</div>
