@@ -179,7 +179,7 @@ The vault id is printed on creation. Keep the keyfile (if you use one) somewhere
 
 **Daemon.** The daemon owns the unlocked vault and serves the API and GUI on `127.0.0.1` with a bearer token. It can run without a vault selected, which is how onboarding works. A single daemon switches between vaults.
 
-**App config.** `~/.config/glyx/config.toml` (override with `GLYX_CONFIG`). It stores the selected vault, known vaults, session defaults, daemon behavior, and the auto-materialize setting.
+**App config.** `~/.config/glyx/config.toml` (override with `GLYX_CONFIG`). It stores the selected vault, known vaults, session defaults, daemon behavior, the auto-materialize setting, and the in-place lock-on-exit default.
 
 **Auto-materialize.** By default, unlocking writes tracked secrets to their files (exports and injections). Turn this off if you prefer to unlock each target explicitly.
 
@@ -329,10 +329,16 @@ Supported types:
 | `file` | blob address, filename |
 | `ssh_key` | private, public, comment (plus `kind` from `ssh gen`) |
 | `generic_key` | material, kind |
+| `pointer` | arbitrary alias fields, each holding `{{glyx:<id>/<field>}}` |
 
 These are template suggestions. `--field key=value` can add extra fields, and
 the TUI/WebUI forms show the same template. Any item can carry one encrypted
 attachment in its reserved `blob` field (25 MiB max).
+
+A `pointer` item is a reusable bundle of named aliases. Each field value is a
+reference such as `{{glyx:<real-item-id>/<field>}}`. The injection editor
+expands the alias to the real reference when inserting it; the engine still
+resolves only the real field. Pointer items cannot target another pointer item.
 
 ### CLI
 
@@ -658,6 +664,41 @@ glyx inject move <old> <new>
 
 `inject move` re-points the ledger entry and re-seals pointers for the new path, so the moved file unlocks normally. A folder target scopes its children.
 
+### Lock on crash or exit
+
+The global setting **Lock in-place files on crash or exit** defaults on. Each
+tracked file can override it:
+
+```sh
+glyx inject policy project/.env --lock-on-exit inherit
+glyx inject policy project/.env --lock-on-exit always
+glyx inject policy project/.env --lock-on-exit never
+```
+
+On a graceful daemon exit (`glyx daemon stop`, desktop close with daemon-stop,
+SIGTERM/SIGINT), glyx locks the files selected by the policy. Explicit
+`glyx lock` always locks everything. After a hard crash, the next daemon start
+restores the stored locked form when the file is unchanged; drifted files are
+left untouched and reported. `glyx inject recover` runs the same recovery
+manually. If the desktop is configured to keep the daemon running, the daemon
+has not exited, so this policy does not fire.
+
+### Pointer aliases
+
+Create a pointer item with aliases to real fields:
+
+```sh
+glyx add pointer --name prod_alias \
+  --field password='{{glyx:<login-id>/password}}' \
+  --field token='{{glyx:<api-id>/token}}'
+```
+
+In **Files & Injection → In-place injection**, choose the pointer item and an
+alias; the editor inserts the real `{{glyx:<id>/<field>}}` reference. The same
+screen can create a normal item with multiple fields, add a field to an
+existing item, or create a pointer item and insert its first alias in one step.
+CLI `inject add-ref` and `rm-ref` expand pointer aliases the same way.
+
 ### Editing references from the CLI
 
 ```sh
@@ -681,7 +722,9 @@ CLI `inject ls` lists folders first, then files. GUI:
 editor with line numbers, reference chips, per-reference locked forms, insert
 and remove controls, and an unlocked/locked preview. Managed files and tracked
 folders live in sibling tabs, so the whole-file and in-place models are never
-mixed.
+mixed. **Browse** opens the native picker on desktop; the browser WebUI asks the
+local daemon for a host dialog and falls back to a path prompt when no GUI is
+available.
 
 On lock, an unchanged file is restored from the exact locked baseline. If the
 file changed while unlocked, glyx routes the difference through the same
@@ -857,7 +900,7 @@ The daemon serves the GUI on loopback. The static pages are public; every `/v1` 
 - `/conflicts` compare and resolve
 - `/files` splits **Managed files** (whole-file materialization, perm, keep-on-lock) from **In-place injection** (template editor, reference chips, per-reference form, preview, merge); `/exports` redirects here
 - `/onboarding` select, add, create, or forget vaults
-- `/settings` session mode and TTL, idle auto-lock, auto-materialize, daemon behavior, rekey (including keeping old slots), sync, GC, doctor (rebuild + with-unlock), pairwise sync, and the SSH agent socket
+- `/settings` session mode and TTL, idle auto-lock, auto-materialize, lock in-place files on crash/exit, daemon behavior, rekey (including keeping old slots), sync, GC, doctor (rebuild + with-unlock), pairwise sync, and the SSH agent socket
 
 Secrets are kept in memory only and never written to `localStorage`.
 

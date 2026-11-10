@@ -258,12 +258,31 @@ glyx inject preview ~/project/.env
 glyx inject add-ref ~/project/.env --line 4 --item github --field password
 glyx inject rm-ref ~/project/.env --item github --field password
 glyx inject form ~/project/.env masked
+glyx inject policy ~/project/.env --lock-on-exit always
+glyx inject recover
+```
+
+A `pointer` item is a reusable bundle of named aliases. Each alias holds a
+reference to a real item field; inserting it from the injection editor or
+`inject add-ref` expands to the real reference:
+
+```sh
+glyx add pointer --name prod_alias \
+  --field password='{{glyx:<login-id>/password}}'
 ```
 
 The WebUI splits these into **Files & Injection → Managed files** and
 **In-place injection**. The injection editor opens the canonical reference
-template, lets you insert references from any item field, choose a locked form
-per reference, and preview both states before saving.
+template, lets you insert references from any item field (including pointer
+aliases), create a source item or field inline, choose a locked form per
+reference, and preview both states before saving. **Browse** opens a native
+picker on desktop and a host dialog in the browser WebUI.
+
+The global **Lock in-place files on crash or exit** setting defaults on. Each
+file can override it with `inject policy` (`inherit`, `always`, `never`).
+Graceful daemon exit locks the selected files; after a hard crash, the next
+daemon start restores stored locked forms when files are unchanged and reports
+drift instead of overwriting it.
 
 Locked files show opaque encrypted pointers by default (`__GLYXENC:V1:…`, bound to their target path so copying them elsewhere fails closed). Where tooling must parse locked files, `--form masked` writes fixed-size `ENC[…]` tags instead. If a file changed while locked, unlock reports it instead of overwriting: `glyx export tamper`, then combine, keep, or overwrite:
 
