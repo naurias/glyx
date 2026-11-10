@@ -9,6 +9,38 @@ struct Args {
     vault: Option<PathBuf>,
     #[arg(long, help = "Idle auto-lock minutes, 0 disables")]
     idle_lock_min: Option<u64>,
+    #[arg(
+        long,
+        value_name = "TOKEN",
+        conflicts_with_all = ["token_env", "token_file"],
+        help = "Bearer token for the WebUI/API; generated when omitted"
+    )]
+    token: Option<String>,
+    #[arg(
+        long,
+        value_name = "VAR",
+        conflicts_with_all = ["token", "token_file"],
+        help = "Read the bearer token from this environment variable"
+    )]
+    token_env: Option<String>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["token", "token_env"],
+        help = "Read the bearer token from this file"
+    )]
+    token_file: Option<PathBuf>,
+}
+
+fn random_token() -> anyhow::Result<String> {
+    let mut token_bytes = [0u8; 32];
+    glyx_crypto::fill_random(&mut token_bytes)?;
+    let mut token = String::with_capacity(64);
+    for b in token_bytes {
+        use std::fmt::Write as _;
+        write!(token, "{b:02x}").expect("hex formatting");
+    }
+    Ok(token)
 }
 
 #[tokio::main]
@@ -33,13 +65,15 @@ async fn main() -> anyhow::Result<()> {
             .current_vault
             .filter(|p| glyx_store::Vault::open(p).is_ok()),
     };
-    let mut token_bytes = [0u8; 32];
-    glyx_crypto::fill_random(&mut token_bytes)?;
-    let mut token = String::with_capacity(64);
-    for b in token_bytes {
-        use std::fmt::Write as _;
-        write!(token, "{b:02x}").expect("hex formatting");
-    }
+    let source =
+        glyx_daemon::runtime::TokenSource::new(args.token, args.token_env, args.token_file);
+    let token = match source.resolve_warn()? {
+        Some(token) => token,
+        None => match glyx_daemon::runtime::token_from_spawn_env()? {
+            Some(token) => token,
+            None => random_token()?,
+        },
+    };
     let idle_lock_min = args
         .idle_lock_min
         .or_else(|| glyx_store::config::load().idle_lock_min)

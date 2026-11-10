@@ -139,7 +139,7 @@ cargo audit
 pnpm --dir apps/webui build
 ```
 
-Current expected count: **120/120 nextest** on `refine-ui-files`. The detailed Arch
+Current expected count: **126/126 nextest** on `refine-ui-files`. The detailed Arch
 component-by-component guide is `local/build-without-nix.md` in the development
 checkout; the public summary is in `README.md`.
 
@@ -886,14 +886,14 @@ inputs directly.
 ## 16. Daemon and GUI
 
 ```sh
-glyx daemon start [--idle-lock-min N]
+glyx daemon start [--idle-lock-min N] [--token TOKEN | --token-env VAR | --token-file PATH]
 glyx daemon status
 glyx daemon stop
 ```
 
-`daemon start` reuses a live daemon or starts one. It does not need a vault argument; it uses the selected vault, or starts empty for onboarding. `--idle-lock-min` overrides the persisted `idle_lock_min` setting for that daemon instance. The record is `daemon.json` in the runtime directory (port, pid, token, selected vault), readable only by you.
+`daemon start` reuses a live daemon or starts one. It does not need a vault argument; it uses the selected vault, or starts empty for onboarding. `--idle-lock-min` overrides the persisted `idle_lock_min` setting for that daemon instance. It prints the loopback URL, bearer token, and the `daemon.json` record path (port, pid, token, selected vault; `0600`). `--token` sets a custom token; `--token-env` reads it from an environment variable and `--token-file` from a file. The three options are mutually exclusive, surrounding whitespace is trimmed, and tokens shorter than 16 characters print a warning. `--token-env` and `--token-file` keep the value out of shell history and the daemon process list; `--token` itself is visible in your shell history. If a daemon is already running with a different token, stop it first with `glyx daemon stop`.
 
-The daemon serves the GUI on loopback. The static pages are public; every `/v1` API call requires the bearer token. Open the printed URL, enter the token from `daemon.json`, and use the pages:
+The daemon serves the GUI on loopback. The static pages are public; every `/v1` API call requires the bearer token. Open the printed URL, paste the printed token, and use the pages:
 
 - `/` unlock with password, keyfile, or PIN, with an Advanced section for per-unlock TTL and materialization; when unlocking with a password you can also set a PIN
 - the unlocked shell has a persistent sidebar (Items, Favorites, Recents, Passkeys, Files & Injection, Conflicts, Health, Devices, Audit, Generator, Settings, Vaults) and a top bar with global search, Add item, and Lock

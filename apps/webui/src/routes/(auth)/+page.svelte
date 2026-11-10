@@ -173,7 +173,7 @@
     {#if vaultLabel}<p class="dim">Vault: <code>{vaultLabel}</code></p>{/if}
   {:else}
     <label>Daemon URL<input bind:value={url} placeholder="http://127.0.0.1:PORT" /></label>
-    <label>Token<input bind:value={token} placeholder="from daemon-*.json" /></label>
+    <label>Token<input bind:value={token} placeholder="printed by glyx daemon start" /></label>
   {/if}
   {#if !booting && !bootError}
   {#if mobile && biometric?.available && !needsKeyfile}
@@ -230,7 +230,7 @@
     <button class="primary" on:click={connect}>Unlock</button>
     <button on:click={goOnboarding}>Vaults...</button>
   </div>
-  {#if !desktop && !configured()}<p class="dim">Find the port and token in your runtime dir: <code>daemon-&lt;vault&gt;.json</code> (run <code>glyx daemon start</code>), or enter them to manage vaults.</p>{/if}
+  {#if !desktop && !configured()}<p class="dim">Run <code>glyx daemon start</code> to print the URL and token, or read them from <code>daemon.json</code> in your runtime dir. Enter both here to manage vaults.</p>{/if}
   {/if}
 </div>
 

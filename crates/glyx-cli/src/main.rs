@@ -437,12 +437,33 @@ enum ConflictsCmd {
     },
 }
 
-#[derive(Debug, Clone, Copy, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum DaemonCmd {
     #[command(about = "Start the localhost daemon")]
     Start {
         #[arg(long, help = "Idle auto-lock minutes")]
         idle_lock_min: Option<u64>,
+        #[arg(
+            long,
+            value_name = "TOKEN",
+            conflicts_with_all = ["token_env", "token_file"],
+            help = "Bearer token for the WebUI/API; generated when omitted"
+        )]
+        token: Option<String>,
+        #[arg(
+            long,
+            value_name = "VAR",
+            conflicts_with_all = ["token", "token_file"],
+            help = "Read the bearer token from this environment variable"
+        )]
+        token_env: Option<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with_all = ["token", "token_env"],
+            help = "Read the bearer token from this file"
+        )]
+        token_file: Option<PathBuf>,
     },
     #[command(about = "Stop the localhost daemon")]
     Stop,
@@ -1570,8 +1591,14 @@ fn dispatch_inject(ctx: &Ctx, cmd: InjectCmd) -> Result<()> {
 
 fn dispatch_daemon(ctx: &Ctx, cmd: DaemonCmd) -> Result<()> {
     match cmd {
-        DaemonCmd::Start { idle_lock_min } => {
-            daemon::cmd_start(ctx.vault.as_deref(), idle_lock_min, ctx.json)
+        DaemonCmd::Start {
+            idle_lock_min,
+            token,
+            token_env,
+            token_file,
+        } => {
+            let source = glyx_daemon::runtime::TokenSource::new(token, token_env, token_file);
+            daemon::cmd_start(ctx.vault.as_deref(), idle_lock_min, &source, ctx.json)
         }
         DaemonCmd::Stop => daemon::cmd_stop(ctx.json),
         DaemonCmd::Status => {
@@ -3773,4 +3800,65 @@ fn doctor(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod daemon_token_flag_tests {
+    use super::*;
+
+    fn start_flags(args: &[&str]) -> (Option<String>, Option<String>, Option<PathBuf>) {
+        let cli = Cli::try_parse_from(args).expect("parse");
+        let Some(Cmd::Daemon { cmd }) = cli.cmd else {
+            panic!("expected daemon command");
+        };
+        match cmd {
+            DaemonCmd::Start {
+                token,
+                token_env,
+                token_file,
+                ..
+            } => (token, token_env, token_file),
+            _ => panic!("expected daemon start"),
+        }
+    }
+
+    #[test]
+    fn daemon_start_accepts_each_token_source() {
+        assert_eq!(
+            start_flags(&["glyx", "daemon", "start", "--token", "abc"]).0,
+            Some("abc".to_owned())
+        );
+        assert_eq!(
+            start_flags(&["glyx", "daemon", "start", "--token-env", "MY_TOKEN"]).1,
+            Some("MY_TOKEN".to_owned())
+        );
+        assert_eq!(
+            start_flags(&["glyx", "daemon", "start", "--token-file", "/tmp/token"]).2,
+            Some(PathBuf::from("/tmp/token"))
+        );
+    }
+
+    #[test]
+    fn daemon_start_rejects_multiple_token_sources() {
+        assert!(Cli::try_parse_from([
+            "glyx",
+            "daemon",
+            "start",
+            "--token",
+            "abc",
+            "--token-env",
+            "MY_TOKEN",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "glyx",
+            "daemon",
+            "start",
+            "--token-env",
+            "MY_TOKEN",
+            "--token-file",
+            "/tmp/token",
+        ])
+        .is_err());
+    }
 }

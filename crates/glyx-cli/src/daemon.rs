@@ -1,29 +1,54 @@
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
-pub fn cmd_start(vault: Option<&Path>, idle_lock_min: Option<u64>, as_json: bool) -> Result<()> {
+use glyx_daemon::runtime::{DaemonRecord, TokenSource};
+
+pub fn cmd_start(
+    vault: Option<&Path>,
+    idle_lock_min: Option<u64>,
+    token: &TokenSource,
+    as_json: bool,
+) -> Result<()> {
+    let requested = token.resolve_warn()?;
     if let Some(rec) = glyx_daemon::runtime::live_record() {
-        if as_json {
-            println!(
-                "{}",
-                serde_json::json!({"ok": true, "port": rec.port, "pid": rec.pid})
-            );
-        } else {
-            println!("daemon already on 127.0.0.1:{} (pid {})", rec.port, rec.pid);
+        if let Some(token) = &requested {
+            if rec.token != *token {
+                bail!(
+                    "daemon already running with a different token (pid {})\nrunning token: {}\nrun `glyx daemon stop` before starting with a custom token",
+                    rec.pid,
+                    rec.token
+                );
+            }
         }
+        print_record(&rec, as_json);
         return Ok(());
     }
-    let rec = glyx_daemon::runtime::ensure_running(vault, idle_lock_min)?;
+    let rec = glyx_daemon::runtime::ensure_running(vault, idle_lock_min, requested.as_deref())?;
+    print_record(&rec, as_json);
+    Ok(())
+}
+
+fn print_record(rec: &DaemonRecord, as_json: bool) {
+    let url = format!("http://127.0.0.1:{}/", rec.port);
+    let record = glyx_daemon::runtime::record_path();
     if as_json {
         println!(
             "{}",
-            serde_json::json!({"ok": true, "port": rec.port, "pid": rec.pid})
+            serde_json::json!({
+                "ok": true,
+                "url": url,
+                "port": rec.port,
+                "pid": rec.pid,
+                "token": rec.token,
+                "record": record,
+            })
         );
     } else {
-        println!("daemon on 127.0.0.1:{} (pid {})", rec.port, rec.pid);
+        println!("daemon on {url} (pid {})", rec.pid);
+        println!("token: {}", rec.token);
+        println!("token file: {}", record.display());
     }
-    Ok(())
 }
 
 pub fn cmd_stop(as_json: bool) -> Result<()> {

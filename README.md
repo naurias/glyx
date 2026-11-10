@@ -350,10 +350,11 @@ The daemon owns the unlocked vault and serves the API plus the WebUI on loopback
 
 ```sh
 glyx daemon start                 # uses your selected vault, or starts empty
+glyx daemon start --token-env GLYX_TOKEN   # custom token from the environment
 glyx daemon status
 ```
 
-Open the printed address in a browser, paste the token from the runtime dir (`daemon.json`), then manage vaults and unlock items, TOTP codes, conflicts, sync, GC, and doctor from the UI. Secrets stay in memory only and never touch `localStorage`. The desktop app (`glyx-tauri`, or `nix run .#glyx-desktop`) hosts the same UI: it starts the daemon for you, wires the URL and token automatically, and ships with onboarding for choosing, adding, or creating a vault. By default it stops the daemon it started when you close the app; change that under Settings. `daemon stop` (or Lock in the UI) drops the key.
+`daemon start` prints the loopback URL and bearer token. Open that URL in a browser, paste the token, then manage vaults and unlock items, TOTP codes, conflicts, sync, GC, and doctor from the UI. Use `--token`, `--token-env VAR`, or `--token-file PATH` to choose your own token instead of the generated one; the latter two avoid exposing it in shell history or the process list. Secrets stay in memory only and never touch `localStorage`. The desktop app (`glyx-tauri`, or `nix run .#glyx-desktop`) hosts the same UI: it starts the daemon for you, wires the URL and token automatically, and ships with onboarding for choosing, adding, or creating a vault. By default it stops the daemon it started when you close the app; change that under Settings. `daemon stop` (or Lock in the UI) drops the key.
 
 ```sh
 nix profile install .#bundle   # NixOS: CLI, daemon, and desktop in one profile

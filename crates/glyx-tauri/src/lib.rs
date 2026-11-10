@@ -120,7 +120,7 @@ pub fn desktop_bootstrap_info() -> BootstrapInfo {
             error: None,
         };
     }
-    match glyx_daemon::runtime::ensure_running(current_vault().as_deref(), None) {
+    match glyx_daemon::runtime::ensure_running(current_vault().as_deref(), None, None) {
         Ok(rec) => {
             OWNED_DAEMON.store(true, Ordering::Relaxed);
             BootstrapInfo {
