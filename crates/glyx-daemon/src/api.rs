@@ -176,7 +176,10 @@ fn cors_layer() -> CorsLayer {
     .filter_map(|origin| origin.parse::<HeaderValue>().ok())
     .collect::<Vec<_>>();
     CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            origins.iter().any(|allowed| allowed == origin)
+                || origin.to_str().is_ok_and(is_loopback_origin)
+        }))
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -191,6 +194,17 @@ fn cors_layer() -> CorsLayer {
             CONTENT_DISPOSITION,
         ])
         .max_age(std::time::Duration::from_secs(600))
+}
+
+fn is_loopback_origin(origin: &str) -> bool {
+    let Some(rest) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or(rest);
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]")
+        || host.starts_with("localhost:")
+        || host.starts_with("127.0.0.1:")
+        || host.starts_with("[::1]:")
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5086,6 +5100,50 @@ mod tests {
             .get("access-control-allow-headers")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.to_ascii_lowercase().contains("authorization")));
+
+        for origin in [
+            "http://localhost:4173",
+            "http://127.0.0.1:9000",
+            "http://[::1]:9000",
+        ] {
+            let res = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("OPTIONS")
+                        .uri("/v1/status")
+                        .header("origin", origin)
+                        .header("access-control-request-method", "GET")
+                        .header("access-control-request-headers", "authorization")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("oneshot");
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(
+                res.headers()
+                    .get("access-control-allow-origin")
+                    .and_then(|v| v.to_str().ok()),
+                Some(origin)
+            );
+        }
+
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/status")
+                    .header("origin", "https://evil.example")
+                    .header("access-control-request-method", "GET")
+                    .header("access-control-request-headers", "authorization")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("oneshot");
+        assert!(res.headers().get("access-control-allow-origin").is_none());
 
         let res = app
             .oneshot(

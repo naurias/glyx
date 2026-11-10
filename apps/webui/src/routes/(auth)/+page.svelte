@@ -8,9 +8,10 @@
     retryDesktopBootstrap,
     isMobile
   } from '$lib/api.js';
+  import { browser, dev } from '$app/environment';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
-  let url = 'http://127.0.0.1:8080';
+  let url = browser && !dev ? window.location.origin : 'http://127.0.0.1:8080';
   let token = '';
   let password = '';
   let keyfile = '';
@@ -91,6 +92,7 @@
   }
 
   onMount(async () => {
+    if (browser && !dev && !desktop) url = window.location.origin;
     if (await ensureDesktop()) {
       try {
         await loadStatus();

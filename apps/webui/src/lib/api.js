@@ -116,8 +116,21 @@ async function hostPick(kind, title, fileName = '') {
   }
 }
 
+async function daemonFetch(path, options) {
+  try {
+    return await fetch(base + path, options);
+  } catch (e) {
+    const where = base || '(no daemon URL configured)';
+    throw new Error(
+      `cannot reach the glyx daemon at ${where}. ` +
+        'Run `glyx daemon start` and use the printed URL and token. ' +
+        `(${e.message})`
+    );
+  }
+}
+
 async function reqPage(method, path) {
-  const res = await fetch(base + path, {
+  const res = await daemonFetch(path, {
     method,
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
   });
@@ -127,7 +140,7 @@ async function reqPage(method, path) {
 }
 
 async function req(method, path, body) {
-  const res = await fetch(base + path, {
+  const res = await daemonFetch(path, {
     method,
     headers: {
       Authorization: `Bearer ${token}`,
@@ -247,7 +260,7 @@ export const api = {
   settings: () => req('GET', '/v1/settings'),
   saveSettings: (body) => req('POST', '/v1/settings', body),
   uploadBlob: async (file) => {
-    const res = await fetch(`${base}/v1/blobs`, {
+    const res = await daemonFetch('/v1/blobs', {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
       body: file
@@ -259,11 +272,14 @@ export const api = {
   gcBlobs: (dryRun = true) => req('POST', '/v1/blobs/gc', { dry_run: dryRun }),
   backup: () => download('/v1/vaults/backup'),
   restore: async (file, dest) => {
-    const res = await fetch(`${base}/v1/vaults/restore?dest=${encodeURIComponent(dest)}`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-      body: file
-    });
+    const res = await daemonFetch(
+      `/v1/vaults/restore?dest=${encodeURIComponent(dest)}`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: file
+      }
+    );
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || `restore failed: ${res.status}`);
     return data;
@@ -271,7 +287,7 @@ export const api = {
 };
 
 export async function download(path, filename) {
-  const res = await fetch(base + path, {
+  const res = await daemonFetch(path, {
     headers: { Authorization: `Bearer ${token}` }
   });
   if (!res.ok) {
