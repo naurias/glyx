@@ -11,7 +11,7 @@ pub use error::CoreError;
 pub use hlc::Hlc;
 pub use ids::DeviceId;
 pub use item::{Field, Item, ItemType};
-pub use locked::{masked_fallback, ref_placeholder, LockedForm};
+pub use locked::{masked_fallback, parse_ref_placeholder, ref_placeholder, LockedForm};
 pub use secret::SecretString;
 pub use template::{parse_type, FieldSpec, ALL_TYPES};
 pub use vault_spec::{Cipher, CipherSuiteConfig, KdfId, KdfParams, VaultConfig};

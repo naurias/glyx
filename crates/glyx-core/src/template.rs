@@ -257,6 +257,8 @@ const GENERIC_KEY: &[FieldSpec] = &[
     },
 ];
 
+const POINTER: &[FieldSpec] = &[];
+
 #[must_use]
 pub fn spec(item_type: ItemType) -> &'static [FieldSpec] {
     match item_type {
@@ -269,10 +271,11 @@ pub fn spec(item_type: ItemType) -> &'static [FieldSpec] {
         ItemType::File => FILE,
         ItemType::SshKey => SSH_KEY,
         ItemType::GenericKey => GENERIC_KEY,
+        ItemType::Pointer => POINTER,
     }
 }
 
-pub const ALL_TYPES: [ItemType; 9] = [
+pub const ALL_TYPES: [ItemType; 10] = [
     ItemType::Login,
     ItemType::Passkey,
     ItemType::Totp,
@@ -282,6 +285,7 @@ pub const ALL_TYPES: [ItemType; 9] = [
     ItemType::File,
     ItemType::SshKey,
     ItemType::GenericKey,
+    ItemType::Pointer,
 ];
 
 pub fn parse_type(text: &str) -> Result<ItemType, super::CoreError> {
@@ -295,6 +299,20 @@ pub fn parse_type(text: &str) -> Result<ItemType, super::CoreError> {
         "file" => Ok(ItemType::File),
         "ssh_key" | "ssh-key" | "sshkey" => Ok(ItemType::SshKey),
         "generic_key" | "generic-key" | "key" => Ok(ItemType::GenericKey),
+        "pointer" | "ptr" => Ok(ItemType::Pointer),
         other => Err(super::CoreError::UnknownItemType(other.to_owned())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pointer_type_has_no_required_template_fields() {
+        assert!(spec(ItemType::Pointer).is_empty());
+        assert_eq!(parse_type("pointer").expect("parse"), ItemType::Pointer);
+        assert_eq!(parse_type("ptr").expect("parse"), ItemType::Pointer);
+        assert!(ALL_TYPES.contains(&ItemType::Pointer));
     }
 }

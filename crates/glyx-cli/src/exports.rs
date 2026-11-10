@@ -73,6 +73,7 @@ pub fn cmd_ls(as_json: bool) -> Result<()> {
                 })).collect::<Vec<_>>(),
                 "injects": injects.iter().map(|i| serde_json::json!({
                     "target": i.target, "form": i.form,
+                    "lock_on_exit": i.lock_on_exit,
                 })).collect::<Vec<_>>(),
                 "roots": roots.iter().map(|r| serde_json::json!({
                     "root": r.root, "glob": r.glob, "form": r.form,
@@ -88,7 +89,16 @@ pub fn cmd_ls(as_json: bool) -> Result<()> {
             println!("{} [{}] {} ({keep})", e.target.display(), e.kind, e.id);
         }
         for i in &injects {
-            println!("{} [inject:{}]", i.target.display(), i.form);
+            let policy = match i.lock_on_exit {
+                None => "inherit",
+                Some(true) => "always",
+                Some(false) => "never",
+            };
+            println!(
+                "{} [inject:{} lock-on-exit:{policy}]",
+                i.target.display(),
+                i.form
+            );
         }
         if exports.is_empty() && injects.is_empty() && roots.is_empty() {
             println!("no exports registered");
@@ -512,6 +522,59 @@ pub fn cmd_inject_rm(target: &std::path::Path, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn cmd_inject_policy(
+    target: &std::path::Path,
+    lock_on_exit: Option<bool>,
+    as_json: bool,
+) -> Result<()> {
+    let conn = glyx_agent::ledger::open_db()?;
+    if glyx_agent::ledger::get_inject(&conn, target)?.is_none() {
+        bail!("{} is not a tracked file", target.display());
+    }
+    glyx_agent::ledger::set_inject_lock_on_exit(&conn, target, lock_on_exit)?;
+    let policy = match lock_on_exit {
+        None => "inherit",
+        Some(true) => "always",
+        Some(false) => "never",
+    };
+    if as_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true, "target": target, "lock_on_exit": lock_on_exit,
+            })
+        );
+    } else {
+        println!("{} now uses lock-on-exit: {policy}", target.display());
+    }
+    Ok(())
+}
+
+pub fn cmd_inject_recover(as_json: bool) -> Result<()> {
+    let global = glyx_store::config::load().lock_on_exit;
+    let report = glyx_agent::engine::recover_crash(global).map_err(|e| anyhow::anyhow!(e))?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true, "restored": report.restored, "wiped": report.wiped,
+                "drifted": report.drifted,
+            })
+        );
+    } else {
+        println!(
+            "recovered {} file(s), wiped {}, {} drifted",
+            report.restored,
+            report.wiped,
+            report.drifted.len()
+        );
+        for item in &report.drifted {
+            println!("drift: {item}");
+        }
+    }
+    Ok(())
+}
+
 pub fn cmd_target_unlock(
     uv: &mut glyx_store::UnlockedVault,
     target: &std::path::Path,
@@ -659,6 +722,34 @@ pub struct AddRefOpts<'a> {
     pub replace: bool,
 }
 
+fn expand_pointer_ref(
+    uv: &glyx_store::UnlockedVault,
+    item: glyx_core::Item,
+    field: &str,
+    depth: usize,
+) -> Result<(glyx_core::Item, String)> {
+    if item.item_type != glyx_core::ItemType::Pointer {
+        return Ok((item, field.to_owned()));
+    }
+    if depth > 5 {
+        bail!("pointer chain is too deep");
+    }
+    let value = item
+        .fields
+        .get(field)
+        .ok_or_else(|| anyhow::anyhow!("field {field} is not present on {}", item.name))?
+        .value
+        .expose();
+    let (id, target_field) = glyx_core::parse_ref_placeholder(value).ok_or_else(|| {
+        anyhow::anyhow!("pointer alias {}:{field} has no valid target", item.name)
+    })?;
+    let target = uv
+        .get_item(&id)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .ok_or_else(|| anyhow::anyhow!("pointer target item is gone"))?;
+    expand_pointer_ref(uv, target, &target_field, depth + 1)
+}
+
 pub fn cmd_inject_add_ref(
     uv: &glyx_store::UnlockedVault,
     target: &std::path::Path,
@@ -674,6 +765,8 @@ pub fn cmd_inject_add_ref(
     } = *opts;
     let content = glyx_agent::inject_content(uv, target, false).map_err(|e| anyhow::anyhow!(e))?;
     let item = uv.resolve(item_query).map_err(|e| anyhow::anyhow!(e))?;
+    let (item, field) = expand_pointer_ref(uv, item, field, 0)?;
+    let field = field.as_str();
     if !item.fields.contains_key(field) {
         bail!("field {field} is not present on {}", item.name);
     }
@@ -730,6 +823,8 @@ pub fn cmd_inject_rm_ref(
 ) -> Result<()> {
     let content = glyx_agent::inject_content(uv, target, false).map_err(|e| anyhow::anyhow!(e))?;
     let item = uv.resolve(item_query).map_err(|e| anyhow::anyhow!(e))?;
+    let (item, field) = expand_pointer_ref(uv, item, field, 0)?;
+    let field = field.as_str();
     let placeholder = glyx_core::ref_placeholder(&item.id, field);
     if !content.template.contains(&placeholder) {
         bail!(

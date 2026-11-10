@@ -80,6 +80,8 @@ pub struct AppConfig {
     pub daemon_on_exit: DaemonExit,
     #[serde(default = "default_true")]
     pub auto_materialize: bool,
+    #[serde(default = "default_true")]
+    pub lock_on_exit: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_lock_min: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,6 +101,7 @@ impl Default for AppConfig {
             session_ttl_min: default_ttl(),
             daemon_on_exit: DaemonExit::Stop,
             auto_materialize: true,
+            lock_on_exit: true,
             idle_lock_min: None,
             current_vault: None,
             vaults: Vec::new(),

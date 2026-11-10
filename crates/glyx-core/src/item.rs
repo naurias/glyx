@@ -17,6 +17,7 @@ pub enum ItemType {
     File,
     SshKey,
     GenericKey,
+    Pointer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

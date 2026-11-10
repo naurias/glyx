@@ -17,7 +17,8 @@
     ['note', 'Notes'],
     ['file', 'Files'],
     ['ssh_key', 'SSH keys'],
-    ['generic_key', 'Generic keys']
+    ['generic_key', 'Generic keys'],
+    ['pointer', 'Pointers']
   ];
 
   function pick(next) {

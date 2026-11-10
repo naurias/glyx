@@ -1,7 +1,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -61,6 +61,7 @@ pub struct InjectRow {
     pub locked_text: Option<String>,
     pub locked_hash: Option<String>,
     pub unlocked_hash: Option<String>,
+    pub lock_on_exit: Option<bool>,
 }
 
 #[must_use]
@@ -90,10 +91,13 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), AgentError> {
            locked_hash TEXT, unlocked_hash TEXT, mtime INTEGER, size INTEGER, root TEXT);
          CREATE TABLE IF NOT EXISTS inject_roots(
            root TEXT PRIMARY KEY, glob TEXT NOT NULL DEFAULT '*.md',
-           form TEXT NOT NULL DEFAULT 'ref');",
+           form TEXT NOT NULL DEFAULT 'ref');
+         CREATE TABLE IF NOT EXISTS meta(
+           key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
     let _ = conn.execute("ALTER TABLE injects ADD COLUMN root TEXT", []);
     let _ = conn.execute("ALTER TABLE injects ADD COLUMN template_text TEXT", []);
+    let _ = conn.execute("ALTER TABLE injects ADD COLUMN lock_on_exit INTEGER", []);
     Ok(())
 }
 
@@ -443,10 +447,11 @@ pub fn list_exports(conn: &Connection) -> Result<Vec<ExportRow>, AgentError> {
 
 pub fn list_injects(conn: &Connection) -> Result<Vec<InjectRow>, AgentError> {
     let mut stmt = conn.prepare(
-        "SELECT target, form, refs_json, template_text, locked_text, locked_hash, unlocked_hash FROM injects ORDER BY target",
+        "SELECT target, form, refs_json, template_text, locked_text, locked_hash, unlocked_hash, lock_on_exit FROM injects ORDER BY target",
     )?;
     let rows = stmt.query_map([], |r| {
         let target: String = r.get(0)?;
+        let lock_on_exit = r.get::<_, Option<i64>>(7)?.map(|value| value != 0);
         Ok(InjectRow {
             target: PathBuf::from(target),
             form: r.get(1)?,
@@ -455,6 +460,7 @@ pub fn list_injects(conn: &Connection) -> Result<Vec<InjectRow>, AgentError> {
             locked_text: r.get(4)?,
             locked_hash: r.get(5)?,
             unlocked_hash: r.get(6)?,
+            lock_on_exit,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>()
@@ -480,6 +486,39 @@ pub fn update_inject_template(
         rusqlite::params![form, template, refs_json, target.to_string_lossy()],
     )?;
     Ok(())
+}
+
+pub fn set_inject_lock_on_exit(
+    conn: &Connection,
+    target: &Path,
+    value: Option<bool>,
+) -> Result<(), AgentError> {
+    conn.execute(
+        "UPDATE injects SET lock_on_exit = ?1 WHERE target = ?2",
+        rusqlite::params![
+            value.map(|v| i64::from(i32::from(v))),
+            target.to_string_lossy()
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn set_dirty(conn: &Connection, dirty: bool) -> Result<(), AgentError> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES ('dirty', ?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [if dirty { "1" } else { "0" }],
+    )?;
+    Ok(())
+}
+
+pub fn is_dirty(conn: &Connection) -> Result<bool, AgentError> {
+    let value: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'dirty'", [], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(value.as_deref() == Some("1"))
 }
 
 pub fn recall_target(conn: &Connection, target: &Path) -> Result<bool, AgentError> {

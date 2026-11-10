@@ -516,6 +516,7 @@ fn item_type_name(kind: glyx_core::ItemType) -> &'static str {
         glyx_core::ItemType::File => "file",
         glyx_core::ItemType::SshKey => "ssh_key",
         glyx_core::ItemType::GenericKey => "generic_key",
+        glyx_core::ItemType::Pointer => "pointer",
     }
 }
 

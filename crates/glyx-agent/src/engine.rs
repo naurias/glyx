@@ -723,6 +723,7 @@ pub fn materialize_all(
     force: bool,
 ) -> Result<MaterializeReport, AgentError> {
     let conn = open_db()?;
+    crate::ledger::set_dirty(&conn, true)?;
     let mut report = MaterializeReport::default();
     if let Ok(expanded) = expand_inject_roots(&conn) {
         report.scanned = expanded.files;
@@ -763,6 +764,7 @@ pub fn materialize_target(
     force: bool,
 ) -> Result<MaterializeReport, AgentError> {
     let conn = open_db()?;
+    crate::ledger::set_dirty(&conn, true)?;
     let mut report = MaterializeReport::default();
     if target.is_dir() {
         if let Ok(expanded) = expand_inject_roots(&conn) {
@@ -811,7 +813,101 @@ pub fn forget_target(target: &Path) -> Result<bool, AgentError> {
 }
 
 pub fn teardown_all(uv: &glyx_store::UnlockedVault) -> Result<TeardownReport, AgentError> {
-    teardown_targets(uv, None)
+    let report = teardown_targets(uv, None)?;
+    let conn = open_db()?;
+    crate::ledger::set_dirty(&conn, false)?;
+    Ok(report)
+}
+
+#[must_use]
+pub fn effective_lock_on_exit(global: bool, row: &InjectRow) -> bool {
+    row.lock_on_exit.unwrap_or(global)
+}
+
+pub fn teardown_for_exit(
+    uv: &glyx_store::UnlockedVault,
+    global: bool,
+) -> Result<TeardownReport, AgentError> {
+    let conn = open_db()?;
+    let mut report = TeardownReport::default();
+    for row in list_exports(&conn)? {
+        if row.keep_on_lock {
+            continue;
+        }
+        if row.target.exists() {
+            shred_file(&row.target)?;
+            report.wiped += 1;
+        }
+    }
+    for row in list_injects(&conn)? {
+        if !effective_lock_on_exit(global, &row) {
+            continue;
+        }
+        let scoped = teardown_targets(uv, Some(&row.target))?;
+        report.restored += scoped.restored;
+        report.drifted.extend(scoped.drifted);
+    }
+    crate::ledger::set_dirty(&conn, false)?;
+    Ok(report)
+}
+
+pub fn recover_crash(global: bool) -> Result<TeardownReport, AgentError> {
+    let conn = open_db()?;
+    if !crate::ledger::is_dirty(&conn)? {
+        return Ok(TeardownReport::default());
+    }
+    let mut report = TeardownReport::default();
+    for row in list_exports(&conn)? {
+        if row.keep_on_lock {
+            continue;
+        }
+        if row.target.exists() {
+            shred_file(&row.target)?;
+            report.wiped += 1;
+        }
+    }
+    for row in list_injects(&conn)? {
+        if !effective_lock_on_exit(global, &row) {
+            continue;
+        }
+        let Ok(text) = read_text_limited(&row.target) else {
+            continue;
+        };
+        let current_hash = blake_hex(text.as_bytes());
+        if row.locked_hash.as_deref() == Some(current_hash.as_str()) {
+            continue;
+        }
+        let Some(locked_text) = row.locked_text.as_ref() else {
+            report.drifted.push(format!(
+                "{}: no locked baseline stored",
+                row.target.display()
+            ));
+            continue;
+        };
+        if row.unlocked_hash.as_deref() != Some(current_hash.as_str()) {
+            report
+                .drifted
+                .push(format!("{}: changed outside glyx", row.target.display()));
+            continue;
+        }
+        std::fs::write(&row.target, locked_text.as_bytes())?;
+        let meta = std::fs::metadata(&row.target)?;
+        conn.execute(
+            "UPDATE injects SET locked_hash = ?1, mtime = ?2, size = ?3 WHERE target = ?4",
+            rusqlite::params![
+                blake_hex(locked_text.as_bytes()),
+                meta.modified().ok().and_then(|t| t
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs().cast_signed())),
+                meta.len().cast_signed(),
+                row.target.to_string_lossy(),
+            ],
+        )?;
+        report.restored += 1;
+    }
+    crate::ledger::set_dirty(&conn, false)?;
+    Ok(report)
 }
 
 fn auto_merge_lock(
@@ -1088,10 +1184,6 @@ fn in_scope(target: Option<&Path>, candidate: &Path) -> bool {
     }
 }
 
-pub fn crash_replay(uv: &glyx_store::UnlockedVault) -> Result<TeardownReport, AgentError> {
-    teardown_all(uv)
-}
-
 #[derive(Debug, Clone)]
 pub struct MergePreview {
     pub target: PathBuf,
@@ -1314,6 +1406,60 @@ mod tests {
         let tampers = check_all(&conn, true).expect("check");
         assert_eq!(tampers.len(), 1);
         assert_eq!(tampers[0].kind, TamperKind::Residue);
+    }
+
+    #[test]
+    fn crash_recovery_respects_lock_policy() {
+        let _env = ENV_LOCK.lock().expect("lock");
+        let runtime = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
+        let work = tempfile::tempdir().expect("tempdir");
+        let (mut uv, id) = login_vault(work.path());
+        let target = work.path().join("app.env");
+        std::fs::write(&target, format!("pass={{{{glyx:{id}/password}}}}\n")).expect("write");
+        let conn = open_db().expect("db");
+        register_inject(&conn, &target, "encrypted-pointer", None).expect("register");
+        drop(conn);
+
+        materialize_all(&mut uv, false).expect("materialize");
+        assert!(std::fs::read_to_string(&target)
+            .expect("read")
+            .contains("s3cret"));
+        let report = recover_crash(true).expect("recover");
+        assert_eq!(report.restored, 1);
+        let locked = std::fs::read_to_string(&target).expect("read");
+        assert!(!locked.contains("s3cret"));
+        assert!(locked.contains("__GLYXENC:V1:"));
+
+        let conn = open_db().expect("db");
+        crate::ledger::set_inject_lock_on_exit(&conn, &target, Some(false)).expect("policy");
+        drop(conn);
+        materialize_all(&mut uv, false).expect("materialize");
+        let report = recover_crash(true).expect("recover");
+        assert_eq!(report.restored, 0);
+        assert!(std::fs::read_to_string(&target)
+            .expect("read")
+            .contains("s3cret"));
+
+        let conn = open_db().expect("db");
+        crate::ledger::set_inject_lock_on_exit(&conn, &target, Some(true)).expect("policy");
+        drop(conn);
+        materialize_all(&mut uv, false).expect("materialize");
+        let report = recover_crash(false).expect("recover");
+        assert_eq!(report.restored, 1);
+        assert!(!std::fs::read_to_string(&target)
+            .expect("read")
+            .contains("s3cret"));
+
+        materialize_all(&mut uv, false).expect("materialize");
+        std::fs::write(&target, "pass=changed\n").expect("write");
+        let report = recover_crash(true).expect("recover");
+        assert_eq!(report.restored, 0);
+        assert_eq!(report.drifted.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read"),
+            "pass=changed\n"
+        );
     }
 
     #[test]

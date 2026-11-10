@@ -555,6 +555,7 @@ a.button-link:hover {
 .badge.card { border-color: #4e4a2d; color: #e6dc8f; background: #292617; }
 .badge.identity { border-color: #2f505f; color: #9ad9eb; background: #17272d; }
 .badge.generic_key { border-color: #4d4d4d; color: #cfcfcf; background: #232323; }
+.badge.pointer { border-color: #4b5a35; color: #c6e08f; background: #222a18; }
 
 .items-layout {
   display: grid;

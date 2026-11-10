@@ -684,6 +684,15 @@ enum InjectCmd {
     },
     #[command(about = "List tracked injections")]
     Ls,
+    #[command(about = "Set whether a tracked file locks on exit or crash")]
+    Policy {
+        #[arg(help = "Tracked file")]
+        target: PathBuf,
+        #[arg(long, value_enum, default_value = "inherit", help = "Lock policy")]
+        lock_on_exit: LockPolicyArg,
+    },
+    #[command(about = "Recover files after an unclean daemon exit")]
+    Recover,
     #[command(about = "Show a tracked file's injection template and references")]
     Show {
         #[arg(help = "Tracked file")]
@@ -875,6 +884,16 @@ enum SshKind {
     Ed25519,
     #[value(help = "RSA-4096")]
     Rsa4096,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LockPolicyArg {
+    #[value(help = "Use the global setting")]
+    Inherit,
+    #[value(help = "Always lock this file on exit or crash")]
+    Always,
+    #[value(help = "Never lock this file on exit or crash")]
+    Never,
 }
 
 struct Ctx {
@@ -1480,6 +1499,18 @@ fn dispatch_inject(ctx: &Ctx, cmd: InjectCmd) -> Result<()> {
         }
         InjectCmd::Rm { target } => exports::cmd_inject_rm(&target, ctx.json),
         InjectCmd::Ls => exports::cmd_ls(ctx.json),
+        InjectCmd::Policy {
+            target,
+            lock_on_exit,
+        } => {
+            let value = match lock_on_exit {
+                LockPolicyArg::Inherit => None,
+                LockPolicyArg::Always => Some(true),
+                LockPolicyArg::Never => Some(false),
+            };
+            exports::cmd_inject_policy(&target, value, ctx.json)
+        }
+        InjectCmd::Recover => exports::cmd_inject_recover(ctx.json),
         InjectCmd::Show { target, reveal } => {
             let uv = ctx.unlocked()?;
             exports::cmd_inject_show(&uv, &target, reveal, ctx.json)
@@ -3653,6 +3684,7 @@ fn type_label(item_type: glyx_core::ItemType) -> &'static str {
         glyx_core::ItemType::File => "file",
         glyx_core::ItemType::SshKey => "ssh_key",
         glyx_core::ItemType::GenericKey => "generic_key",
+        glyx_core::ItemType::Pointer => "pointer",
     }
 }
 
