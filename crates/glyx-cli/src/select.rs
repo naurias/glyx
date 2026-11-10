@@ -194,7 +194,7 @@ fn add_custom() -> Result<()> {
 }
 
 fn create_new() -> Result<()> {
-    let path = PathBuf::from(Text::new("New vault directory:").prompt()?);
+    let path = PathBuf::from(Text::new("New vault file:").prompt()?);
     if path.exists() {
         bail!("{} already exists", path.display());
     }

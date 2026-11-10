@@ -1343,6 +1343,7 @@ mod tests {
         let _env = ENV_LOCK.lock().expect("lock");
         let runtime = tempfile::tempdir().expect("tempdir");
         std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
+        std::env::set_var("GLYX_CONFIG", runtime.path().join("config.toml"));
         let work = tempfile::tempdir().expect("tempdir");
         let (mut uv, id) = login_vault(work.path());
         let conn = open_db().expect("db");
@@ -1413,6 +1414,7 @@ mod tests {
         let _env = ENV_LOCK.lock().expect("lock");
         let runtime = tempfile::tempdir().expect("tempdir");
         std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
+        std::env::set_var("GLYX_CONFIG", runtime.path().join("config.toml"));
         let work = tempfile::tempdir().expect("tempdir");
         let (mut uv, id) = login_vault(work.path());
         let target = work.path().join("app.env");
@@ -1467,6 +1469,7 @@ mod tests {
         let _env = ENV_LOCK.lock().expect("lock");
         let runtime = tempfile::tempdir().expect("tempdir");
         std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
+        std::env::set_var("GLYX_CONFIG", runtime.path().join("config.toml"));
         let work = tempfile::tempdir().expect("tempdir");
         let (mut uv, id) = login_vault(work.path());
         let conn = open_db().expect("db");
@@ -1508,6 +1511,7 @@ mod tests {
         let _env = ENV_LOCK.lock().expect("lock");
         let runtime = tempfile::tempdir().expect("tempdir");
         std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
+        std::env::set_var("GLYX_CONFIG", runtime.path().join("config.toml"));
         let work = tempfile::tempdir().expect("tempdir");
         let (uv, id) = login_vault(work.path());
 
@@ -1572,6 +1576,7 @@ mod tests {
         let _env = ENV_LOCK.lock().expect("lock");
         let runtime = tempfile::tempdir().expect("tempdir");
         std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
+        std::env::set_var("GLYX_CONFIG", runtime.path().join("config.toml"));
         let work = tempfile::tempdir().expect("tempdir");
         let (mut uv, id) = login_vault(work.path());
 
@@ -1700,6 +1705,7 @@ mod merge_e2e {
         let _env = ENV_LOCK.lock().expect("lock");
         let runtime = tempfile::tempdir().expect("tempdir");
         std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
+        std::env::set_var("GLYX_CONFIG", runtime.path().join("config.toml"));
         let work = tempfile::tempdir().expect("tempdir");
         let (vault, id) = vault_with_secret(work.path());
         let mut uv = vault.unlock(b"pw", &[1u8; 32]).expect("unlock");
@@ -1737,6 +1743,7 @@ mod merge_e2e {
         let _env = ENV_LOCK.lock().expect("lock");
         let runtime = tempfile::tempdir().expect("tempdir");
         std::env::set_var("GLYX_RUNTIME_DIR", runtime.path());
+        std::env::set_var("GLYX_CONFIG", runtime.path().join("config.toml"));
         let work = tempfile::tempdir().expect("tempdir");
         let (vault, id) = vault_with_secret(work.path());
         let mut uv = vault.unlock(b"pw", &[1u8; 32]).expect("unlock");

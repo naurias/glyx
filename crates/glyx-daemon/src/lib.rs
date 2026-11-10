@@ -8,7 +8,7 @@ pub mod runtime;
 #[derive(Debug)]
 pub enum DaemonState {
     Locked { path: PathBuf },
-    Unlocked(glyx_store::UnlockedVault),
+    Unlocked(Box<glyx_store::UnlockedVault>),
 }
 
 impl DaemonState {
@@ -25,7 +25,7 @@ impl DaemonState {
         match self {
             Self::Locked { path } => {
                 let vault = glyx_store::Vault::open(&path)?;
-                Ok(Self::Unlocked(vault.unlock(password, keyfile)?))
+                Ok(Self::Unlocked(Box::new(vault.unlock(password, keyfile)?)))
             }
             already @ Self::Unlocked(_) => Ok(already),
         }

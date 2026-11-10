@@ -5,6 +5,7 @@
     bootstrapDesktop,
     bootstrapError,
     retryDesktopBootstrap,
+    pickFile,
     pickFolder,
     pickSave,
     isMobile,
@@ -93,8 +94,8 @@
     await load();
   }
 
-  async function chooseAddFolder() {
-    const path = await pickFolder('Select an existing glyx vault folder');
+  async function chooseAddVault() {
+    const path = await pickFile('Select an existing glyx vault file');
     if (path) addPath = path;
   }
 
@@ -143,7 +144,7 @@
   async function add() {
     error = '';
     if (!addPath) {
-      error = 'Choose an existing vault folder first.';
+      error = 'Choose an existing vault file first.';
       return;
     }
     busy = true;
@@ -207,7 +208,7 @@
     error = '';
     const file = restoreInput?.files?.[0];
     if (!file) {
-      error = 'Choose a glyx backup archive first.';
+      error = 'Choose a glyx backup file first.';
       return;
     }
     if (!restorePath) {
@@ -273,11 +274,11 @@
       </div>
     {:else if mode === 'add'}
       <h2>Open existing vault</h2>
-      <p class="dim">Select a glyx vault folder you created here or synced from another device.</p>
-      <label>Vault folder
+      <p class="dim">Select a <code>.glyx</code> vault file you created here or synced from another device.</p>
+      <label>Vault file
         <div class="row">
           <input bind:value={addPath} placeholder="/path/to/vault.glyx" style="flex: 1" />
-          <button on:click={chooseAddFolder}>Browse...</button>
+          <button on:click={chooseAddVault}>Browse...</button>
         </div>
       </label>
       <label>Display name (optional)<input bind:value={addName} placeholder="Personal" /></label>
@@ -290,7 +291,7 @@
       </div>
     {:else if mode === 'create'}
       <h2>Create new vault</h2>
-      <p class="dim">The vault directory must not exist yet. Your password is mandatory; a keyfile adds a second factor.</p>
+      <p class="dim">The vault file must not exist yet. Your password is mandatory; a keyfile adds a second factor.</p>
       <label>Parent folder
         <div class="row">
           <input bind:value={createParent} placeholder="/home/you/Vaults" style="flex: 1" />
@@ -326,8 +327,8 @@
       </div>
     {:else}
       <h2>Restore from backup</h2>
-      <p class="dim">Restore a glyx backup archive into a new vault directory.</p>
-      <label>Backup archive<input type="file" bind:this={restoreInput} accept=".gz,.tgz,.tar.gz" /></label>
+      <p class="dim">Restore a glyx vault backup file into a new location.</p>
+      <label>Backup file<input type="file" bind:this={restoreInput} accept=".glyx" /></label>
       <label>Parent folder
         <div class="row">
           <input bind:value={restoreParent} placeholder="/home/you/Vaults" style="flex: 1" />

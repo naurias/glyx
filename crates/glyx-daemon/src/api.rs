@@ -916,9 +916,12 @@ fn do_lock(state: &AppState) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
     stop_ssh_agent(state);
-    if let Some(uv) = taken.as_ref() {
-        audit(uv, "lock", None, None, "success", None);
-        release_vault(uv);
+    if let Some(mut uv) = taken {
+        audit(&uv, "lock", None, None, "success", None);
+        release_vault(&uv);
+        if let Err(e) = uv.compact() {
+            eprintln!("vault compaction failed: {e}");
+        }
     }
 }
 
@@ -929,15 +932,18 @@ fn do_shutdown(state: &AppState) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
     stop_ssh_agent(state);
-    if let Some(uv) = taken.as_ref() {
+    if let Some(mut uv) = taken {
         let lock_on_exit = glyx_store::config::load().lock_on_exit;
-        if let Err(e) = glyx_agent::engine::teardown_for_exit(uv, lock_on_exit) {
+        if let Err(e) = glyx_agent::engine::teardown_for_exit(&uv, lock_on_exit) {
             eprintln!("exit teardown failed: {e}");
         }
-        audit(uv, "lock", None, None, "success", None);
+        audit(&uv, "lock", None, None, "success", None);
         let vault_id = uv.config().vault_id;
         glyx_agent::ssh_agent::stop(&glyx_agent::ssh_agent::socket_path(&vault_id));
         glyx_store::session::wipe_ticket(&vault_id);
+        if let Err(e) = uv.compact() {
+            eprintln!("vault compaction failed: {e}");
+        }
     }
 }
 
@@ -2346,7 +2352,7 @@ async fn sync(State(state): State<Arc<AppState>>, Json(body): Json<SyncBody>) ->
     let Some(uv) = guard.as_mut() else {
         return locked_error().into_response();
     };
-    let heal = match uv.heal_conflict_files() {
+    let heal = match uv.heal_container_conflicts() {
         Ok(r) => r,
         Err(e) => return store_error(&e).into_response(),
     };
@@ -2578,6 +2584,9 @@ async fn gc(State(state): State<Arc<AppState>>, Json(body): Json<GcBody>) -> imp
                 "success",
                 Some(&format!("purged={}", ids.len())),
             );
+            if let Err(e) = uv.compact() {
+                eprintln!("vault compaction failed: {e}");
+            }
             Json(serde_json::json!({"ids": ids})).into_response()
         }
         Err(e) => store_error(&e).into_response(),
@@ -2585,11 +2594,11 @@ async fn gc(State(state): State<Arc<AppState>>, Json(body): Json<GcBody>) -> imp
 }
 
 async fn upload_blob(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
-    let guard = state
+    let mut guard = state
         .vault
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(uv) = guard.as_ref() else {
+    let Some(uv) = guard.as_mut() else {
         return locked_error().into_response();
     };
     match uv.put_blob(&body) {
@@ -2641,11 +2650,11 @@ async fn gc_blobs(
     State(state): State<Arc<AppState>>,
     Json(body): Json<GcBlobsBody>,
 ) -> impl IntoResponse {
-    let guard = state
+    let mut guard = state
         .vault
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(uv) = guard.as_ref() else {
+    let Some(uv) = guard.as_mut() else {
         return locked_error().into_response();
     };
     let conn = match glyx_agent::ledger::open_db() {
@@ -2701,8 +2710,7 @@ async fn backup_vault(State(state): State<Arc<AppState>>) -> Response {
         .and_then(|entry| entry.keyfile.as_deref())
         .map(std::path::Path::to_path_buf);
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let tmp =
-        std::env::temp_dir().join(format!("glyx-backup-{}-{stamp}.tar.gz", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("glyx-backup-{}-{stamp}.glyx", std::process::id()));
     let vault_path = path.clone();
     let tmp_path = tmp.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -2750,10 +2758,13 @@ async fn backup_vault(State(state): State<Arc<AppState>>) -> Response {
         })
         .collect();
     let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/gzip"));
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
     headers.insert(
         CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!("attachment; filename=\"{name}-{stamp}.tar.gz\""))
+        HeaderValue::from_str(&format!("attachment; filename=\"{name}-{stamp}.glyx\""))
             .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
     );
     headers.insert(
@@ -2788,7 +2799,7 @@ async fn restore_vault(
             .into_response();
     }
     let dest = params.dest;
-    let tmp = std::env::temp_dir().join(format!("glyx-restore-{}.tar.gz", temp_tag()));
+    let tmp = std::env::temp_dir().join(format!("glyx-restore-{}.glyx", temp_tag()));
     let std_file = {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -2882,7 +2893,7 @@ async fn receive_archive(
         if total > glyx_store::MAX_ARCHIVE_BYTES {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
-                Json(serde_json::json!({"error": "backup archive is too large"})),
+                Json(serde_json::json!({"error": "backup file is too large"})),
             ));
         }
         file.write_all(&chunk).await.map_err(|e| {
@@ -2919,38 +2930,35 @@ async fn doctor(
         Ok((_, v)) => v,
         Err(e) => return store_error(&e).into_response(),
     };
-    let headers = vault.scan_headers().unwrap_or_default();
-    let live = headers.iter().filter(|h| !h.deleted).count();
     let mut report = serde_json::json!({
         "format_version": vault.config().format_version,
-        "envelopes": headers.len(),
-        "live": live,
+        "index": "in-memory, rebuilt on unlock",
         "ok": true,
     });
     if let Some(uv) = guard.as_ref() {
-        let mut ok = 0;
-        for h in &headers {
-            if uv.get_item(&h.id).ok().flatten().is_some() {
-                ok += 1;
+        match uv.list(true) {
+            Ok(rows) => {
+                let live = rows.iter().filter(|row| !row.deleted).count();
+                let mut ok = 0;
+                for row in &rows {
+                    if uv.get_item(&row.id).ok().flatten().is_some() {
+                        ok += 1;
+                    }
+                }
+                report["envelopes"] = serde_json::json!(rows.len());
+                report["live"] = serde_json::json!(live);
+                report["decrypted_items"] = serde_json::json!(ok);
+                if params.rebuild_index == Some(true) {
+                    report["rebuilt_index"] = serde_json::json!(rows.len());
+                }
             }
+            Err(e) => return store_error(&e).into_response(),
         }
-        report["decrypted_items"] = serde_json::json!(ok);
+    } else if params.rebuild_index == Some(true) {
+        report["rebuilt_index"] = serde_json::json!("requires unlock");
     }
     if params.with_unlock == Some(true) {
         report["with_unlock"] = serde_json::json!(guard.is_some());
-    }
-    if params.rebuild_index == Some(true) {
-        if guard.is_some() {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "lock the vault before rebuilding the index"})),
-            )
-                .into_response();
-        }
-        match vault.rebuild_index() {
-            Ok(n) => report["rebuilt_index"] = serde_json::json!(n),
-            Err(e) => return store_error(&e).into_response(),
-        }
     }
     Json(report).into_response()
 }
@@ -4190,11 +4198,11 @@ async fn add_biometric_slot(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BiometricSlotBody>,
 ) -> impl IntoResponse {
-    let guard = state
+    let mut guard = state
         .vault
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(uv) = guard.as_ref() else {
+    let Some(uv) = guard.as_mut() else {
         return locked_error().into_response();
     };
     let keyfile = match keyfile_for_slot(uv, body.keyfile.as_deref()) {
@@ -4227,11 +4235,11 @@ async fn retire_biometric_slot(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let guard = state
+    let mut guard = state
         .vault
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(uv) = guard.as_ref() else {
+    let Some(uv) = guard.as_mut() else {
         return locked_error().into_response();
     };
     let Ok(id) = uuid::Uuid::parse_str(&id) else {
@@ -4829,16 +4837,16 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             headers.get("content-type").and_then(|v| v.to_str().ok()),
-            Some("application/gzip")
+            Some("application/octet-stream")
         );
-        assert_eq!(&archive[..2], &[0x1f, 0x8b]);
+        assert_eq!(&archive[..8], b"GLYXPK01");
         let dest = cfg.path().join("restored.glyx");
         let (status, _, body) = call_raw(
             state,
             "POST",
             &format!("/v1/vaults/restore?dest={}", dest.display()),
             Body::from(archive),
-            Some("application/gzip"),
+            Some("application/octet-stream"),
             "test-token",
         )
         .await;
@@ -5460,7 +5468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn doctor_rebuild_requires_lock() {
+    async fn doctor_rebuilds_in_memory_index_when_unlocked() {
         let (_d, state) = test_state();
         let kf_path = test_kf();
         let (status, _) = call(
@@ -5472,7 +5480,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        let (status, _) = call(
+        let (status, body) = call(
             state.clone(),
             "GET",
             "/v1/doctor?rebuild_index=true",
@@ -5480,7 +5488,12 @@ mod tests {
             "test-token",
         )
         .await;
-        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("rebuilt_index").is_some(), "{body}");
+        assert_eq!(
+            body["index"],
+            serde_json::json!("in-memory, rebuilt on unlock")
+        );
         let (status, _) = call(state.clone(), "POST", "/v1/lock", None, "test-token").await;
         assert_eq!(status, StatusCode::OK);
         let (status, body) = call(
@@ -5492,7 +5505,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(body.get("rebuilt_index").is_some(), "{body}");
+        assert_eq!(body["rebuilt_index"], serde_json::json!("requires unlock"));
         assert_eq!(body["with_unlock"], serde_json::json!(false));
     }
 

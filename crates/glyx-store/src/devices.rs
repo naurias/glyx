@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{config, conflicts, StoreError, UnlockedVault};
+use crate::{config, StoreError, UnlockedVault};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -32,7 +32,7 @@ impl UnlockedVault {
             }
         }
         for meta in self.list_conflicts()? {
-            let conflict = conflicts::read_conflict(&meta.path)?;
+            let conflict = self.read_conflict_file(&meta.key)?;
             for envelope in [&conflict.winner, &conflict.local, &conflict.remote] {
                 bump(envelope.hlc.node, envelope.hlc.wall_ms);
             }

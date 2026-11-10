@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -29,7 +28,7 @@ pub struct ConflictFile {
 #[derive(Debug, Clone)]
 pub struct ConflictMeta {
     pub item_id: Uuid,
-    pub path: PathBuf,
+    pub key: String,
     pub created_ms: u64,
     pub race_targets: Vec<String>,
 }
@@ -88,26 +87,9 @@ pub fn conflict_filename(item_id: &Uuid, stamp_ms: u64, stamp_seq: u16) -> Strin
     format!("{}-{stamp_ms}-{stamp_seq}.json", item_id.as_simple())
 }
 
-pub fn write_conflict(
-    dir: &std::path::Path,
-    file: &ConflictFile,
-    stamp_ms: u64,
-    stamp_seq: u16,
-) -> Result<PathBuf, StoreError> {
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(conflict_filename(&file.item_id, stamp_ms, stamp_seq));
-    crate::vault::atomic_write(
-        &path,
-        serde_json::to_vec_pretty(file)
-            .map_err(|e| StoreError::Corrupt(e.to_string()))?
-            .as_slice(),
-    )?;
-    Ok(path)
-}
-
-pub fn read_conflict(path: &std::path::Path) -> Result<ConflictFile, StoreError> {
-    let file: ConflictFile = serde_json::from_slice(&std::fs::read(path)?)
-        .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+pub fn read_conflict_bytes(bytes: &[u8]) -> Result<ConflictFile, StoreError> {
+    let file: ConflictFile =
+        serde_json::from_slice(bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
     if file.v != CONFLICT_VERSION {
         return Err(StoreError::Corrupt("unsupported conflict version".into()));
     }

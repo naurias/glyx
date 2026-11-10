@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::CoreError;
 
-pub const MAX_FORMAT_VERSION: u32 = 2;
+pub const MAX_FORMAT_VERSION: u32 = 3;
 pub const KDF_M_KIB_MIN: u32 = 65_536;
 pub const KDF_T_COST_MIN: u32 = 2;
 
@@ -144,9 +144,9 @@ mod tests {
 
     #[test]
     fn golden_toml_roundtrip() {
-        let text = "format_version = 2\nvault_id = \"0191a2b3-c4d5-7e6f-8901-234567890abc\"\ncreated_at = \"2026-10-15T00:00:00Z\"\nkeyfile_required = true\n[cipher_suite]\nkdf = \"argon2id\"\ncipher = \"xchacha20poly1305\"\nm_kib = 262144\nt_cost = 3\np_cost = 4\n";
+        let text = "format_version = 3\nvault_id = \"0191a2b3-c4d5-7e6f-8901-234567890abc\"\ncreated_at = \"2026-10-15T00:00:00Z\"\nkeyfile_required = true\n[cipher_suite]\nkdf = \"argon2id\"\ncipher = \"xchacha20poly1305\"\nm_kib = 262144\nt_cost = 3\np_cost = 4\n";
         let cfg = VaultConfig::parse_toml(text).expect("golden parses");
-        assert_eq!(cfg.format_version, 2);
+        assert_eq!(cfg.format_version, 3);
         assert!(cfg.keyfile_required);
         assert_eq!(cfg.cipher_suite.cipher, Cipher::Xchacha20poly1305);
         let _ = cfg.to_toml().expect("renders");

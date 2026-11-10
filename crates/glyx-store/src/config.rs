@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -92,6 +93,8 @@ pub struct AppConfig {
     pub recent_items: Vec<RecentItem>,
     #[serde(default)]
     pub device_labels: Vec<DeviceLabel>,
+    #[serde(default)]
+    pub device_ids: BTreeMap<String, String>,
 }
 
 impl Default for AppConfig {
@@ -107,6 +110,7 @@ impl Default for AppConfig {
             vaults: Vec::new(),
             recent_items: Vec::new(),
             device_labels: Vec::new(),
+            device_ids: BTreeMap::new(),
         }
     }
 }
@@ -243,19 +247,45 @@ pub fn normalize(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+pub fn device_id(path: &Path, _vault_id: Uuid) -> Result<glyx_core::DeviceId, StoreError> {
+    let mut config = load();
+    let key = std::fs::canonicalize(path)
+        .unwrap_or_else(|_| normalize(path))
+        .to_string_lossy()
+        .into_owned();
+    if let Some(hex) = config.device_ids.get(&key) {
+        if let Some(id) = glyx_core::DeviceId::from_hex(hex) {
+            return Ok(id);
+        }
+    }
+    let id = glyx_core::DeviceId::generate();
+    config.device_ids.insert(key, id.to_hex());
+    save(&config)?;
+    Ok(id)
+}
+
 #[must_use]
 pub fn config_path() -> PathBuf {
     if let Ok(p) = std::env::var("GLYX_CONFIG") {
         return PathBuf::from(p);
     }
-    let base = std::env::var("XDG_CONFIG_HOME").map_or_else(
-        |_| {
-            std::env::var("HOME")
-                .map_or_else(|_| PathBuf::from("."), |h| PathBuf::from(h).join(".config"))
-        },
-        PathBuf::from,
-    );
-    base.join("glyx").join("config.toml")
+    #[cfg(test)]
+    {
+        std::env::temp_dir()
+            .join(format!("glyx-store-tests-{}", std::process::id()))
+            .join("config.toml")
+    }
+    #[cfg(not(test))]
+    {
+        let base = std::env::var("XDG_CONFIG_HOME").map_or_else(
+            |_| {
+                std::env::var("HOME")
+                    .map_or_else(|_| PathBuf::from("."), |h| PathBuf::from(h).join(".config"))
+            },
+            PathBuf::from,
+        );
+        base.join("glyx").join("config.toml")
+    }
 }
 
 #[must_use]

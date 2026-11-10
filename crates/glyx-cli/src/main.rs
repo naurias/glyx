@@ -20,7 +20,7 @@ use uuid::Uuid;
 struct Cli {
     #[arg(long, global = true, help = "Output machine-readable JSON")]
     json: bool,
-    #[arg(long, global = true, help = "Vault directory (or GLYX_VAULT)")]
+    #[arg(long, global = true, help = "Vault file (or GLYX_VAULT)")]
     vault: Option<PathBuf>,
     #[arg(long, global = true, help = "Keyfile path")]
     keyfile: Option<PathBuf>,
@@ -281,7 +281,7 @@ enum Cmd {
     SyncStatus,
     #[command(about = "Merge sync-conflict copies, optionally with another vault")]
     Sync {
-        #[arg(help = "Other vault directory for pairwise merge")]
+        #[arg(help = "Other vault file for pairwise merge")]
         path: Option<PathBuf>,
         #[arg(long, help = "Other vault keyfile")]
         other_keyfile: Option<PathBuf>,
@@ -333,9 +333,9 @@ enum Cmd {
 enum VaultCmd {
     #[command(about = "Choose the active vault (interactive)")]
     Select,
-    #[command(about = "Create a fresh vault directory")]
+    #[command(about = "Create a fresh single-file vault")]
     Init {
-        #[arg(help = "New vault directory (must not exist)")]
+        #[arg(help = "New vault file (must not exist)")]
         path: PathBuf,
         #[arg(long, value_enum, default_value = "balanced", help = "Cost preset")]
         preset: Preset,
@@ -362,21 +362,21 @@ enum VaultCmd {
         #[arg(long, help = "Keep old keyslots")]
         keep_old_slots: bool,
     },
-    #[command(about = "Write an encrypted-artifact backup archive")]
+    #[command(about = "Copy the encrypted vault file to a backup")]
     Backup {
-        #[arg(help = "Archive path (must not exist)")]
+        #[arg(help = "Backup file path (must not exist)")]
         out: PathBuf,
     },
-    #[command(about = "Restore a backup into a new vault directory")]
+    #[command(about = "Restore a backup into a new vault file")]
     Restore {
-        #[arg(help = "Archive path")]
+        #[arg(help = "Backup file path")]
         archive: PathBuf,
-        #[arg(help = "New vault directory (must not exist)")]
+        #[arg(help = "New vault file (must not exist)")]
         dest: PathBuf,
     },
     #[command(about = "Remove a vault from the registry (files untouched)")]
     Forget {
-        #[arg(help = "Vault directory (defaults to the selected vault)")]
+        #[arg(help = "Vault file (defaults to the selected vault)")]
         path: Option<PathBuf>,
     },
 }
@@ -1960,7 +1960,7 @@ fn cmd_lock(ctx: &Ctx) -> Result<()> {
                         vault.open_session(Some(pin.as_bytes()))?
                     }
                 };
-                if let Some(uv) = uv {
+                if let Some(mut uv) = uv {
                     let rep = glyx_agent::teardown_all(&uv).map_err(|e| anyhow::anyhow!(e))?;
                     if !ctx.json && (rep.wiped > 0 || rep.restored > 0 || !rep.drifted.is_empty()) {
                         println!("agent: wiped {}, restored {}", rep.wiped, rep.restored);
@@ -1968,6 +1968,7 @@ fn cmd_lock(ctx: &Ctx) -> Result<()> {
                             println!("drifted: {d}");
                         }
                     }
+                    uv.compact()?;
                 }
             }
         }
@@ -2498,7 +2499,7 @@ fn read_attachment(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn cmd_blob(ctx: &Ctx, cmd: BlobCmd) -> Result<()> {
-    let uv = ctx.unlocked()?;
+    let mut uv = ctx.unlocked()?;
     match cmd {
         BlobCmd::Put { file } => {
             let data = read_attachment(&file)?;
@@ -3350,29 +3351,27 @@ fn normalized_public(public: &str, comment: &str) -> String {
 }
 
 fn cmd_sync_status(ctx: &Ctx) -> Result<()> {
-    let vault_path = ctx.vault_path()?;
-    let vault = glyx_store::Vault::open(&vault_path)?;
-    let headers = vault.scan_headers()?;
-    let live = headers.iter().filter(|h| !h.deleted).count();
-    let max_rev = headers.iter().map(|h| h.rev).max().unwrap_or(0);
     let uv = ctx.unlocked()?;
+    let rows = uv.list(true)?;
+    let live = rows.iter().filter(|row| !row.deleted).count();
+    let max_rev = rows.iter().map(|row| row.rev).max().unwrap_or(0);
     let conflicts = uv.list_conflicts()?.len();
     let last_merge = uv.last_merge_ms()?;
     if ctx.json {
         println!(
             "{}",
             serde_json::json!({
-                "envelopes": headers.len(),
+                "envelopes": rows.len(),
                 "live": live,
-                "tombstones": headers.len() - live,
+                "tombstones": rows.len() - live,
                 "max_rev": max_rev,
                 "conflicts": conflicts,
                 "last_merge_ms": last_merge,
             })
         );
     } else {
-        println!("envelopes: {}", headers.len());
-        println!("live: {live}, tombstones: {}", headers.len() - live);
+        println!("envelopes: {}", rows.len());
+        println!("live: {live}, tombstones: {}", rows.len() - live);
         println!("max rev: {max_rev}");
         println!("conflicts: {conflicts}");
         match last_merge {
@@ -3390,7 +3389,7 @@ fn cmd_sync(
     other_password_env: Option<&str>,
 ) -> Result<()> {
     let mut uv = ctx.unlocked()?;
-    let heal = uv.heal_conflict_files()?;
+    let heal = uv.heal_container_conflicts()?;
     let mut adopted = 0usize;
     let mut merged = heal.merged;
     let mut conflicts = heal.conflicts;
@@ -3616,6 +3615,7 @@ fn cmd_gc(ctx: &Ctx, older_than: &str, dry_run: bool) -> Result<()> {
     }
     let mut uv = ctx.unlocked()?;
     let ids = uv.gc_tombstones(window)?;
+    uv.compact()?;
     output_ids(ctx.json, &ids, "purged");
     Ok(())
 }
@@ -3720,24 +3720,27 @@ fn doctor(
     let vault = glyx_store::Vault::open(path)?;
     report["format_version"] = serde_json::json!(vault.config().format_version);
     report["keyslots"] = serde_json::json!(vault.keyslot_count()?);
-    let headers = vault.scan_headers()?;
-    report["envelopes"] = serde_json::json!(headers.len());
-    report["live"] = serde_json::json!(headers.iter().filter(|h| !h.deleted).count());
-    if rebuild_index {
-        let n = vault.rebuild_index()?;
-        report["rebuilt_index"] = serde_json::json!(n);
+    report["index"] = serde_json::json!("in-memory, rebuilt on unlock");
+    if rebuild_index && !with_unlock {
+        report["rebuilt_index"] = serde_json::json!("requires --with-unlock");
     }
     if with_unlock {
         let kf = auth::resolve_keyfile(&vault, keyfile)?;
         let password = auth::read_password(password_env)?;
         let unlocked = vault.unlock(&password, &kf)?;
+        let rows = unlocked.list(true)?;
         let mut items_ok = 0;
-        for h in &headers {
-            if unlocked.get_item(&h.id)?.is_some() {
+        for row in &rows {
+            if unlocked.get_item(&row.id)?.is_some() {
                 items_ok += 1;
             }
         }
+        report["envelopes"] = serde_json::json!(rows.len());
+        report["live"] = serde_json::json!(rows.iter().filter(|row| !row.deleted).count());
         report["decrypted_items"] = serde_json::json!(items_ok);
+        if rebuild_index {
+            report["rebuilt_index"] = serde_json::json!(rows.len());
+        }
     }
     report["ok"] = serde_json::json!(true);
     report["clipboard"] = serde_json::json!({
@@ -3759,7 +3762,9 @@ fn doctor(
             }
         );
         println!("keyslots: {}", report["keyslots"]);
-        println!("envelopes: {} (live {})", headers.len(), report["live"]);
+        if let Some(envelopes) = report.get("envelopes") {
+            println!("envelopes: {envelopes} (live {})", report["live"]);
+        }
         if let Some(n) = report.get("rebuilt_index") {
             println!("index rebuilt: {n}");
         }

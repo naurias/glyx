@@ -248,11 +248,11 @@
   }
   async function restore() {
     if (!restoreFile) {
-      error = 'Choose a backup archive first.';
+      error = 'Choose a backup file first.';
       return;
     }
     if (!restoreDest) {
-      error = 'Choose a new vault directory.';
+      error = 'Choose a new vault file path.';
       return;
     }
     error = '';
@@ -356,13 +356,13 @@
     </div>
     <div class="card">
       <div>Backup</div>
-      <p class="dim">Lock the vault first. The archive contains encrypted vault files only; the index, device id, and keyfile are excluded.</p>
+      <p class="dim">Lock the vault first. The backup is a direct copy of the encrypted <code>.glyx</code> file; the device id and keyfile are never included.</p>
       <div class="row">
         <button on:click={backup} disabled={backupBusy}>Download backup</button>
       </div>
       <div class="row">
         <input type="file" bind:this={restoreInput} on:change={(e) => (restoreFile = e.currentTarget.files?.[0] ?? null)} />
-        <input bind:value={restoreDest} placeholder="new vault directory" style="flex: 1" />
+        <input bind:value={restoreDest} placeholder="/path/to/restored.glyx" style="flex: 1" />
         <button on:click={restore} disabled={backupBusy}>Restore</button>
       </div>
     </div>

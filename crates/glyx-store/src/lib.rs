@@ -11,6 +11,7 @@ pub mod health;
 pub mod index;
 pub mod keyfile;
 pub mod layout;
+pub mod pack;
 pub mod present;
 pub mod session;
 pub mod vault;

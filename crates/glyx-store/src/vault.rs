@@ -8,12 +8,13 @@ use rusqlite::{Connection, OptionalExtension as _};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use crate::pack::{self, Pack};
 use crate::{blob, index, layout, Envelope, EnvelopeHeader, IndexRow, StoreError};
 
 #[derive(Debug, Clone)]
 pub struct Vault {
     path: PathBuf,
-    config: glyx_core::VaultConfig,
+    header: pack::Header,
 }
 
 impl Vault {
@@ -26,77 +27,53 @@ impl Vault {
         if path.exists() {
             return Err(StoreError::AlreadyExists(path.display().to_string()));
         }
-        fs::create_dir_all(path.join(layout::KEYSLOTS_DIR))?;
-        fs::create_dir_all(path.join(layout::ITEMS_DIR))?;
-        fs::create_dir_all(path.join(layout::BLOBS_DIR))?;
-        fs::create_dir_all(path.join(layout::HISTORY_DIR))?;
-        fs::create_dir_all(path.join(layout::CONFLICTS_DIR))?;
-        harden_dir(path);
-        for dir in [
-            layout::KEYSLOTS_DIR,
-            layout::ITEMS_DIR,
-            layout::BLOBS_DIR,
-            layout::HISTORY_DIR,
-            layout::CONFLICTS_DIR,
-        ] {
-            harden_dir(&path.join(dir));
-        }
-        let _session = lock_file(path)?;
         let keyfile_bytes = keyfile.copied().unwrap_or([0u8; 32]);
         let config = glyx_core::VaultConfig::new(Uuid::now_v7(), suite, keyfile.is_some());
         config.validate()?;
-        atomic_write(&path.join(layout::VAULT_TOML), config.to_toml()?.as_bytes())?;
         let (key, slot) = glyx_crypto::seal_fresh_vault(password, &keyfile_bytes, suite.params)?;
-        drop(key);
-        atomic_write(
-            &path.join(layout::KEYSLOTS_DIR).join(slot.filename()),
-            serde_json::to_string_pretty(&slot)
-                .map_err(|e| StoreError::Corrupt(e.to_string()))?
-                .as_bytes(),
-        )?;
-        let conn = Connection::open(path.join(layout::INDEX_DB))?;
-        index::init_schema(&conn)?;
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES ('vault_id', ?1)",
-            [config.vault_id.as_simple().to_string()],
-        )?;
-        harden_file(&path.join(layout::INDEX_DB));
-        drop(conn);
+        let pack = Pack::create(path, config, vec![slot], &key)?;
+        let header = pack.header().clone();
+        drop(pack);
+        harden_file(path);
         Ok(Self {
             path: path.to_owned(),
-            config,
+            header,
         })
     }
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let text = fs::read_to_string(path.join(layout::VAULT_TOML))
-            .map_err(|e| StoreError::Corrupt(format!("cannot read VAULT.toml: {e}")))?;
-        let config = glyx_core::VaultConfig::parse_toml(&text)?;
-        for dir in [layout::KEYSLOTS_DIR, layout::ITEMS_DIR, layout::BLOBS_DIR] {
-            if !path.join(dir).is_dir() {
-                return Err(StoreError::Corrupt(format!("missing dir {dir}")));
-            }
+        if path.is_dir() {
+            return Err(StoreError::Corrupt(
+                "directory vaults are no longer supported; create a new single-file vault".into(),
+            ));
         }
-        harden_dir(path);
-        for dir in [
-            layout::KEYSLOTS_DIR,
-            layout::ITEMS_DIR,
-            layout::BLOBS_DIR,
-            layout::HISTORY_DIR,
-            layout::CONFLICTS_DIR,
-        ] {
-            let dir = path.join(dir);
-            if dir.is_dir() {
-                harden_dir(&dir);
-            }
-        }
-        harden_file(&path.join(layout::INDEX_DB));
+        let header = pack::read_header(path)?;
+        harden_file(path);
         Ok(Self {
             path: path.to_owned(),
-            config,
+            header,
         })
     }
     pub fn try_lock(&self) -> Result<fs::File, StoreError> {
-        let file = open_lock_file(&self.path)?;
+        let dir = crate::session::session_dir().join("locks");
+        fs::create_dir_all(&dir)?;
+        harden_dir(&dir);
+        let canonical =
+            fs::canonicalize(&self.path).unwrap_or_else(|_| crate::config::normalize(&self.path));
+        let path_key = glyx_crypto::blake3_hex(canonical.to_string_lossy().as_bytes());
+        let path = dir.join(format!(
+            "{}-{}.lock",
+            self.config().vault_id.as_simple(),
+            &path_key[..16]
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        harden_file(&path);
         file.try_lock_exclusive().map_err(|e| {
             StoreError::Corrupt(format!("vault is unlocked or busy; lock it first: {e}"))
         })?;
@@ -108,30 +85,15 @@ impl Vault {
     }
     #[must_use]
     pub fn config(&self) -> &glyx_core::VaultConfig {
-        &self.config
+        &self.header.config
     }
     #[must_use]
     pub fn keyfile_required(&self) -> bool {
-        self.config.keyfile_required
+        self.header.config.keyfile_required
     }
     pub fn unlock(&self, password: &[u8], keyfile: &[u8; 32]) -> Result<UnlockedVault, StoreError> {
-        let dir = fs::read_dir(self.path.join(layout::KEYSLOTS_DIR))?;
         let mut last_err = StoreError::Corrupt("no keyslots found".into());
-        for entry in dir.flatten() {
-            let bytes = match fs::read(entry.path()) {
-                Ok(b) => b,
-                Err(e) => {
-                    last_err = e.into();
-                    continue;
-                }
-            };
-            let slot: glyx_crypto::Keyslot = match serde_json::from_slice(&bytes) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = StoreError::Corrupt(e.to_string());
-                    continue;
-                }
-            };
+        for slot in &self.header.keyslots {
             match slot.unseal(password, keyfile) {
                 Ok(key) => return self.finish_unlock(key),
                 Err(e) => last_err = e.into(),
@@ -140,65 +102,20 @@ impl Vault {
         Err(last_err)
     }
     pub fn scan_headers(&self) -> Result<Vec<EnvelopeHeader>, StoreError> {
-        let mut out = Vec::new();
-        for entry in fs::read_dir(self.path.join(layout::ITEMS_DIR))?.flatten() {
-            if !is_envelope_file(&entry.path()) {
-                continue;
-            }
-            let bytes = fs::read(entry.path())?;
-            let env: Envelope =
-                serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-            out.push(env.header());
-        }
-        Ok(out)
+        Err(StoreError::Corrupt(
+            "unlock the vault to inspect items".into(),
+        ))
     }
     pub fn rebuild_index(&self) -> Result<usize, StoreError> {
-        let _session = lock_file(&self.path)?;
-        let conn = Connection::open(self.path.join(layout::INDEX_DB))?;
-        harden_file(&self.path.join(layout::INDEX_DB));
-        index::init_schema(&conn)?;
-        conn.execute("DELETE FROM items", [])?;
-        let mut n = 0;
-        for entry in fs::read_dir(self.path.join(layout::ITEMS_DIR))?.flatten() {
-            if !is_envelope_file(&entry.path()) {
-                continue;
-            }
-            let bytes = fs::read(entry.path())?;
-            let env: Envelope =
-                serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-            conn.execute(
-                "INSERT INTO items(id, hlc_ms, hlc_seq, node, rev, deleted, item_type, name, updated_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', '', 0)",
-                rusqlite::params![
-                    env.id.as_simple().to_string(),
-                    env.hlc.wall_ms.cast_signed(),
-                    i64::from(env.hlc.seq),
-                    env.hlc.node.0.to_vec(),
-                    env.rev.cast_signed(),
-                    i64::from(env.deleted),
-                ],
-            )?;
-            n += 1;
-        }
-        Ok(n)
+        Err(StoreError::Corrupt(
+            "the index is rebuilt in memory when the vault unlocks".into(),
+        ))
     }
     pub fn keyslot_count(&self) -> Result<usize, StoreError> {
-        Ok(fs::read_dir(self.path.join(layout::KEYSLOTS_DIR))?
-            .flatten()
-            .filter(|e| has_extension(&e.path(), "json"))
-            .count())
+        Ok(self.header.keyslots.len())
     }
     pub fn device_id(&self) -> Result<glyx_core::DeviceId, StoreError> {
-        let file = self.path.join("device.id");
-        if file.exists() {
-            let raw = fs::read(&file)?;
-            if let Ok(bytes) = <[u8; 16]>::try_from(raw) {
-                return Ok(glyx_core::DeviceId(bytes));
-            }
-        }
-        let id = glyx_core::DeviceId::generate();
-        atomic_write(&file, &id.0)?;
-        Ok(id)
+        crate::config::device_id(&self.path, self.header.config.vault_id)
     }
     pub fn verify_slot(
         &self,
@@ -206,13 +123,10 @@ impl Vault {
         password: &[u8],
         keyfile: &[u8; 32],
     ) -> Result<bool, StoreError> {
-        let bytes = fs::read(
-            self.path
-                .join(layout::KEYSLOTS_DIR)
-                .join(format!("slot-{}.json", id.as_simple())),
-        )?;
-        let slot: glyx_crypto::Keyslot =
-            serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        let header = pack::read_header(&self.path)?;
+        let Some(slot) = header.keyslots.iter().find(|slot| slot.id == *id) else {
+            return Ok(false);
+        };
         match slot.unseal(password, keyfile) {
             Ok(_) => Ok(true),
             Err(glyx_crypto::CryptoError::Decrypt) => Ok(false),
@@ -220,31 +134,54 @@ impl Vault {
         }
     }
     pub fn open_session(&self, pin: Option<&[u8]>) -> Result<Option<UnlockedVault>, StoreError> {
-        match crate::session::open_ticket(&self.config.vault_id, pin)? {
+        match crate::session::open_ticket(&self.config().vault_id, pin)? {
             Some(key) => Ok(Some(self.finish_unlock(key)?)),
             None => Ok(None),
         }
     }
     fn finish_unlock(&self, key: Zeroizing<[u8; 32]>) -> Result<UnlockedVault, StoreError> {
+        self.finish_unlock_with(key, true)
+    }
+    pub(crate) fn open_with_key(
+        &self,
+        key: &[u8; 32],
+        heal: bool,
+    ) -> Result<UnlockedVault, StoreError> {
+        self.finish_unlock_with(Zeroizing::new(*key), heal)
+    }
+    fn finish_unlock_with(
+        &self,
+        key: Zeroizing<[u8; 32]>,
+        heal: bool,
+    ) -> Result<UnlockedVault, StoreError> {
         let node = self.device_id()?;
-        let session = lock_file(&self.path)?;
-        let conn = Connection::open(self.path.join(layout::INDEX_DB))?;
-        harden_file(&self.path.join(layout::INDEX_DB));
+        let session = self.try_lock()?;
+        let pack = Pack::open(&self.path, self.header.clone(), &key)?;
+        let conn = Connection::open_in_memory()?;
         index::init_schema(&conn)?;
         let mut uv = UnlockedVault {
             path: self.path.clone(),
-            config: self.config.clone(),
+            config: pack.config().clone(),
             key,
             conn,
             node,
+            pack,
             _session: session,
         };
-        let healed = uv.heal_conflict_files()?;
-        if healed.healed > 0 {
-            uv.stamp_merge()?;
+        for key in ["hlc_ms", "hlc_seq"] {
+            if let Some(value) = uv.pack.meta(key).map(str::to_owned) {
+                uv.meta_set_str(key, &value)?;
+            }
         }
-        if uv.index_needs_rebuild()? {
-            uv.rebuild_index_from_envelopes()?;
+        if let Some(last) = uv.pack.meta("last_merge_ms").and_then(|v| v.parse().ok()) {
+            uv.meta_set("last_merge_ms", last)?;
+        }
+        uv.rebuild_index_from_envelopes()?;
+        if heal {
+            let healed = uv.heal_container_conflicts()?;
+            if healed.healed > 0 {
+                uv.stamp_merge()?;
+            }
         }
         Ok(uv)
     }
@@ -343,6 +280,7 @@ pub struct UnlockedVault {
     key: Zeroizing<[u8; 32]>,
     conn: Connection,
     node: glyx_core::DeviceId,
+    pack: Pack,
     _session: fs::File,
 }
 
@@ -365,32 +303,26 @@ impl UnlockedVault {
     }
     pub fn put_item(&mut self, item: &glyx_core::Item) -> Result<(), StoreError> {
         item.validate()?;
-        if has_conflict_files(&self.path) {
-            self.heal_conflict_files()?;
-            self.stamp_merge()?;
-        }
         let env = Envelope::seal(item, &self.key, self.cipher())?;
-        let target = self.path.join(layout::ITEMS_DIR).join(env.filename());
-        if target.exists() {
-            let old = fs::read(&target)?;
-            let dir = self
-                .path
-                .join(layout::HISTORY_DIR)
-                .join(item.id.as_simple().to_string());
-            fs::create_dir_all(&dir)?;
-            atomic_write(
-                &dir.join(format!("{}-{}.json", item.hlc.wall_ms, item.hlc.seq)),
-                &old,
-            )?;
+        let key = item_key(&item.id);
+        if self.pack.has_entry(&key) {
+            let old = self.pack.read_entry(&key)?;
+            let hist = history_key(
+                &item.id,
+                &format!("{}-{}.json", item.hlc.wall_ms, item.hlc.seq),
+            );
+            self.pack.append_entry(&hist, &old)?;
         }
-        atomic_write(
-            &target,
-            serde_json::to_string_pretty(&env)
-                .map_err(|e| StoreError::Corrupt(e.to_string()))?
-                .as_bytes(),
-        )?;
+        let bytes = serde_json::to_vec(&env).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        self.pack.append_entry(&key, &bytes)?;
         index::upsert(&self.conn, item)?;
-        Ok(())
+        self.persist()
+    }
+    fn persist(&mut self) -> Result<(), StoreError> {
+        self.pack.commit()
+    }
+    pub fn compact(&mut self) -> Result<(), StoreError> {
+        self.pack.compact()
     }
     pub fn resolve(&self, query: &str) -> Result<glyx_core::Item, StoreError> {
         if let Ok(id) = query.parse::<Uuid>() {
@@ -436,54 +368,42 @@ impl UnlockedVault {
     }
 
     pub fn get_item(&self, id: &Uuid) -> Result<Option<glyx_core::Item>, StoreError> {
-        let file = self
-            .path
-            .join(layout::ITEMS_DIR)
-            .join(format!("{}.envelope.json", id.as_simple()));
-        if !file.exists() {
+        let key = item_key(id);
+        if !self.pack.has_entry(&key) {
             return Ok(None);
         }
-        let env: Envelope = serde_json::from_slice(&fs::read(file)?)
+        let env: Envelope = serde_json::from_slice(&self.pack.read_entry(&key)?)
             .map_err(|e| StoreError::Corrupt(e.to_string()))?;
         Ok(Some(env.open(&self.key)?))
     }
     pub fn list(&self, include_deleted: bool) -> Result<Vec<IndexRow>, StoreError> {
         index::list(&self.conn, include_deleted)
     }
-    fn history_dir(&self, id: &Uuid) -> PathBuf {
-        self.path
-            .join(layout::HISTORY_DIR)
-            .join(id.as_simple().to_string())
-    }
     fn history_envelope(&self, id: &Uuid, file: &str) -> Result<Envelope, StoreError> {
         if file.is_empty() || file.contains('/') || file.contains('\\') || file.contains("..") {
             return Err(StoreError::Corrupt("invalid history file".into()));
         }
-        let bytes = fs::read(self.history_dir(id).join(file))?;
+        let bytes = self.pack.read_entry(&history_key(id, file))?;
         serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))
     }
     pub fn history(&self, id: &Uuid) -> Result<Vec<HistoryEntry>, StoreError> {
-        let dir = self.history_dir(id);
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
+        let prefix = format!("history/{}/", id.as_simple());
         let mut out = Vec::new();
-        for entry in fs::read_dir(&dir)?.flatten() {
-            let path = entry.path();
-            if !has_extension(&path, "json") {
+        for key in self.pack.list_entries(&prefix) {
+            let Some(file) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            if !has_json_suffix(file) {
                 continue;
             }
-            let bytes = fs::read(&path)?;
+            let bytes = self.pack.read_entry(&key)?;
             let env: Envelope =
                 serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-            let file = path
-                .file_name()
-                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
             out.push(HistoryEntry {
                 rev: env.rev,
                 hlc: env.hlc,
                 deleted: env.deleted,
-                file,
+                file: file.to_owned(),
             });
         }
         out.sort_by_key(|entry| std::cmp::Reverse(entry.hlc));
@@ -517,6 +437,7 @@ impl UnlockedVault {
         };
         self.meta_set("hlc_ms", wall)?;
         self.meta_set("hlc_seq", seq)?;
+        self.persist()?;
         Ok(glyx_core::Hlc {
             wall_ms: u64::try_from(wall).unwrap_or(0),
             seq: u16::try_from(seq).unwrap_or(u16::MAX),
@@ -549,53 +470,25 @@ impl UnlockedVault {
         })
         .transpose()
     }
-    fn meta_set(&self, key: &str, value: i64) -> Result<(), StoreError> {
+    fn meta_set(&mut self, key: &str, value: i64) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             rusqlite::params![key, value.to_string()],
         )?;
+        self.pack.set_meta(key, &value.to_string());
         Ok(())
     }
-    fn meta_set_str(&self, key: &str, value: &str) -> Result<(), StoreError> {
+    fn meta_set_str(&mut self, key: &str, value: &str) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             rusqlite::params![key, value],
         )?;
+        self.pack.set_meta(key, value);
         Ok(())
     }
-    fn index_needs_rebuild(&self) -> Result<bool, StoreError> {
-        if index::needs_backfill(&self.conn)? {
-            return Ok(true);
-        }
-        let vault_id: Option<String> = self
-            .conn
-            .query_row("SELECT value FROM meta WHERE key = 'vault_id'", [], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        if vault_id.is_none() {
-            return Ok(true);
-        }
-        let indexed: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?;
-        let envelopes = fs::read_dir(self.path.join(layout::ITEMS_DIR))?
-            .flatten()
-            .filter(|e| is_envelope_file(&e.path()))
-            .count();
-        if usize::try_from(indexed).unwrap_or(usize::MAX) != envelopes {
-            return Ok(true);
-        }
-        let blank: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM items WHERE item_type = ''", [], |r| {
-                    r.get(0)
-                })?;
-        Ok(blank > 0)
-    }
-    pub fn rebuild_index_from_envelopes(&self) -> Result<usize, StoreError> {
+    pub fn rebuild_index_from_envelopes(&mut self) -> Result<usize, StoreError> {
         self.conn.execute("DELETE FROM items", [])?;
         let mut max = glyx_core::Hlc {
             wall_ms: 0,
@@ -603,11 +496,11 @@ impl UnlockedVault {
             node: self.node,
         };
         let mut count = 0usize;
-        for entry in fs::read_dir(self.path.join(layout::ITEMS_DIR))?.flatten() {
-            if !is_envelope_file(&entry.path()) {
+        for key in self.pack.list_entries(&format!("{}/", layout::ITEMS_DIR)) {
+            if !key.ends_with(".envelope.json") {
                 continue;
             }
-            let env: Envelope = serde_json::from_slice(&fs::read(entry.path())?)
+            let env: Envelope = serde_json::from_slice(&self.pack.read_entry(&key)?)
                 .map_err(|e| StoreError::Corrupt(e.to_string()))?;
             let item = env.open(&self.key)?;
             if hlc_newer(item.hlc, max) {
@@ -616,35 +509,27 @@ impl UnlockedVault {
             index::upsert(&self.conn, &item)?;
             count += 1;
         }
-        let history = self.path.join(layout::HISTORY_DIR);
-        if history.is_dir() {
-            for dir in fs::read_dir(history)?.flatten() {
-                if !dir.file_type().is_ok_and(|t| t.is_dir()) {
-                    continue;
-                }
-                for entry in fs::read_dir(dir.path())?.flatten() {
-                    if !has_extension(&entry.path(), "json") {
-                        continue;
-                    }
-                    let env: Envelope = serde_json::from_slice(&fs::read(entry.path())?)
-                        .map_err(|e| StoreError::Corrupt(e.to_string()))?;
-                    if hlc_newer(env.hlc, max) {
-                        max = env.hlc;
-                    }
-                }
+        for key in self.pack.list_entries(&format!("{}/", layout::HISTORY_DIR)) {
+            if !has_json_suffix(&key) {
+                continue;
+            }
+            let env: Envelope = serde_json::from_slice(&self.pack.read_entry(&key)?)
+                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            if hlc_newer(env.hlc, max) {
+                max = env.hlc;
             }
         }
-        let conflicts = self.path.join(layout::CONFLICTS_DIR);
-        if conflicts.is_dir() {
-            for entry in fs::read_dir(conflicts)?.flatten() {
-                if !has_extension(&entry.path(), "json") {
-                    continue;
-                }
-                let conflict = crate::conflicts::read_conflict(&entry.path())?;
-                for env in [&conflict.winner, &conflict.local, &conflict.remote] {
-                    if hlc_newer(env.hlc, max) {
-                        max = env.hlc;
-                    }
+        for key in self
+            .pack
+            .list_entries(&format!("{}/", layout::CONFLICTS_DIR))
+        {
+            if !has_json_suffix(&key) {
+                continue;
+            }
+            let conflict = crate::conflicts::read_conflict_bytes(&self.pack.read_entry(&key)?)?;
+            for env in [&conflict.winner, &conflict.local, &conflict.remote] {
+                if hlc_newer(env.hlc, max) {
+                    max = env.hlc;
                 }
             }
         }
@@ -658,6 +543,7 @@ impl UnlockedVault {
         {
             self.meta_set("hlc_ms", i64::try_from(max.wall_ms).unwrap_or(i64::MAX))?;
             self.meta_set("hlc_seq", i64::from(max.seq))?;
+            self.persist()?;
         }
         Ok(count)
     }
@@ -897,7 +783,7 @@ impl UnlockedVault {
         }
         Ok(out)
     }
-    pub fn put_blob(&self, data: &[u8]) -> Result<String, StoreError> {
+    pub fn put_blob(&mut self, data: &[u8]) -> Result<String, StoreError> {
         if data.len() > blob::MAX_BLOB_BYTES {
             return Err(StoreError::Limit(format!(
                 "blob exceeds {} bytes",
@@ -905,41 +791,27 @@ impl UnlockedVault {
             )));
         }
         let (addr, bytes) = blob::seal(data, &self.key, self.cipher(), b"glyx-blob-v1")?;
-        atomic_write(
-            &self
-                .path
-                .join(layout::BLOBS_DIR)
-                .join(format!("{addr}.enc")),
-            &bytes,
-        )?;
+        self.pack.append_entry(&blob_key(&addr), &bytes)?;
+        self.persist()?;
         Ok(addr)
     }
     pub fn get_blob(&self, addr: &str) -> Result<Zeroizing<Vec<u8>>, StoreError> {
         if !blob::valid_address(addr) {
             return Err(StoreError::Corrupt("invalid blob address".into()));
         }
-        let bytes = fs::read(
-            self.path
-                .join(layout::BLOBS_DIR)
-                .join(format!("{addr}.enc")),
-        )
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
+        let bytes = self.pack.read_entry(&blob_key(addr)).map_err(|e| {
+            if matches!(e, StoreError::NotFound(_)) {
                 StoreError::NotFound(format!("blob {addr}"))
             } else {
-                e.into()
+                e
             }
         })?;
         blob::open(&bytes, &self.key, b"glyx-blob-v1")
     }
     pub fn blob_addresses(&self) -> Result<Vec<(String, u64)>, StoreError> {
         let mut out = Vec::new();
-        for entry in fs::read_dir(self.path.join(layout::BLOBS_DIR))?.flatten() {
-            let path = entry.path();
-            if !entry.file_type().is_ok_and(|t| t.is_file()) {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        for key in self.pack.list_entries(&format!("{}/", layout::BLOBS_DIR)) {
+            let Some(name) = key.rsplit('/').next() else {
                 continue;
             };
             let Some(addr) = name.strip_suffix(".enc") else {
@@ -948,53 +820,45 @@ impl UnlockedVault {
             if !blob::valid_address(addr) {
                 continue;
             }
-            out.push((addr.to_owned(), entry.metadata()?.len()));
+            out.push((addr.to_owned(), self.pack.entry_len(&key).unwrap_or(0)));
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
     pub fn referenced_blobs(&self) -> Result<HashSet<String>, StoreError> {
         let mut refs = HashSet::new();
-        for entry in fs::read_dir(self.path.join(layout::ITEMS_DIR))?.flatten() {
-            if !is_envelope_file(&entry.path()) {
+        for key in self.pack.list_entries(&format!("{}/", layout::ITEMS_DIR)) {
+            if !key.ends_with(".envelope.json") {
                 continue;
             }
-            let env: Envelope = serde_json::from_slice(&fs::read(entry.path())?)
+            let env: Envelope = serde_json::from_slice(&self.pack.read_entry(&key)?)
                 .map_err(|e| StoreError::Corrupt(e.to_string()))?;
             collect_blob_refs(&env, &self.key, &mut refs)?;
         }
-        let history = self.path.join(layout::HISTORY_DIR);
-        if history.is_dir() {
-            for dir in fs::read_dir(history)?.flatten() {
-                if !dir.file_type().is_ok_and(|t| t.is_dir()) {
-                    continue;
-                }
-                for entry in fs::read_dir(dir.path())?.flatten() {
-                    if !has_extension(&entry.path(), "json") {
-                        continue;
-                    }
-                    let env: Envelope = serde_json::from_slice(&fs::read(entry.path())?)
-                        .map_err(|e| StoreError::Corrupt(e.to_string()))?;
-                    collect_blob_refs(&env, &self.key, &mut refs)?;
-                }
+        for key in self.pack.list_entries(&format!("{}/", layout::HISTORY_DIR)) {
+            if !has_json_suffix(&key) {
+                continue;
             }
+            let env: Envelope = serde_json::from_slice(&self.pack.read_entry(&key)?)
+                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            collect_blob_refs(&env, &self.key, &mut refs)?;
         }
-        let conflicts = self.path.join(layout::CONFLICTS_DIR);
-        if conflicts.is_dir() {
-            for entry in fs::read_dir(conflicts)?.flatten() {
-                if !has_extension(&entry.path(), "json") {
-                    continue;
-                }
-                let conflict = crate::conflicts::read_conflict(&entry.path())?;
-                for env in [&conflict.winner, &conflict.local, &conflict.remote] {
-                    collect_blob_refs(env, &self.key, &mut refs)?;
-                }
+        for key in self
+            .pack
+            .list_entries(&format!("{}/", layout::CONFLICTS_DIR))
+        {
+            if !has_json_suffix(&key) {
+                continue;
+            }
+            let conflict = crate::conflicts::read_conflict_bytes(&self.pack.read_entry(&key)?)?;
+            for env in [&conflict.winner, &conflict.local, &conflict.remote] {
+                collect_blob_refs(env, &self.key, &mut refs)?;
             }
         }
         Ok(refs)
     }
     pub fn gc_blobs(
-        &self,
+        &mut self,
         extra_refs: &HashSet<String>,
         dry_run: bool,
     ) -> Result<BlobGcReport, StoreError> {
@@ -1017,14 +881,13 @@ impl UnlockedVault {
             report.orphans += 1;
             report.orphan_bytes = report.orphan_bytes.saturating_add(size);
             if !dry_run {
-                fs::remove_file(
-                    self.path
-                        .join(layout::BLOBS_DIR)
-                        .join(format!("{addr}.enc")),
-                )?;
+                self.pack.remove_entry(&blob_key(&addr));
                 report.purged += 1;
                 report.purged_bytes = report.purged_bytes.saturating_add(size);
             }
+        }
+        if !dry_run && report.purged > 0 {
+            self.persist()?;
         }
         Ok(report)
     }
@@ -1034,38 +897,32 @@ impl UnlockedVault {
     pub fn seal_pin_session(&self, pin: &[u8], ttl_min: u64) -> Result<(), StoreError> {
         crate::session::seal_pin_ticket(self.config.vault_id, &self.key, pin, ttl_min)
     }
-    pub fn add_slot(&self, password: &[u8], keyfile: &[u8; 32]) -> Result<Uuid, StoreError> {
+    pub fn add_slot(&mut self, password: &[u8], keyfile: &[u8; 32]) -> Result<Uuid, StoreError> {
         self.add_slot_with_params(password, keyfile, self.config.cipher_suite.params)
     }
     pub fn add_slot_with_params(
-        &self,
+        &mut self,
         password: &[u8],
         keyfile: &[u8; 32],
         params: glyx_core::KdfParams,
     ) -> Result<Uuid, StoreError> {
         let slot = glyx_crypto::Keyslot::seal(password, keyfile, &self.key, params)?;
         let id = slot.id;
-        atomic_write(
-            &self.path.join(layout::KEYSLOTS_DIR).join(slot.filename()),
-            serde_json::to_string_pretty(&slot)
-                .map_err(|e| StoreError::Corrupt(e.to_string()))?
-                .as_bytes(),
-        )?;
+        let mut slots = self.pack.keyslots().to_vec();
+        slots.push(slot);
+        self.pack.set_keyslots(slots);
+        self.pack.write_header()?;
         Ok(id)
     }
     pub fn list_slots(&self) -> Result<Vec<(Uuid, glyx_core::KdfParams)>, StoreError> {
-        let mut out = Vec::new();
-        for entry in fs::read_dir(self.path.join(layout::KEYSLOTS_DIR))?.flatten() {
-            if !has_extension(&entry.path(), "json") {
-                continue;
-            }
-            let slot: glyx_crypto::Keyslot = serde_json::from_slice(&fs::read(entry.path())?)
-                .map_err(|e| StoreError::Corrupt(e.to_string()))?;
-            out.push((slot.id, slot.params));
-        }
-        Ok(out)
+        Ok(self
+            .pack
+            .keyslots()
+            .iter()
+            .map(|slot| (slot.id, slot.params))
+            .collect())
     }
-    pub fn retire_slot(&self, id: &Uuid) -> Result<(), StoreError> {
+    pub fn retire_slot(&mut self, id: &Uuid) -> Result<(), StoreError> {
         let slots = self.list_slots()?;
         if slots.len() <= 1 {
             return Err(StoreError::Corrupt("cannot retire the last keyslot".into()));
@@ -1073,20 +930,24 @@ impl UnlockedVault {
         if !slots.iter().any(|(s, _)| s == id) {
             return Err(StoreError::Corrupt("keyslot not found".into()));
         }
-        fs::remove_file(
-            self.path
-                .join(layout::KEYSLOTS_DIR)
-                .join(format!("slot-{}.json", id.as_simple())),
-        )?;
+        let slots = self
+            .pack
+            .keyslots()
+            .iter()
+            .filter(|slot| slot.id != *id)
+            .cloned()
+            .collect();
+        self.pack.set_keyslots(slots);
+        self.pack.write_header()?;
         Ok(())
     }
     fn scan_headers_unlocked(&self) -> Result<Vec<EnvelopeHeader>, StoreError> {
         let mut out = Vec::new();
-        for entry in fs::read_dir(self.path.join(layout::ITEMS_DIR))?.flatten() {
-            if !is_envelope_file(&entry.path()) {
+        for key in self.pack.list_entries(&format!("{}/", layout::ITEMS_DIR)) {
+            if !key.ends_with(".envelope.json") {
                 continue;
             }
-            let bytes = fs::read(entry.path())?;
+            let bytes = self.pack.read_entry(&key)?;
             let env: Envelope =
                 serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
             out.push(env.header());
@@ -1095,28 +956,23 @@ impl UnlockedVault {
     }
     pub fn reencrypt(&mut self, cipher: glyx_core::Cipher) -> Result<usize, StoreError> {
         let mut addr_map = std::collections::HashMap::new();
-        for entry in fs::read_dir(self.path.join(layout::BLOBS_DIR))?.flatten() {
-            if !has_extension(&entry.path(), "enc") {
+        for key in self.pack.list_entries(&format!("{}/", layout::BLOBS_DIR)) {
+            let Some(name) = key.rsplit('/').next() else {
+                continue;
+            };
+            let Some(old_addr) = name.strip_suffix(".enc") else {
+                continue;
+            };
+            if !blob::valid_address(old_addr) {
                 continue;
             }
-            let old_addr = entry
-                .path()
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let bytes = fs::read(entry.path())?;
+            let bytes = self.pack.read_entry(&key)?;
             let data = blob::open(&bytes, &self.key, b"glyx-blob-v1")?;
             let (new_addr, sealed) = blob::seal(&data, &self.key, cipher, b"glyx-blob-v1")?;
             if new_addr != old_addr {
-                atomic_write(
-                    &self
-                        .path
-                        .join(layout::BLOBS_DIR)
-                        .join(format!("{new_addr}.enc")),
-                    &sealed,
-                )?;
-                fs::remove_file(entry.path())?;
-                addr_map.insert(old_addr, new_addr);
+                self.pack.append_entry(&blob_key(&new_addr), &sealed)?;
+                self.pack.remove_entry(&key);
+                addr_map.insert(old_addr.to_owned(), new_addr);
             }
         }
         let mut n = 0;
@@ -1138,29 +994,21 @@ impl UnlockedVault {
                 item.updated_by = self.node;
             }
             let env = Envelope::seal(&item, &self.key, cipher)?;
-            atomic_write(
-                &self.path.join(layout::ITEMS_DIR).join(env.filename()),
-                serde_json::to_string_pretty(&env)
-                    .map_err(|e| StoreError::Corrupt(e.to_string()))?
-                    .as_bytes(),
-            )?;
+            let bytes = serde_json::to_vec(&env).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            self.pack.append_entry(&item_key(&item.id), &bytes)?;
             index::upsert(&self.conn, &item)?;
             n += 1;
         }
         self.config.cipher_suite.cipher = cipher;
-        atomic_write(
-            &self.path.join(layout::VAULT_TOML),
-            self.config.to_toml()?.as_bytes(),
-        )?;
+        self.pack.set_config(self.config.clone());
+        self.persist()?;
         Ok(n)
     }
 
     pub fn set_keyfile_required(&mut self, required: bool) -> Result<(), StoreError> {
         self.config.keyfile_required = required;
-        atomic_write(
-            &self.path.join(layout::VAULT_TOML),
-            self.config.to_toml()?.as_bytes(),
-        )?;
+        self.pack.set_config(self.config.clone());
+        self.pack.write_header()?;
         Ok(())
     }
 
@@ -1197,19 +1045,17 @@ impl UnlockedVault {
         glyx_crypto::pointer::open_pointer(&self.key, token, target).map_err(StoreError::from)
     }
 
-    pub fn stamp_merge(&self) -> Result<(), StoreError> {
-        self.meta_set("last_merge_ms", glyx_core::ids::wall_ms_now().cast_signed())
+    pub fn stamp_merge(&mut self) -> Result<(), StoreError> {
+        self.meta_set("last_merge_ms", glyx_core::ids::wall_ms_now().cast_signed())?;
+        self.persist()
     }
 
     fn read_envelope(&self, id: &Uuid) -> Result<Option<Envelope>, StoreError> {
-        let file = self
-            .path
-            .join(layout::ITEMS_DIR)
-            .join(format!("{}.envelope.json", id.as_simple()));
-        if !file.exists() {
+        let key = item_key(id);
+        if !self.pack.has_entry(&key) {
             return Ok(None);
         }
-        serde_json::from_slice(&fs::read(file)?)
+        serde_json::from_slice(&self.pack.read_entry(&key)?)
             .map_err(|e| StoreError::Corrupt(e.to_string()))
             .map(Some)
     }
@@ -1281,12 +1127,12 @@ impl UnlockedVault {
                     .map(|r| crate::conflicts::target_label(&r.target))
                     .collect(),
             };
-            crate::conflicts::write_conflict(
-                &self.path.join(layout::CONFLICTS_DIR),
-                &file,
-                tick.wall_ms,
-                tick.seq,
-            )?;
+            let filename =
+                crate::conflicts::conflict_filename(&file.item_id, tick.wall_ms, tick.seq);
+            let bytes =
+                serde_json::to_vec_pretty(&file).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            self.pack.append_entry(&conflict_key(&filename), &bytes)?;
+            self.persist()?;
         }
         Ok(MergeReport {
             outcome: MergeOutcome::Merged,
@@ -1296,44 +1142,38 @@ impl UnlockedVault {
 }
 
 impl UnlockedVault {
-    pub fn heal_conflict_files(&mut self) -> Result<crate::conflicts::HealReport, StoreError> {
-        use crate::conflicts::{HealReport, MergeOutcome};
+    pub fn heal_container_conflicts(&mut self) -> Result<crate::conflicts::HealReport, StoreError> {
+        use crate::conflicts::HealReport;
         let mut report = HealReport::default();
+        let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+            return Ok(report);
+        };
         let mut copies = Vec::new();
-        for entry in fs::read_dir(self.path.join(layout::ITEMS_DIR))?.flatten() {
+        for entry in fs::read_dir(parent)?.flatten() {
+            let path = entry.path();
+            if path == self.path || !path.is_file() {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             if is_sync_conflict_copy(&name) {
-                copies.push(entry.path());
+                copies.push(path);
             }
         }
-        let mut pending = Vec::new();
         for copy in copies {
-            let Some(original) = original_envelope_name(&copy) else {
+            let Ok(other_vault) = Vault::open(&copy) else {
                 continue;
             };
-            let bytes = fs::read(&copy)?;
-            let remote: Envelope = match serde_json::from_slice(&bytes) {
-                Ok(env) => env,
-                Err(_) => continue,
-            };
-            if remote.id.as_simple().to_string() + ".envelope.json" != original {
+            if other_vault.config().vault_id != self.config.vault_id {
                 continue;
             }
-            fs::remove_file(&copy)?;
-            pending.push(remote);
-        }
-        for remote in &pending {
-            let rep = self.merge_envelope(remote)?;
-            report.healed += 1;
-            match rep.outcome {
-                MergeOutcome::Merged => {
-                    report.merged += 1;
-                    report.conflicts += usize::from(rep.races > 0);
-                }
-                MergeOutcome::Adopted | MergeOutcome::FastForwarded | MergeOutcome::Tombstoned => {
-                    report.merged += 1;
-                }
-                MergeOutcome::Stale => {}
+            let Ok(other) = other_vault.open_with_key(&self.key, false) else {
+                continue;
+            };
+            if let Ok(sync) = self.sync_from(&other) {
+                report.healed += 1;
+                report.merged += sync.merged;
+                report.conflicts += sync.conflicts;
+                fs::remove_file(&copy).ok();
             }
         }
         Ok(report)
@@ -1386,24 +1226,15 @@ impl UnlockedVault {
         let Some(addr) = item.fields.get("blob").map(|f| f.value.expose().to_owned()) else {
             return Ok(false);
         };
-        if self
-            .path
-            .join(layout::BLOBS_DIR)
-            .join(format!("{addr}.enc"))
-            .exists()
-        {
+        if self.pack.has_entry(&blob_key(&addr)) {
             return Ok(false);
         }
         let data = other.get_blob(&addr)?;
         let (new_addr, sealed) = blob::seal(&data, &self.key, self.cipher(), b"glyx-blob-v1")?;
-        atomic_write(
-            &self
-                .path
-                .join(layout::BLOBS_DIR)
-                .join(format!("{new_addr}.enc")),
-            &sealed,
-        )?;
-        if new_addr != addr {
+        self.pack.append_entry(&blob_key(&new_addr), &sealed)?;
+        if new_addr == addr {
+            self.persist()?;
+        } else {
             let hlc = self.next_hlc()?;
             if let Some(field) = item.fields.get_mut("blob") {
                 field.value = glyx_core::SecretString::new(new_addr);
@@ -1418,20 +1249,18 @@ impl UnlockedVault {
     }
 
     pub fn list_conflicts(&self) -> Result<Vec<crate::conflicts::ConflictMeta>, StoreError> {
-        let dir = self.path.join(layout::CONFLICTS_DIR);
         let mut out = Vec::new();
-        if !dir.exists() {
-            return Ok(out);
-        }
-        for entry in fs::read_dir(dir)?.flatten() {
-            let path = entry.path();
-            if !has_extension(&path, "json") {
+        for key in self
+            .pack
+            .list_entries(&format!("{}/", layout::CONFLICTS_DIR))
+        {
+            if !has_json_suffix(&key) {
                 continue;
             }
-            if let Ok(file) = crate::conflicts::read_conflict(&path) {
+            if let Ok(file) = self.read_conflict_file(&key) {
                 out.push(crate::conflicts::ConflictMeta {
                     item_id: file.item_id,
-                    path,
+                    key,
                     created_ms: file.created_ms,
                     race_targets: file.race_targets,
                 });
@@ -1439,6 +1268,13 @@ impl UnlockedVault {
         }
         out.sort_by_key(|m| (m.item_id.as_bytes().to_vec(), m.created_ms));
         Ok(out)
+    }
+
+    pub fn read_conflict_file(
+        &self,
+        key: &str,
+    ) -> Result<crate::conflicts::ConflictFile, StoreError> {
+        crate::conflicts::read_conflict_bytes(&self.pack.read_entry(key)?)
     }
 
     pub fn read_conflict(
@@ -1450,7 +1286,7 @@ impl UnlockedVault {
         let Some(meta) = metas.into_iter().next() else {
             return Ok(None);
         };
-        let file = crate::conflicts::read_conflict(&meta.path)?;
+        let file = self.read_conflict_file(&meta.key)?;
         Ok(Some((
             file.winner.open(&self.key)?,
             file.local.open(&self.key)?,
@@ -1498,11 +1334,16 @@ impl UnlockedVault {
         item.deleted = false;
         item.updated_by = self.node;
         self.put_item(&item)?;
-        for meta in self.list_conflicts()? {
-            if &meta.item_id == item_id {
-                fs::remove_file(meta.path)?;
-            }
+        let keys: Vec<String> = self
+            .list_conflicts()?
+            .into_iter()
+            .filter(|meta| &meta.item_id == item_id)
+            .map(|meta| meta.key)
+            .collect();
+        for key in keys {
+            self.pack.remove_entry(&key);
         }
+        self.persist()?;
         Ok(true)
     }
 
@@ -1514,41 +1355,41 @@ impl UnlockedVault {
             if !header.deleted || header.hlc.wall_ms >= cutoff {
                 continue;
             }
-            fs::remove_file(
-                self.path
-                    .join(layout::ITEMS_DIR)
-                    .join(format!("{}.envelope.json", header.id.as_simple())),
-            )?;
+            self.pack.remove_entry(&item_key(&header.id));
             index::remove(&self.conn, &header.id)?;
             purged.push(header.id);
+        }
+        if !purged.is_empty() {
+            self.persist()?;
         }
         Ok(purged)
     }
 }
 
-fn has_conflict_files(vault_path: &Path) -> bool {
-    fs::read_dir(vault_path.join(layout::ITEMS_DIR)).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .any(|e| is_sync_conflict_copy(&e.file_name().to_string_lossy()))
-    })
+fn item_key(id: &Uuid) -> String {
+    format!("{}/{}.envelope.json", layout::ITEMS_DIR, id.as_simple())
+}
+
+fn history_key(id: &Uuid, file: &str) -> String {
+    format!("{}/{}/{}", layout::HISTORY_DIR, id.as_simple(), file)
+}
+
+fn blob_key(addr: &str) -> String {
+    format!("{}/{}.enc", layout::BLOBS_DIR, addr)
+}
+
+fn conflict_key(file: &str) -> String {
+    format!("{}/{}", layout::CONFLICTS_DIR, file)
+}
+
+fn has_json_suffix(key: &str) -> bool {
+    std::path::Path::new(key)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
 }
 
 fn is_sync_conflict_copy(name: &str) -> bool {
     name.contains(".sync-conflict-") || name.contains("conflicted copy")
-}
-
-fn original_envelope_name(copy_path: &Path) -> Option<String> {
-    let name = copy_path.file_name()?.to_string_lossy().into_owned();
-    if let Some((head, _)) = name.split_once(".sync-conflict-") {
-        let ext = copy_path.extension()?.to_string_lossy().into_owned();
-        return Some(format!("{head}.{ext}"));
-    }
-    if let Some((head, _)) = name.split_once(" (conflicted copy") {
-        let ext = copy_path.extension()?.to_string_lossy().into_owned();
-        return Some(format!("{head}.{ext}"));
-    }
-    None
 }
 
 impl std::fmt::Debug for UnlockedVault {
@@ -1558,19 +1399,6 @@ impl std::fmt::Debug for UnlockedVault {
             .field("vault_id", &self.config.vault_id)
             .finish_non_exhaustive()
     }
-}
-
-fn has_extension(path: &Path, ext: &str) -> bool {
-    path.extension().is_some_and(|e| e == ext)
-}
-
-fn is_envelope_file(path: &Path) -> bool {
-    if !has_extension(path, "json") {
-        return false;
-    }
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .is_some_and(|stem| stem.rsplit('.').next() == Some("envelope"))
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
@@ -1614,23 +1442,6 @@ pub(crate) fn harden_file(path: &Path) {
     }
     #[cfg(not(unix))]
     let _ = path;
-}
-
-fn open_lock_file(vault_path: &Path) -> Result<fs::File, StoreError> {
-    fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(vault_path.join(layout::LOCK_FILE))
-        .map_err(|e| StoreError::Corrupt(format!("cannot open lock file: {e}")))
-}
-
-fn lock_file(vault_path: &Path) -> Result<fs::File, StoreError> {
-    let file = open_lock_file(vault_path)?;
-    file.lock_exclusive()
-        .map_err(|e| StoreError::Corrupt(format!("vault is locked by another process: {e}")))?;
-    Ok(file)
 }
 
 #[cfg(test)]
@@ -1815,9 +1626,9 @@ mod tests {
     #[test]
     fn backup_restore_rebuilds_index_and_keeps_blobs() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("backup.glyx");
+        let path = dir.path().join("vault.glyx");
         let dest = dir.path().join("restored.glyx");
-        let archive = dir.path().join("backup.tar.gz");
+        let archive = dir.path().join("backup.glyx");
         Vault::init(
             &path,
             suite(glyx_core::Cipher::Xchacha20poly1305),
@@ -1882,8 +1693,8 @@ mod tests {
             assert_eq!(&*unlocked.get_blob(&addr).expect("get blob"), b"attachment");
             drop(unlocked);
             let reopened = Vault::open(&path).expect("reopen");
-            assert_eq!(reopened.scan_headers().expect("scan").len(), 1);
-            assert_eq!(reopened.rebuild_index().expect("rebuild"), 1);
+            let reopened_uv = reopened.unlock(b"password", &keyfile).expect("reunlock");
+            assert_eq!(reopened_uv.list(false).expect("list").len(), 1);
         }
     }
 }
@@ -1943,10 +1754,7 @@ mod m1_tests {
         v2.hlc = uv.next_hlc().expect("tick");
         v2.rev = 2;
         uv.put_item(&v2).expect("overwrite");
-        let hist = path
-            .join(layout::HISTORY_DIR)
-            .join(id.as_simple().to_string());
-        assert!(fs::read_dir(&hist).expect("history").count() >= 1);
+        assert!(!uv.history(&id).expect("history").is_empty());
         assert!(uv.delete_item(&id).expect("delete"));
         assert!(uv.get_item(&id).expect("get").expect("found").deleted);
         assert!(uv.list(false).expect("list").is_empty());
@@ -1993,6 +1801,25 @@ mod m1_tests {
         let first = {
             let vault = Vault::open(&path).expect("open");
             let mut uv = vault.unlock(b"pw", &kf).expect("unlock");
+            let hlc = uv.next_hlc().expect("tick");
+            uv.put_item(&login_item(uv.device_node(), hlc))
+                .expect("put");
+            hlc
+        };
+        let vault = Vault::open(&path).expect("open");
+        let mut uv = vault.unlock(b"pw", &kf).expect("unlock");
+        assert!(uv.next_hlc().expect("tick") > first);
+    }
+
+    #[test]
+    fn hlc_floor_persists_without_an_item_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("h.glyx");
+        let kf = [2u8; 32];
+        Vault::init(&path, mobile_suite(), b"pw", Some(&kf)).expect("init");
+        let first = {
+            let vault = Vault::open(&path).expect("open");
+            let mut uv = vault.unlock(b"pw", &kf).expect("unlock");
             uv.next_hlc().expect("tick")
         };
         let vault = Vault::open(&path).expect("open");
@@ -2006,7 +1833,7 @@ mod m1_tests {
         let path = dir.path().join("s.glyx");
         Vault::init(&path, mobile_suite(), b"pw", Some(&[3u8; 32])).expect("init");
         let vault = Vault::open(&path).expect("open");
-        let uv = vault.unlock(b"pw", &[3u8; 32]).expect("unlock");
+        let mut uv = vault.unlock(b"pw", &[3u8; 32]).expect("unlock");
         let id = uv.add_slot(b"new", &[4u8; 32]).expect("add");
         assert!(vault.verify_slot(&id, b"new", &[4u8; 32]).expect("verify"));
         assert!(!vault
@@ -2049,18 +1876,6 @@ mod m1_tests {
 mod test_helpers {
     use super::*;
 
-    pub fn copy_dir(src: &Path, dst: &Path) {
-        fs::create_dir_all(dst).expect("mkdir");
-        for entry in fs::read_dir(src).expect("read").flatten() {
-            let to = dst.join(entry.file_name());
-            if entry.file_type().expect("type").is_dir() {
-                copy_dir(&entry.path(), &to);
-            } else {
-                fs::copy(entry.path(), to).expect("copy");
-            }
-        }
-    }
-
     pub fn m1_item(uv: &mut UnlockedVault, name: &str, fields: &[(&str, &str)]) -> glyx_core::Item {
         let hlc = uv.next_hlc().expect("tick");
         let node = uv.device_node();
@@ -2101,8 +1916,7 @@ mod test_helpers {
             params: glyx_core::KdfParams::mobile(),
         };
         Vault::init(&a, suite, b"pw", Some(&[9u8; 32])).expect("init");
-        copy_dir(&a, &b);
-        fs::remove_file(b.join("device.id")).ok();
+        fs::copy(&a, &b).expect("copy vault");
         (dir, a, b)
     }
 
@@ -2249,24 +2063,35 @@ mod m2_tests {
     }
 
     #[test]
-    fn conflict_copy_heals_on_unlock() {
-        let (_d, a, _) = two_vaults();
+    fn whole_file_conflict_copy_heals_on_unlock() {
+        let (_d, a, b) = two_vaults();
+        let id = {
+            let vault = Vault::open(&a).expect("open");
+            let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+            let item = m1_item(&mut uv, "x", &[("password", "p")]);
+            let id = item.id;
+            uv.put_item(&item).expect("put");
+            id
+        };
+        seed_b_from_a(&a, &b);
+        {
+            let vault = Vault::open(&b).expect("open");
+            let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+            let mut item = uv.get_item(&id).expect("get").expect("found");
+            item.name = "from-b".to_owned();
+            item.hlc = uv.next_hlc().expect("tick");
+            item.rev += 1;
+            uv.put_item(&item).expect("put");
+        }
+        let copy = a.with_file_name("a.sync-conflict-20240101-101010-ABCDEF1.glyx");
+        fs::copy(&b, &copy).expect("craft copy");
         let vault = Vault::open(&a).expect("open");
-        let mut uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
-        let item = m1_item(&mut uv, "x", &[("password", "p")]);
-        uv.put_item(&item).expect("put");
-        drop(uv);
-        let hex = item.id.as_simple().to_string();
-        let src = a
-            .join(layout::ITEMS_DIR)
-            .join(format!("{hex}.envelope.json"));
-        let copy = a.join(layout::ITEMS_DIR).join(format!(
-            "{hex}.envelope.sync-conflict-20240101-101010-ABCDEF1.json"
-        ));
-        fs::copy(&src, &copy).expect("craft copy");
-        let vault = Vault::open(&a).expect("open");
-        let _uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
+        let uv = vault.unlock(b"pw", &[9u8; 32]).expect("unlock");
         assert!(!copy.exists());
+        assert_eq!(
+            uv.get_item(&id).expect("get").expect("found").name,
+            "from-b"
+        );
     }
 
     #[test]

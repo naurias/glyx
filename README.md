@@ -1,6 +1,6 @@
 # glyx
 
-Local-first password manager for Linux, Windows, and Android. CLI, full-screen TUI, WebUI, desktop app, and an Android app on one Rust core. No accounts, no telemetry, your vault stays yours.
+Local-first password manager for Linux, Windows, and Android. CLI, full-screen TUI, WebUI, desktop app, and an Android app on one Rust core. No accounts, no telemetry, and the whole vault is one encrypted `.glyx` file you own.
 
 Full feature guide for every frontend, with examples: **[docs.md](docs.md)**. The frontend capability summary is under **[Frontends at a glance](docs.md#frontends-at-a-glance)**.
 
@@ -179,8 +179,8 @@ glyx --keyfile ~/keys/main2.key vault rekey --cipher aesgcm
 # Encrypted attachments and backups
 glyx add file --name report --attach report.pdf
 glyx blob ls
-glyx vault backup ~/backups/main.tar.gz
-glyx vault restore ~/backups/main.tar.gz ~/vaults/restored.glyx
+glyx vault backup ~/backups/main.glyx
+glyx vault restore ~/backups/main.glyx ~/vaults/restored.glyx
 
 # Check vault health
 glyx doctor --with-unlock --json
@@ -328,7 +328,7 @@ passphrase), fingerprints, add/revoke, reload, and per-key export targets.
 
 ## Sync
 
-Point any file sync you trust (Syncthing, Nextcloud, plain copy) at the vault folder. When the same item changes on two devices, glyx merges field by field on the next unlock or `sync`:
+Point any file sync you trust (Syncthing, Nextcloud, plain copy) at the `.glyx` file. When the same item changes on two devices, glyx merges field by field on the next unlock or `sync`:
 
 ```sh
 glyx sync                        # heal file-sync conflict copies in place
@@ -390,7 +390,7 @@ The desktop app also registers Ctrl+Shift+G to pop up the vault search.
 
 | Item            | Location                                    |
 |-----------------|---------------------------------------------|
-| Vault folder    | You choose, for example `~/vaults/main.glyx` |
+| Vault file      | You choose, for example `~/vaults/main.glyx` |
 | Daemon socket   | Loopback only, token in `daemon.json`, token auth |
 | Export ledger   | Local only, never synced (`agent-ledger.sqlite`) |
 | App config      | `~/.config/glyx/config.toml` (or `GLYX_CONFIG`) |
@@ -404,7 +404,7 @@ No network listener leaves your machine in v1 except the planned opt-in relay.
 ```
 flake.nix        Nix shells, packages, apps
 crates/
-  glyx-core      Item/HLC/DeviceId/SecretString types, VAULT.toml spec
+  glyx-core      Item/HLC/DeviceId/SecretString types, vault config spec
   glyx-crypto    Argon2id KDF, XChaCha/AES-GCM, keyslots, BLAKE3
   glyx-store     Vault init/open, envelopes, blobs, index, merge/heal/GC
   glyx-sync      Field-LWW merge, dominance check, header ordering, classifier

@@ -1,6 +1,6 @@
 # glyx user guide
 
-glyx is a local-first password manager. Your vault is a directory of encrypted files that you own and can sync with any tool you trust. There is no account, no telemetry, and no network service outside your machine.
+glyx is a local-first password manager. Your vault is a single encrypted `.glyx` file that you own and can sync with any tool you trust. There is no account, no telemetry, and no network service outside your machine.
 
 This guide covers the user-facing frontends:
 
@@ -139,7 +139,7 @@ cargo audit
 pnpm --dir apps/webui build
 ```
 
-Current expected count: **103/103 nextest** on `refine-ui-files`. The detailed Arch
+Current expected count: **120/120 nextest** on `refine-ui-files`. The detailed Arch
 component-by-component guide is `local/build-without-nix.md` in the development
 checkout; the public summary is in `README.md`.
 
@@ -169,9 +169,13 @@ The vault id is printed on creation. Keep the keyfile (if you use one) somewhere
 
 ## 2. Core concepts
 
-**Vault directory.** `VAULT.toml` plus `keyslots/`, `items/`, `blobs/`, `history/`, `conflicts/`, and a local SQLite index. Sync the whole directory, never individual files.
+**Single-file vault.** One `.glyx` container holds an encrypted manifest, every item envelope, history, conflicts, and attachments. The container has two fixed 32 KiB header slots; the newest valid slot wins, so a torn write falls back to the previous header. Item and blob payloads are sealed exactly as before, so only the manifest reveals logical names. Saves append changed entries and switch to the inactive header slot; lock and GC compact the file. Sync the file as a whole, never part of it.
 
-**Format version 2.** `VAULT.toml` records `format_version = 2` and `keyfile_required`. Version 1 vaults are not supported; recreate them.
+**Format version 3.** The encrypted header records `format_version = 3`, the vault id, the cipher suite, and the keyslots. Directory vaults and format 1–2 vaults are rejected; recreate them as a single file.
+
+**Index.** There is no on-disk index. A private in-memory SQLite index is rebuilt from the encrypted manifest and envelopes on every unlock, so copying the file never copies plaintext metadata.
+
+**Backups.** A backup is a direct `0600` copy of the `.glyx` file. Restore verifies the header, then copies the file into a new destination. The device id and keyfile are never part of the vault file.
 
 **Password and keyfile.** The password is mandatory. The keyfile is optional. Unlock derives a key from `password + keyfile` (or `password` alone) with Argon2id, then unwraps the random data key. Cipher is XChaCha20-Poly1305 by default, AES-256-GCM is an option.
 
@@ -430,22 +434,21 @@ The desktop app is the same GUI plus platform glue:
 
 ### Backup and restore
 
-Backups require a locked vault so the snapshot is consistent. The archive is a
-`tar.gz` of encrypted vault artifacts plus `VAULT.toml`; the plaintext SQLite
-index, lock file, `device.id`, and a registered keyfile are excluded.
+Backups require a locked vault so the snapshot is consistent. A backup is a
+direct copy of the encrypted `.glyx` file. The device id, app config, keyfile,
+and runtime lock/session files are never included.
 
 ```sh
-glyx vault backup ~/backups/main-2026-10-20.tar.gz
-glyx vault restore ~/backups/main-2026-10-20.tar.gz ~/vaults/restored.glyx
+glyx vault backup ~/backups/main-2026-10-20.glyx
+glyx vault restore ~/backups/main-2026-10-20.glyx ~/vaults/restored.glyx
 ```
 
-Restore requires a destination that does not exist. It rejects absolute paths,
-`..`, symlinks, hardlinks, special files, oversized archives, and unexpected
-top-level entries, extracts to a private temporary directory, then renames it
-into place. A fresh device id is generated and the index is rebuilt from
-envelopes on first unlock, with the HLC floor restored from items, history, and
-conflicts. GUI: Settings → Backup (lock first). The archive is not additionally
-encrypted; treat it as sensitive even though item contents are encrypted.
+Restore requires a destination that does not exist, verifies the container
+header, copies to a private temporary file, then renames it into place. The
+in-memory index is rebuilt from envelopes on first unlock, with the HLC floor
+restored from items, history, and conflicts. GUI: Settings → Backup (lock
+first). The copy is not additionally encrypted; treat it as sensitive even
+though item contents are encrypted.
 
 ---
 
@@ -747,7 +750,7 @@ Hunks are line-based. Clean hunks apply automatically. Real conflicts need an ex
 
 ## 12. Sync and conflicts
 
-Point any file sync you trust at the vault directory (Syncthing, Nextcloud, rsync, a USB copy). glyx merges field by field:
+Point any file sync you trust at the `.glyx` file (Syncthing, Nextcloud, rsync, a USB copy). When a sync tool leaves a whole-file `*.sync-conflict-*.glyx` copy next to the vault, glyx merges it on unlock when the vault id matches, then retires the copy. glyx merges field by field:
 
 ```sh
 glyx sync                        # heal file-sync conflict copies
@@ -910,7 +913,7 @@ Secrets are kept in memory only and never written to `localStorage`.
 
 `glyx-tauri` (the installed binary, or `nix run .#glyx-desktop` on NixOS) starts the daemon for the selected vault, injects the URL and token into the WebView, and opens the GUI. It closes the daemon on exit by default.
 
-With no vault selected, the desktop opens onboarding instead of failing to connect: it lists known vaults and offers **Open existing vault**, **Create new vault**, and **Restore from backup**. Folder/keyfile/archive selection uses native dialogs on desktop and text paths in the browser WebUI. Creating a vault auto-unlocks it and opens the item list. If the external daemon cannot be started, the desktop falls back to an in-process daemon and shows a retryable error card instead of a blank connection error.
+With no vault selected, the desktop opens onboarding instead of failing to connect: it lists known vaults and offers **Open existing vault**, **Create new vault**, and **Restore from backup**. File/keyfile selection uses native dialogs on desktop and text paths in the browser WebUI; the native picker runs asynchronously so the Linux desktop no longer freezes while a dialog is open. Creating a vault auto-unlocks it and opens the item list. If the external daemon cannot be started, the desktop falls back to an in-process daemon and shows a retryable error card instead of a blank connection error.
 
 On Hyprland, the desktop starts through XWayland (`GDK_BACKEND=x11`) because WebKitGTK/GTK3 can compute a corrupted viewport after a Wayland tile resize. Set `GDK_BACKEND=wayland` explicitly to opt out. The Nix package embeds the production WebUI; `cargo build -p glyx-tauri --features glyx-tauri/custom-protocol` does the same for local Arch/Nix builds after `pnpm --dir apps/webui build`.
 
