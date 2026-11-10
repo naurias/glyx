@@ -278,10 +278,16 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .patch(update_export),
         )
         .route("/v1/exports/enforce", post(enforce_exports))
-        .route("/v1/injects", get(list_exports).post(add_inject))
+        .route(
+            "/v1/injects",
+            get(list_exports).post(add_inject).patch(set_inject_policy),
+        )
         .route("/v1/injects/content", get(inject_content).put(inject_save))
         .route("/v1/injects/preview", get(inject_preview))
         .route("/v1/injects/scan", post(scan_injects))
+        .route("/v1/pick/file", post(pick_file_dialog))
+        .route("/v1/pick/folder", post(pick_folder_dialog))
+        .route("/v1/pick/save", post(pick_save_dialog))
         .route("/v1/agent/tamper", get(agent_tamper))
         .route("/v1/agent/resolve", post(agent_resolve))
         .route("/v1/agent/unlock", post(agent_unlock_target))
@@ -913,6 +919,25 @@ fn do_lock(state: &AppState) {
     if let Some(uv) = taken.as_ref() {
         audit(uv, "lock", None, None, "success", None);
         release_vault(uv);
+    }
+}
+
+fn do_shutdown(state: &AppState) {
+    let taken = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    stop_ssh_agent(state);
+    if let Some(uv) = taken.as_ref() {
+        let lock_on_exit = glyx_store::config::load().lock_on_exit;
+        if let Err(e) = glyx_agent::engine::teardown_for_exit(uv, lock_on_exit) {
+            eprintln!("exit teardown failed: {e}");
+        }
+        audit(uv, "lock", None, None, "success", None);
+        let vault_id = uv.config().vault_id;
+        glyx_agent::ssh_agent::stop(&glyx_agent::ssh_agent::socket_path(&vault_id));
+        glyx_store::session::wipe_ticket(&vault_id);
     }
 }
 
@@ -2969,6 +2994,7 @@ async fn list_exports(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             serde_json::json!({
                 "target": i.target, "form": i.form, "status": status,
                 "template": i.template_text.is_some(), "refs": refs,
+                "lock_on_exit": i.lock_on_exit,
             })
         }).collect::<Vec<_>>(),
         "roots": roots.iter().map(|r| serde_json::json!({
@@ -3267,6 +3293,7 @@ struct AddInjectBody {
     target: PathBuf,
     form: Option<String>,
     glob: Option<String>,
+    lock_on_exit: Option<bool>,
 }
 
 async fn add_inject(
@@ -3307,16 +3334,111 @@ async fn add_inject(
                 .into_response(),
         };
     }
-    match glyx_agent::ledger::register_inject(
+    let registered = glyx_agent::ledger::register_inject(
         &conn,
         &body.target,
         &body.form.unwrap_or_else(|| "encrypted-pointer".to_owned()),
         None,
-    ) {
-        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+    );
+    match registered {
+        Ok(()) => {
+            if let Some(lock_on_exit) = body.lock_on_exit {
+                if let Err(e) = glyx_agent::ledger::set_inject_lock_on_exit(
+                    &conn,
+                    &body.target,
+                    Some(lock_on_exit),
+                ) {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                        .into_response();
+                }
+            }
+            Json(serde_json::json!({"ok": true})).into_response()
+        }
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetInjectPolicyBody {
+    target: PathBuf,
+    lock_on_exit: Option<bool>,
+}
+
+async fn set_inject_policy(Json(body): Json<SetInjectPolicyBody>) -> impl IntoResponse {
+    let conn = match glyx_agent::ledger::open_db() {
+        Ok(conn) => conn,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) =
+        glyx_agent::ledger::set_inject_lock_on_exit(&conn, &body.target, body.lock_on_exit)
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({"ok": true, "lock_on_exit": body.lock_on_exit})).into_response()
+}
+
+#[derive(Deserialize)]
+struct PickBody {
+    title: Option<String>,
+    file_name: Option<String>,
+}
+
+async fn pick_file_dialog(Json(body): Json<PickBody>) -> impl IntoResponse {
+    pick_dialog(crate::picker::PickKind::File, body).await
+}
+
+async fn pick_folder_dialog(Json(body): Json<PickBody>) -> impl IntoResponse {
+    pick_dialog(crate::picker::PickKind::Folder, body).await
+}
+
+async fn pick_save_dialog(Json(body): Json<PickBody>) -> impl IntoResponse {
+    pick_dialog(crate::picker::PickKind::Save, body).await
+}
+
+async fn pick_dialog(kind: crate::picker::PickKind, body: PickBody) -> Response {
+    let title = body.title.unwrap_or_else(|| "Choose a path".to_owned());
+    let result = tokio::task::spawn_blocking(move || {
+        crate::picker::pick(kind, &title, body.file_name.as_deref())
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(path))) => Json(serde_json::json!({
+            "ok": true,
+            "path": path,
+            "cancelled": false,
+        }))
+        .into_response(),
+        Ok(Ok(None)) => Json(serde_json::json!({
+            "ok": true,
+            "path": null,
+            "cancelled": true,
+        }))
+        .into_response(),
+        Ok(Err(error)) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error.to_string()})),
         )
             .into_response(),
     }
@@ -3903,6 +4025,7 @@ struct SettingsBody {
     session_ttl_min: Option<u64>,
     auto_materialize: Option<bool>,
     idle_lock_min: Option<u64>,
+    lock_on_exit: Option<bool>,
 }
 
 fn vault_json(
@@ -4186,6 +4309,7 @@ async fn get_settings(State(_state): State<Arc<AppState>>) -> impl IntoResponse 
         "session_ttl_min": cfg.session_ttl_min,
         "auto_materialize": cfg.auto_materialize,
         "idle_lock_min": cfg.idle_lock_min,
+        "lock_on_exit": cfg.lock_on_exit,
     }))
 }
 
@@ -4212,6 +4336,9 @@ async fn set_settings(
     if let Some(auto) = body.auto_materialize {
         cfg.auto_materialize = auto;
     }
+    if let Some(lock) = body.lock_on_exit {
+        cfg.lock_on_exit = lock;
+    }
     if let Some(min) = body.idle_lock_min {
         cfg.idle_lock_min = Some(min);
         state.idle_lock_ms.store(
@@ -4229,6 +4356,7 @@ async fn set_settings(
         "session_ttl_min": cfg.session_ttl_min,
         "auto_materialize": cfg.auto_materialize,
         "idle_lock_min": cfg.idle_lock_min,
+        "lock_on_exit": cfg.lock_on_exit,
     }))
     .into_response()
 }
@@ -4395,6 +4523,16 @@ pub async fn serve(
     config: DaemonConfig,
     token: String,
 ) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    if let Ok(report) = glyx_agent::engine::recover_crash(glyx_store::config::load().lock_on_exit) {
+        if report.restored > 0 || report.wiped > 0 || !report.drifted.is_empty() {
+            eprintln!(
+                "crash recovery: restored {}, wiped {}, drifted {}",
+                report.restored,
+                report.wiped,
+                report.drifted.len()
+            );
+        }
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let state = Arc::new(AppState {
@@ -4425,12 +4563,34 @@ pub async fn serve(
             }
         }
     });
+    let shutdown = state.clone();
+    tokio::spawn(async move {
+        wait_for_shutdown().await;
+        do_shutdown(&shutdown);
+        std::process::exit(0);
+    });
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap_or_else(|e| {
             eprintln!("daemon serve error: {e}");
         });
     });
     Ok((addr, handle))
+}
+
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("sigterm handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[derive(Debug)]
@@ -5007,6 +5167,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn history_restore_and_settings() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("GLYX_CONFIG", dir.path().join("config.toml"));
@@ -5097,12 +5258,72 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["idle_lock_min"], serde_json::json!(5));
+        assert_eq!(body["lock_on_exit"], serde_json::json!(true));
         assert_eq!(
             state
                 .idle_lock_ms
                 .load(std::sync::atomic::Ordering::Relaxed),
             300_000
         );
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/settings",
+            Some(serde_json::json!({"lock_on_exit": false})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["lock_on_exit"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn inject_lock_policy_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("GLYX_CONFIG", dir.path().join("config.toml"));
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": "pw", "keyfile": kf_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let target = dir.path().join("notes.md");
+        std::fs::write(&target, "hello\n").expect("write");
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/injects",
+            Some(serde_json::json!({
+                "target": target,
+                "form": "encrypted-pointer",
+                "lock_on_exit": true,
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call(state.clone(), "GET", "/v1/exports", None, "test-token").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let injects = body["injects"].as_array().expect("injects");
+        assert_eq!(injects.len(), 1);
+        assert_eq!(injects[0]["lock_on_exit"], serde_json::json!(true));
+        let (status, body) = call(
+            state.clone(),
+            "PATCH",
+            "/v1/injects",
+            Some(serde_json::json!({"target": target, "lock_on_exit": false})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call(state.clone(), "GET", "/v1/exports", None, "test-token").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["injects"][0]["lock_on_exit"], serde_json::json!(false));
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 pub mod api;
 pub mod passkey;
+pub mod picker;
 pub mod runtime;
 
 #[derive(Debug)]
