@@ -4,7 +4,7 @@ Local-first password manager for Linux, Windows, and Android. CLI, full-screen T
 
 Full feature guide for every frontend, with examples: **[docs.md](docs.md)**. The frontend capability summary is under **[Frontends at a glance](docs.md#frontends-at-a-glance)**.
 
-> Status: M6e.1 passkeys (committed at `293caf1`). CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, encrypted attachments, item history reveal/compare/restore, safe backups, favorites/recents, tag and folder management, sorting/pagination, bulk actions, duplicate detection, device labels, password health, a local audit log, a standalone generator, and a polished Linux desktop with no-vault onboarding. Android includes the Tauri-mobile shell, login and TOTP autofill with system save prompts, QR/paste/deep-link TOTP capture, Android Keystore-backed biometric unlock, and Android 14+ passkeys through Credential Manager; APK build is verified, device smoke testing remains. M6e.1 adds synced passkey storage, a Chromium extension WebAuthn provider, and passkey management in the WebUI/CLI/desktop (Chrome manual matrix pending). The current development host is NixOS; see [Build from source](#build-from-source-linux-without-nix).
+> Status: M6e.1 passkeys (committed at `293caf1`). CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, encrypted attachments, item history reveal/compare/restore, safe backups, favorites/recents, tag and folder management, sorting/pagination, bulk actions, duplicate detection, device labels, password health, a local audit log, a standalone generator, and a polished Linux desktop with no-vault onboarding. Android includes the Tauri-mobile shell, login and TOTP autofill with system save prompts, QR/paste/deep-link TOTP capture, Android Keystore-backed biometric unlock, and Android 14+ passkeys through Credential Manager; APK build is verified, device smoke testing remains. M6e.1 adds synced passkey storage, a Chromium extension WebAuthn provider, and passkey management in the WebUI/CLI/desktop (Chrome manual matrix pending). The current development host is NixOS; see [Build from source](#build-from-source-linux).
 
 ## What glyx will do
 
@@ -50,7 +50,7 @@ nix build .#release-bundle
 tar -tzf result
 ```
 
-## Build from source (Linux, without Nix)
+## Build from source (Linux)
 
 This is the Arch Linux path used by the current development host. NixOS users
 can use the flake above. A detailed component-by-component guide is kept in
@@ -111,8 +111,55 @@ ln -sf glyx ~/.local/bin/git-credential-glyx
 
 Then run `glyx daemon start`, `glyx-tauri`, and load `apps/extension` in
 Chromium. `glyx extension install` + `glyx extension allow <id>` registers the
-native host. Android needs the SDK/NDK; see `docs.md` and
-`local/build-without-nix.md`.
+native host.
+
+### Android package
+
+The Android app is the `glyx-tauri` mobile shell. The APK bundles the WebUI
+(`cargo tauri android build` runs `pnpm --dir apps/webui build` for you) and
+needs JDK 17, Android SDK platform 36, Build-Tools 35 and 36, the NDK,
+`cargo-ndk`, and the `tauri-cli` from the toolchain step above.
+
+On NixOS, or any Linux host with Nix, the flake's FHS shell pins the SDK/NDK
+and AAPT2:
+
+```sh
+nix run .#android-fhs -- bash -lc \
+  'cd crates/glyx-tauri && cargo tauri android build --debug --apk -t aarch64'
+```
+
+On Arch or another Linux host set the SDK paths and add the Rust target:
+
+```sh
+export ANDROID_HOME="$HOME/Android/Sdk"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.0.12077973"
+export NDK_HOME="$ANDROID_NDK_HOME"
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+export PATH="${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/cmdline-tools/latest/bin:${PATH}"
+
+rustup target add aarch64-linux-android
+cd crates/glyx-tauri
+cargo tauri android build --debug --apk -t aarch64
+```
+
+The debug APK is written to
+`crates/glyx-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`:
+
+```sh
+adb install -r crates/glyx-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+```
+
+Use `--apk` without `--debug` for a release build; the result is unsigned
+(`.../apk/universal/release/app-universal-release-unsigned.apk`), so sign it
+with your own key before installing. Omit `-t aarch64` to build all four ABIs
+(several GB of disk and a much larger APK). The Android project is committed
+under `crates/glyx-tauri/gen/android`; do not re-run `cargo tauri android init`
+or the pinned Build-Tools/Gradle settings and manifest entries are lost.
+
+After installing, enable glyx as the autofill service and, on Android 14+, as a
+passkey provider; the glyx **Settings** page has an **Android integration** card
+with shortcuts. See `docs.md` §21 for runtime behavior and known limitations.
 
 ## Developer shells
 
