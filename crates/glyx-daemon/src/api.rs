@@ -222,6 +222,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/passkeys/create", post(passkey_create))
         .route("/v1/passkeys/get", post(passkey_get))
         .route("/v1/logins/match", post(match_login))
+        .route("/v1/logins/list", post(list_logins))
         .route("/v1/status", get(status))
         .route(
             "/v1/vaults",
@@ -1737,13 +1738,153 @@ async fn totp_code(
 
 #[derive(Deserialize)]
 struct MatchLoginBody {
+    #[serde(default)]
     origin: String,
+    #[serde(default)]
+    package: String,
     #[serde(default)]
     username: String,
 }
 
-fn host_matches(left: &str, right: &str) -> bool {
-    left == right || left.ends_with(&format!(".{right}")) || right.ends_with(&format!(".{left}"))
+#[derive(Deserialize)]
+struct ListLoginsBody {
+    #[serde(default)]
+    origin: String,
+    #[serde(default)]
+    package: String,
+    #[serde(default)]
+    username: String,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct LoginMatch {
+    id: String,
+    name: String,
+    username: String,
+    password: String,
+    url: String,
+    package: String,
+    has_totp: bool,
+    totp_item_id: Option<String>,
+}
+
+fn registrable_host(host: &str) -> String {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "localhost" || host.parse::<std::net::IpAddr>().is_ok() {
+        return host;
+    }
+    psl::domain_str(&host).map_or_else(|| host.clone(), ToOwned::to_owned)
+}
+
+fn host_matches(item_host: &str, page_host: &str) -> bool {
+    item_host == page_host || registrable_host(item_host) == registrable_host(page_host)
+}
+
+fn login_totp_item(
+    uv: &glyx_store::UnlockedVault,
+    item: &glyx_core::Item,
+    rows: &[glyx_store::IndexRow],
+) -> Option<String> {
+    if item.fields.contains_key("seed") {
+        return Some(item.id.to_string());
+    }
+    let login_id = item.id.to_string();
+    for row in rows {
+        if row.item_type != "totp" {
+            continue;
+        }
+        let Ok(Some(candidate)) = uv.get_item(&row.id) else {
+            continue;
+        };
+        if item_is_linked_to(&candidate, &login_id) {
+            return Some(candidate.id.to_string());
+        }
+    }
+    None
+}
+
+fn login_matches(
+    uv: &glyx_store::UnlockedVault,
+    rows: &[glyx_store::IndexRow],
+    origin: &str,
+    package: &str,
+    username: &str,
+    limit: usize,
+) -> Vec<LoginMatch> {
+    let page_host = url_host(origin);
+    let package = package.trim();
+    let username = username.trim();
+    let mut out: Vec<(u8, LoginMatch)> = Vec::new();
+    for row in rows {
+        if row.item_type != "login" {
+            continue;
+        }
+        let Ok(Some(item)) = uv.get_item(&row.id) else {
+            continue;
+        };
+        let item_host = item
+            .fields
+            .get("url")
+            .and_then(|field| url_host(field.value.expose()));
+        let item_package = item
+            .fields
+            .get("package")
+            .map_or("", |field| field.value.expose())
+            .trim();
+        let host_hit = page_host.as_ref().is_some_and(|page| {
+            item_host
+                .as_ref()
+                .is_some_and(|host| host_matches(host, page))
+        });
+        let package_hit = !package.is_empty() && item_package == package;
+        if !host_hit && !package_hit {
+            continue;
+        }
+        let item_username = item
+            .fields
+            .get("username")
+            .map_or("", |field| field.value.expose());
+        if !username.is_empty() && !item_username.eq_ignore_ascii_case(username) {
+            continue;
+        }
+        let rank = u8::from(
+            page_host
+                .as_ref()
+                .zip(item_host.as_ref())
+                .is_some_and(|(page, host)| page == host),
+        ) | (u8::from(package_hit) << 1);
+        let totp_item_id = login_totp_item(uv, &item, rows);
+        out.push((
+            rank,
+            LoginMatch {
+                id: item.id.to_string(),
+                name: item.name.clone(),
+                username: item_username.to_owned(),
+                password: item
+                    .fields
+                    .get("password")
+                    .map_or("", |field| field.value.expose())
+                    .to_owned(),
+                url: item
+                    .fields
+                    .get("url")
+                    .map_or("", |field| field.value.expose())
+                    .to_owned(),
+                package: item_package.to_owned(),
+                has_totp: totp_item_id.is_some(),
+                totp_item_id,
+            },
+        ));
+    }
+    out.sort_by(|(left_rank, left), (right_rank, right)| {
+        right_rank
+            .cmp(left_rank)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    out.truncate(limit);
+    out.into_iter().map(|(_, item)| item).collect()
 }
 
 async fn match_login(
@@ -1757,53 +1898,42 @@ async fn match_login(
     let Some(uv) = guard.as_ref() else {
         return locked_error().into_response();
     };
-    let Some(host) = url_host(&body.origin) else {
-        return Json(serde_json::json!({"match": null})).into_response();
+    let rows = match uv.list(false) {
+        Ok(rows) => rows,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    let matches = login_matches(uv, &rows, &body.origin, &body.package, &body.username, 1);
+    match matches.into_iter().next() {
+        Some(found) => Json(serde_json::json!({"match": found})).into_response(),
+        None => Json(serde_json::json!({"match": null})).into_response(),
+    }
+}
+
+async fn list_logins(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ListLoginsBody>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
     };
     let rows = match uv.list(false) {
         Ok(rows) => rows,
         Err(e) => return store_error(&e).into_response(),
     };
-    for row in rows {
-        if row.item_type != "login" {
-            continue;
-        }
-        let Ok(Some(item)) = uv.get_item(&row.id) else {
-            continue;
-        };
-        let Some(item_host) = item
-            .fields
-            .get("url")
-            .and_then(|field| url_host(field.value.expose()))
-        else {
-            continue;
-        };
-        if !host_matches(&item_host, &host) {
-            continue;
-        }
-        let username = item
-            .fields
-            .get("username")
-            .map_or("", |field| field.value.expose());
-        if !body.username.is_empty() && username != body.username.as_str() {
-            continue;
-        }
-        let password = item
-            .fields
-            .get("password")
-            .map_or("", |field| field.value.expose());
-        return Json(serde_json::json!({
-            "match": {
-                "id": item.id,
-                "name": item.name,
-                "username": username,
-                "url": item.fields.get("url").map_or("", |field| field.value.expose()),
-                "password": password,
-            }
-        }))
-        .into_response();
-    }
-    Json(serde_json::json!({"match": null})).into_response()
+    let limit = body.limit.unwrap_or(20).clamp(1, 50);
+    let matches = login_matches(
+        uv,
+        &rows,
+        &body.origin,
+        &body.package,
+        &body.username,
+        limit,
+    );
+    Json(serde_json::json!({"matches": matches})).into_response()
 }
 
 fn url_host(url: &str) -> Option<String> {
@@ -5212,6 +5342,125 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["match"].is_null());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn login_list_matches_domain_package_and_totp() {
+        let cfg = tempfile::tempdir().expect("config dir");
+        std::env::set_var("GLYX_CONFIG", cfg.path().join("config.toml"));
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": "pw", "keyfile": kf_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/items",
+            Some(serde_json::json!({
+                "type": "login",
+                "name": "example.com",
+                "fields": {
+                    "username": "alice",
+                    "password": "secret",
+                    "url": "https://example.com",
+                    "package": "com.example.app"
+                }
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let login_id = body["id"].as_str().expect("login id").to_owned();
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/items",
+            Some(serde_json::json!({
+                "type": "totp",
+                "name": "example totp",
+                "fields": {
+                    "seed": "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+                    "login_id": login_id
+                }
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let totp_id = body["id"].as_str().expect("totp id").to_owned();
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/logins/list",
+            Some(serde_json::json!({"origin": "https://login.example.com"})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let matches = body["matches"].as_array().expect("matches");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["username"], "alice");
+        assert_eq!(matches[0]["password"], "secret");
+        assert_eq!(matches[0]["has_totp"], true);
+        assert_eq!(matches[0]["totp_item_id"], totp_id);
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/logins/list",
+            Some(serde_json::json!({"package": "com.example.app"})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["matches"].as_array().expect("matches").len(), 1);
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/logins/list",
+            Some(serde_json::json!({"origin": "https://other.example"})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["matches"].as_array().expect("matches").is_empty());
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/logins/match",
+            Some(serde_json::json!({
+                "origin": "https://example.com",
+                "username": "ALICE"
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["match"]["username"], "alice");
+
+        let (status, body) = call(
+            state,
+            "POST",
+            "/v1/logins/match",
+            Some(serde_json::json!({"package": "com.example.app"})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["match"]["username"], "alice");
     }
 
     #[tokio::test]

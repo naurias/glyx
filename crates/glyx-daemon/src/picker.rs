@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 
 #[derive(Debug, Clone, Copy)]

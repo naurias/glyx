@@ -24,6 +24,11 @@ const LOGIN: &[FieldSpec] = &[
         required: false,
     },
     FieldSpec {
+        name: "package",
+        secret: false,
+        required: false,
+    },
+    FieldSpec {
         name: "notes",
         secret: false,
         required: false,

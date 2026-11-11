@@ -10,27 +10,29 @@ import android.service.autofill.FillCallback
 import android.service.autofill.FillRequest
 import android.service.autofill.FillResponse
 import android.service.autofill.SaveCallback
+import android.service.autofill.SaveInfo
 import android.service.autofill.SaveRequest
 import android.text.InputType
 import android.view.View
 import android.view.autofill.AutofillId
 import android.view.autofill.AutofillValue
 import android.widget.RemoteViews
-import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
-import java.net.URLEncoder
 
 class GlyxAutofillService : AutofillService() {
   private data class Fields(
     var username: AutofillId? = null,
     var password: AutofillId? = null,
     var webDomain: String? = null,
+    var usernameValue: String = "",
+    var passwordValue: String = "",
   )
 
-  private data class Item(
+  private data class Login(
+    val id: String,
     val name: String,
     val username: String,
     val password: String,
@@ -70,45 +72,73 @@ class GlyxAutofillService : AutofillService() {
       return
     }
     Thread {
-      val items = queryItems(session, fields.webDomain, targetPackage)
-      callback.onSuccess(
-        when {
-          items == null -> unlockResponse(fields)
-          items.isEmpty() -> null
-          else -> buildResponse(fields, items)
-        }
-      )
+      val matches = queryLogins(session, fields.webDomain, targetPackage)
+      val response = when {
+        matches == null -> unlockResponse(fields)
+        matches.isEmpty() -> saveOnlyResponse(fields)
+        else -> buildResponse(fields, matches)
+      }
+      callback.onSuccess(response)
     }.start()
   }
 
   override fun onSaveRequest(request: SaveRequest, callback: SaveCallback) {
-    callback.onSuccess()
+    val structure = request.fillContexts.lastOrNull()?.structure
+    if (structure == null) {
+      callback.onSuccess()
+      return
+    }
+    val fields = Fields()
+    if (structure.windowNodeCount > 0) {
+      walkValues(structure.getWindowNodeAt(0).rootViewNode, fields)
+    }
+    val targetPackage = structure.activityComponent?.packageName ?: return callback.onSuccess()
+    if (targetPackage == packageName) {
+      callback.onSuccess()
+      return
+    }
+    if (fields.passwordValue.isBlank()) {
+      callback.onSuccess()
+      return
+    }
+    val session = readSession()
+    if (session == null) {
+      callback.onFailure("glyx is locked; unlock and try again")
+      return
+    }
+    Thread {
+      if (saveLogin(session, fields, targetPackage)) {
+        callback.onSuccess()
+      } else {
+        callback.onFailure("could not save to glyx")
+      }
+    }.start()
   }
 
   private fun walk(node: android.app.assist.AssistStructure.ViewNode?, fields: Fields) {
     if (node == null) return
+    if (node.visibility != View.VISIBLE || !node.isEnabled) return
     node.webDomain?.let { fields.webDomain = it }
     val hints = node.autofillHints.orEmpty()
-    if (hints.any {
-        it == View.AUTOFILL_HINT_USERNAME || it == View.AUTOFILL_HINT_EMAIL_ADDRESS
-      }
-    ) {
-      fields.username = node.autofillId
-    }
-    if (hints.any { it == View.AUTOFILL_HINT_PASSWORD }) {
-      fields.password = node.autofillId
-    }
     val inputType = node.inputType
-    if (fields.password == null &&
-      (inputType and InputType.TYPE_TEXT_VARIATION_PASSWORD == InputType.TYPE_TEXT_VARIATION_PASSWORD ||
-        inputType and InputType.TYPE_NUMBER_VARIATION_PASSWORD == InputType.TYPE_NUMBER_VARIATION_PASSWORD)
-    ) {
+    val passwordField =
+      hints.any { it == View.AUTOFILL_HINT_PASSWORD || it == "newPassword" } ||
+        (inputType and InputType.TYPE_TEXT_VARIATION_PASSWORD) ==
+          InputType.TYPE_TEXT_VARIATION_PASSWORD ||
+        (inputType and InputType.TYPE_NUMBER_VARIATION_PASSWORD) ==
+          InputType.TYPE_NUMBER_VARIATION_PASSWORD
+    val usernameField =
+      hints.any {
+        it == View.AUTOFILL_HINT_USERNAME || it == View.AUTOFILL_HINT_EMAIL_ADDRESS
+      } ||
+        (inputType and InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS) ==
+          InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS ||
+        (inputType and InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS) ==
+          InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS
+    if (passwordField && fields.password == null) {
       fields.password = node.autofillId
     }
-    if (fields.username == null &&
-      (inputType and InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS == InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS ||
-        inputType and InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS == InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS)
-    ) {
+    if (!passwordField && usernameField && fields.username == null) {
       fields.username = node.autofillId
     }
     for (index in 0 until node.childCount) {
@@ -116,11 +146,46 @@ class GlyxAutofillService : AutofillService() {
     }
   }
 
-  private fun buildResponse(fields: Fields, items: List<Item>): FillResponse? {
+  private fun walkValues(node: android.app.assist.AssistStructure.ViewNode?, fields: Fields) {
+    if (node == null) return
+    if (node.visibility != View.VISIBLE || !node.isEnabled) return
+    node.webDomain?.let { fields.webDomain = it }
+    val hints = node.autofillHints.orEmpty()
+    val inputType = node.inputType
+    val passwordField =
+      hints.any { it == View.AUTOFILL_HINT_PASSWORD || it == "newPassword" } ||
+        (inputType and InputType.TYPE_TEXT_VARIATION_PASSWORD) ==
+          InputType.TYPE_TEXT_VARIATION_PASSWORD ||
+        (inputType and InputType.TYPE_NUMBER_VARIATION_PASSWORD) ==
+          InputType.TYPE_NUMBER_VARIATION_PASSWORD
+    val usernameField =
+      hints.any {
+        it == View.AUTOFILL_HINT_USERNAME || it == View.AUTOFILL_HINT_EMAIL_ADDRESS
+      } ||
+        (inputType and InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS) ==
+          InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS ||
+        (inputType and InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS) ==
+          InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS
+    if (passwordField && fields.password == null) {
+      fields.password = node.autofillId
+      fields.passwordValue = node.autofillValue?.textValue?.toString().orEmpty()
+    }
+    if (!passwordField && usernameField && fields.username == null) {
+      fields.username = node.autofillId
+      fields.usernameValue = node.autofillValue?.textValue?.toString().orEmpty()
+    }
+    for (index in 0 until node.childCount) {
+      walkValues(node.getChildAt(index), fields)
+    }
+  }
+
+  private fun buildResponse(fields: Fields, items: List<Login>): FillResponse? {
     val response = FillResponse.Builder()
+    var added = 0
     for (item in items) {
       val presentation = RemoteViews(packageName, R.layout.autofill_item).apply {
         setTextViewText(R.id.autofill_label, item.name)
+        setTextViewText(R.id.autofill_detail, item.username.ifEmpty { "glyx" })
       }
       val dataset = Dataset.Builder(presentation)
       var hasValue = false
@@ -136,9 +201,31 @@ class GlyxAutofillService : AutofillService() {
           hasValue = true
         }
       }
-      if (hasValue) response.addDataset(dataset.build())
+      if (hasValue) {
+        response.addDataset(dataset.build())
+        added++
+      }
     }
+    if (added == 0) return saveOnlyResponse(fields)
+    saveInfo(fields)?.let { response.setSaveInfo(it) }
     return runCatching { response.build() }.getOrNull()
+  }
+
+  private fun saveOnlyResponse(fields: Fields): FillResponse? {
+    val info = saveInfo(fields) ?: return null
+    return runCatching { FillResponse.Builder().setSaveInfo(info).build() }.getOrNull()
+  }
+
+  private fun saveInfo(fields: Fields): SaveInfo? {
+    val ids = listOfNotNull(fields.username, fields.password)
+    if (ids.isEmpty()) return null
+    val type = when {
+      fields.username != null && fields.password != null ->
+        SaveInfo.SAVE_DATA_TYPE_USERNAME or SaveInfo.SAVE_DATA_TYPE_PASSWORD
+      fields.username != null -> SaveInfo.SAVE_DATA_TYPE_USERNAME
+      else -> SaveInfo.SAVE_DATA_TYPE_PASSWORD
+    }
+    return runCatching { SaveInfo.Builder(type, ids.toTypedArray()).build() }.getOrNull()
   }
 
   private fun unlockResponse(fields: Fields): FillResponse? {
@@ -154,6 +241,7 @@ class GlyxAutofillService : AutofillService() {
     )
     val presentation = RemoteViews(packageName, R.layout.autofill_item).apply {
       setTextViewText(R.id.autofill_label, "Unlock glyx")
+      setTextViewText(R.id.autofill_detail, "Unlock the vault to fill")
     }
     return runCatching {
       FillResponse.Builder()
@@ -173,42 +261,119 @@ class GlyxAutofillService : AutofillService() {
     }.getOrNull()
   }
 
-  private fun queryItems(
+  private fun queryLogins(
     session: Session,
     webDomain: String?,
     targetPackage: String,
-  ): List<Item>? {
-    val query = URLEncoder.encode(webDomain ?: targetPackage, "UTF-8")
-    val list = getJson(session, "/v1/items?type=login&limit=20&q=$query") as? JSONArray ?: return null
-    val out = ArrayList<Item>()
-    for (index in 0 until list.length()) {
-      val row = list.optJSONObject(index) ?: continue
+  ): List<Login>? {
+    val body = JSONObject().apply {
+      if (webDomain != null) {
+        put("origin", "https://$webDomain")
+      } else {
+        put("package", targetPackage)
+      }
+      put("limit", 10)
+    }
+    val response = requestJson(session, "POST", "/v1/logins/list", body) ?: return null
+    val matches = response.optJSONArray("matches") ?: return emptyList()
+    val out = ArrayList<Login>()
+    for (index in 0 until matches.length()) {
+      val row = matches.optJSONObject(index) ?: continue
       val id = row.optString("id")
       if (id.isBlank()) continue
-      val detail = getJson(session, "/v1/items/$id?reveal=true") as? JSONObject ?: continue
-      val fields = detail.optJSONObject("fields") ?: continue
-      val username = fields.optString("username")
-      val password = fields.optString("password")
-      if (username.isBlank() && password.isBlank()) continue
-      out.add(Item(detail.optString("name", "glyx"), username, password))
+      out.add(
+        Login(
+          id = id,
+          name = row.optString("name", "glyx"),
+          username = row.optString("username"),
+          password = row.optString("password"),
+        )
+      )
       if (out.size >= 10) break
     }
     return out
   }
 
-  private fun getJson(session: Session, path: String): Any? {
+  private fun saveLogin(session: Session, fields: Fields, targetPackage: String): Boolean {
+    val host = fields.webDomain?.trim()?.lowercase()
+    val packageName = if (host == null) targetPackage else ""
+    val url = if (host != null) "https://$host" else ""
+    val username = fields.usernameValue.trim()
+    val password = fields.passwordValue
+    if (username.isEmpty() && password.isEmpty()) return true
+    val matchBody = JSONObject().apply {
+      if (host != null) put("origin", url)
+      if (packageName.isNotEmpty()) put("package", packageName)
+      put("username", username)
+    }
+    val match = requestJson(session, "POST", "/v1/logins/match", matchBody)
+      ?.optJSONObject("match")
+    if (match != null) {
+      val id = match.optString("id")
+      if (id.isBlank()) return false
+      if (match.optString("password") == password) return true
+      val body = JSONObject().put(
+        "fields",
+        JSONObject().apply {
+          put("username", username)
+          put("password", password)
+          if (url.isNotEmpty()) put("url", url)
+          if (packageName.isNotEmpty()) put("package", packageName)
+        },
+      )
+      return requestJson(session, "PATCH", "/v1/items/$id", body) != null
+    }
+    if (username.isEmpty()) return true
+    val name = host ?: appLabel(targetPackage) ?: targetPackage
+    val body = JSONObject()
+      .put("type", "login")
+      .put("name", name)
+      .put(
+        "fields",
+        JSONObject().apply {
+          put("username", username)
+          put("password", password)
+          if (url.isNotEmpty()) put("url", url)
+          if (packageName.isNotEmpty()) put("package", packageName)
+        },
+      )
+    return requestJson(session, "POST", "/v1/items", body) != null
+  }
+
+  private fun appLabel(packageName: String): String? = runCatching {
+    val info = packageManager.getApplicationInfo(packageName, 0)
+    packageManager.getApplicationLabel(info).toString()
+  }.getOrNull()
+
+  private fun requestJson(
+    session: Session,
+    method: String,
+    path: String,
+    body: JSONObject? = null,
+  ): JSONObject? {
     var connection: HttpURLConnection? = null
     return try {
-      connection = (URL(session.url + path).openConnection() as HttpURLConnection).apply {
-        requestMethod = "GET"
+      val conn = (URL(session.url + path).openConnection() as HttpURLConnection).apply {
+        requestMethod = method
         setRequestProperty("Authorization", "Bearer ${session.token}")
         setRequestProperty("Accept", "application/json")
         connectTimeout = 1500
         readTimeout = 2500
+        if (body != null) {
+          doOutput = true
+          setRequestProperty("Content-Type", "application/json")
+        }
       }
-      if (connection.responseCode != HttpURLConnection.HTTP_OK) return null
-      val body = connection.inputStream.bufferedReader().use { it.readText() }
-      if (body.trimStart().startsWith("[")) JSONArray(body) else JSONObject(body)
+      connection = conn
+      if (body != null) {
+        conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+      }
+      if (conn.responseCode !in 200..299) {
+        null
+      } else {
+        val text = conn.inputStream.bufferedReader().use { it.readText() }
+        if (text.isBlank()) JSONObject() else JSONObject(text)
+      }
     } catch (_: Exception) {
       null
     } finally {

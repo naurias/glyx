@@ -192,18 +192,39 @@ fn write_mobile_session(data_dir: &std::path::Path, port: u16, token: &str) {
 }
 
 #[cfg(mobile)]
+#[derive(Clone)]
+struct MobileSession {
+    url: String,
+    token: String,
+}
+
+#[cfg(mobile)]
+static MOBILE_SESSION: std::sync::Mutex<Option<MobileSession>> = std::sync::Mutex::new(None);
+
+#[cfg(mobile)]
 fn remove_mobile_session(app: &tauri::AppHandle) {
     if let Ok(data_dir) = app.path().app_data_dir() {
         let _ = std::fs::remove_file(mobile_session_path(&data_dir));
     }
+    let mut guard = MOBILE_SESSION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = None;
 }
 
 #[cfg(mobile)]
-fn mobile_script(app: &tauri::AppHandle) -> String {
+fn ensure_mobile_daemon(data_dir: &std::path::Path) -> Result<MobileSession, String> {
     use std::fmt::Write as _;
-    let data_dir = mobile_data_dir(app);
+    {
+        let guard = MOBILE_SESSION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(session) = guard.as_ref() {
+            return Ok(session.clone());
+        }
+    }
     let runtime_dir = data_dir.join("runtime");
-    let _ = std::fs::create_dir_all(&runtime_dir);
+    std::fs::create_dir_all(&runtime_dir).map_err(|e| e.to_string())?;
     std::env::set_var("GLYX_CONFIG", data_dir.join("config.toml"));
     std::env::set_var("GLYX_RUNTIME_DIR", &runtime_dir);
     let mut bytes = [0u8; 32];
@@ -223,6 +244,7 @@ fn mobile_script(app: &tauri::AppHandle) -> String {
             Ok(rt) => rt,
             Err(e) => {
                 eprintln!("glyx mobile runtime failed: {e}");
+                let _ = tx.send(0);
                 return;
             }
         };
@@ -234,26 +256,46 @@ fn mobile_script(app: &tauri::AppHandle) -> String {
                         eprintln!("glyx mobile daemon stopped: {e}");
                     }
                 }
-                Err(e) => eprintln!("glyx mobile daemon failed: {e}"),
+                Err(e) => {
+                    eprintln!("glyx mobile daemon failed: {e}");
+                    let _ = tx.send(0);
+                }
             }
         });
     });
     let port = rx
         .recv_timeout(std::time::Duration::from_secs(10))
-        .unwrap_or(0);
+        .map_err(|_| "mobile daemon did not start within 10s".to_owned())?;
     if port == 0 {
-        return format!(
-            "window.__GLYX_MOBILE__=true;{}",
-            bootstrap_error_script("mobile daemon did not start within 10s")
-        );
+        return Err("mobile daemon did not bind".to_owned());
     }
-    write_mobile_session(&data_dir, port, &token);
-    format!(
-        "window.__GLYX__={{url:{},token:{},mobile:true,dataDir:{}}};",
-        serde_json::to_string(&format!("http://127.0.0.1:{port}")).unwrap_or_else(|_| "''".into()),
-        serde_json::to_string(&token).unwrap_or_else(|_| "''".into()),
-        serde_json::to_string(&data_dir.to_string_lossy()).unwrap_or_else(|_| "''".into())
-    )
+    let session = MobileSession {
+        url: format!("http://127.0.0.1:{port}"),
+        token,
+    };
+    write_mobile_session(data_dir, port, &session.token);
+    let mut guard = MOBILE_SESSION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(session.clone());
+    Ok(session)
+}
+
+#[cfg(mobile)]
+fn mobile_script(app: &tauri::AppHandle) -> String {
+    let data_dir = mobile_data_dir(app);
+    match ensure_mobile_daemon(&data_dir) {
+        Ok(session) => format!(
+            "window.__GLYX__={{url:{},token:{},mobile:true,dataDir:{}}};",
+            serde_json::to_string(&session.url).unwrap_or_else(|_| "''".into()),
+            serde_json::to_string(&session.token).unwrap_or_else(|_| "''".into()),
+            serde_json::to_string(&data_dir.to_string_lossy()).unwrap_or_else(|_| "''".into())
+        ),
+        Err(error) => format!(
+            "window.__GLYX_MOBILE__=true;{}",
+            bootstrap_error_script(&error)
+        ),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
