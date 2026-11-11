@@ -38,24 +38,35 @@ class GlyxCredentialProviderService : CredentialProviderService() {
     cancellationSignal: CancellationSignal,
     callback: OutcomeReceiver<BeginCreateCredentialResponse, CreateCredentialException>,
   ) {
-    if (request !is BeginCreatePublicKeyCredentialRequest || !GlyxClient.unlocked(this)) {
+    if (request !is BeginCreatePublicKeyCredentialRequest) {
       callback.onResult(BeginCreateCredentialResponse(emptyList()))
       return
     }
-    val intent = Intent(this, PasskeyCreateActivity::class.java).setAction(ACTION_CREATE)
-    val pending = PendingIntent.getActivity(
-      this,
-      1001,
-      intent,
-      PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-    )
-    val entry = CreateEntry(
-      accountName = "glyx",
-      pendingIntent = pending,
-      description = getString(R.string.credential_provider_label),
-      icon = Icon.createWithResource(this, R.mipmap.ic_launcher),
-    )
-    callback.onResult(BeginCreateCredentialResponse(listOf(entry)))
+    val rpName = runCatching {
+      JSONObject(request.requestJson).optJSONObject("rp")?.optString("name").orEmpty()
+    }.getOrDefault("")
+    Thread {
+      val response = runCatching {
+        if (!GlyxClient.unlocked(this)) {
+          BeginCreateCredentialResponse(emptyList())
+        } else {
+          val pending = PendingIntent.getActivity(
+            this,
+            1001,
+            Intent(this, PasskeyCreateActivity::class.java).setAction(ACTION_CREATE),
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+          )
+          val entry = CreateEntry(
+            accountName = if (rpName.isBlank()) "glyx" else rpName,
+            pendingIntent = pending,
+            description = getString(R.string.credential_provider_label),
+            icon = Icon.createWithResource(this, R.mipmap.ic_launcher),
+          )
+          BeginCreateCredentialResponse(listOf(entry))
+        }
+      }.getOrElse { BeginCreateCredentialResponse(emptyList()) }
+      callback.onResult(response)
+    }.start()
   }
 
   override fun onBeginGetCredentialRequest(
@@ -63,62 +74,73 @@ class GlyxCredentialProviderService : CredentialProviderService() {
     cancellationSignal: CancellationSignal,
     callback: OutcomeReceiver<BeginGetCredentialResponse, GetCredentialException>,
   ) {
-    val session = GlyxClient.readSession(this)
-    if (session == null || !GlyxClient.unlocked(this)) {
-      callback.onResult(
-        BeginGetCredentialResponse(authenticationActions = listOf(unlockAction()))
-      )
-      return
-    }
     Thread {
-      val entries = mutableListOf<CredentialEntry>()
-      val icon = Icon.createWithResource(this, R.mipmap.ic_launcher)
-      for (option in request.beginGetCredentialOptions) {
-        if (option !is BeginGetPublicKeyCredentialOption) continue
-        val requestJson = runCatching { JSONObject(option.requestJson) }.getOrNull() ?: continue
-        val rpId = requestJson.optString("rpId")
-        if (rpId.isBlank()) continue
-        val allow = requestJson.optJSONArray("allowCredentials") ?: JSONArray()
-        val ids = JSONArray()
-        for (index in 0 until allow.length()) {
-          val id = allow.optJSONObject(index)?.optString("id").orEmpty()
-          if (id.isNotEmpty()) ids.put(id)
+      val response = runCatching {
+        val session = GlyxClient.readSession(this)
+        if (session == null || !GlyxClient.unlocked(this)) {
+          BeginGetCredentialResponse(authenticationActions = listOf(unlockAction()))
+        } else {
+          BeginGetCredentialResponse(lookupEntries(session, request))
         }
-        val body = JSONObject()
-          .put("origin", PasskeyOrigin.forCallingApp(this, request.callingAppInfo))
-          .put("rp_id", rpId)
-          .put("allow_credentials", ids)
-        val raw = GlyxClient.requestRaw(session, "POST", "/v1/passkeys/lookup", body) ?: continue
-        val matches = runCatching { JSONArray(raw) }.getOrNull() ?: continue
-        for (index in 0 until matches.length()) {
-          val row = matches.optJSONObject(index) ?: continue
-          val itemId = row.optString("item_id")
-          if (itemId.isBlank()) continue
-          val pending = PendingIntent.getActivity(
-            this,
-            2000 + (itemId.hashCode() and 0xFFFF),
-            Intent(this, PasskeyGetActivity::class.java)
-              .setAction(ACTION_GET)
-              .putExtra(EXTRA_ITEM_ID, itemId)
-              .putExtra(EXTRA_CREDENTIAL_ID, row.optString("credential_id")),
-            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-          )
-          val username = row.optString("user_name").ifEmpty { row.optString("name") }
-          val display = row.optString("display_name").ifEmpty { username }
-          entries.add(
-            PublicKeyCredentialEntry(
-              context = this,
-              username = username,
-              pendingIntent = pending,
-              beginGetPublicKeyCredentialOption = option,
-              displayName = display,
-              icon = icon,
-            )
-          )
-        }
+      }.getOrElse {
+        BeginGetCredentialResponse(authenticationActions = listOf(unlockAction()))
       }
-      callback.onResult(BeginGetCredentialResponse(entries))
+      callback.onResult(response)
     }.start()
+  }
+
+  private fun lookupEntries(
+    session: GlyxSession,
+    request: BeginGetCredentialRequest,
+  ): List<CredentialEntry> {
+    val entries = mutableListOf<CredentialEntry>()
+    val icon = Icon.createWithResource(this, R.mipmap.ic_launcher)
+    val origin = PasskeyOrigin.forCallingApp(this, request.callingAppInfo)
+    for (option in request.beginGetCredentialOptions) {
+      if (option !is BeginGetPublicKeyCredentialOption) continue
+      val requestJson = runCatching { JSONObject(option.requestJson) }.getOrNull() ?: continue
+      val rpId = requestJson.optString("rpId")
+      if (rpId.isBlank()) continue
+      val allow = requestJson.optJSONArray("allowCredentials") ?: JSONArray()
+      val ids = JSONArray()
+      for (index in 0 until allow.length()) {
+        val id = allow.optJSONObject(index)?.optString("id").orEmpty()
+        if (id.isNotEmpty()) ids.put(id)
+      }
+      val body = JSONObject()
+        .put("origin", origin)
+        .put("rp_id", rpId)
+        .put("allow_credentials", ids)
+      val raw = GlyxClient.requestRaw(session, "POST", "/v1/passkeys/lookup", body) ?: continue
+      val matches = runCatching { JSONArray(raw) }.getOrNull() ?: continue
+      for (index in 0 until matches.length()) {
+        val row = matches.optJSONObject(index) ?: continue
+        val itemId = row.optString("item_id")
+        if (itemId.isBlank()) continue
+        val pending = PendingIntent.getActivity(
+          this,
+          2000 + (itemId.hashCode() and 0xFFFF),
+          Intent(this, PasskeyGetActivity::class.java)
+            .setAction(ACTION_GET)
+            .putExtra(EXTRA_ITEM_ID, itemId)
+            .putExtra(EXTRA_CREDENTIAL_ID, row.optString("credential_id")),
+          PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val username = row.optString("user_name").ifEmpty { row.optString("name") }
+        val display = row.optString("display_name").ifEmpty { username }
+        entries.add(
+          PublicKeyCredentialEntry(
+            context = this,
+            username = username,
+            pendingIntent = pending,
+            beginGetPublicKeyCredentialOption = option,
+            displayName = display,
+            icon = icon,
+          )
+        )
+      }
+    }
+    return entries
   }
 
   override fun onClearCredentialStateRequest(
