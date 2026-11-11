@@ -223,6 +223,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/passkeys/get", post(passkey_get))
         .route("/v1/logins/match", post(match_login))
         .route("/v1/logins/list", post(list_logins))
+        .route("/v1/totp/parse", post(totp_parse))
+        .route("/v1/totp/list", post(list_totp))
         .route("/v1/status", get(status))
         .route(
             "/v1/vaults",
@@ -1933,6 +1935,195 @@ async fn list_logins(
         &body.username,
         limit,
     );
+    Json(serde_json::json!({"matches": matches})).into_response()
+}
+
+#[derive(Deserialize)]
+struct TotpParseBody {
+    uri: String,
+    #[serde(default)]
+    digits: Option<usize>,
+    #[serde(default)]
+    period: Option<u64>,
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                out.push(high * 16 + low);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn totp_label(uri: &str) -> (String, String) {
+    let Some(rest) = uri.strip_prefix("otpauth://totp/") else {
+        return (String::new(), String::new());
+    };
+    let label = percent_decode(rest.split('?').next().unwrap_or_default());
+    let (label_issuer, account) = label.split_once(':').map_or_else(
+        || (String::new(), label.clone()),
+        |(issuer, account)| (issuer.trim().to_owned(), account.trim().to_owned()),
+    );
+    let query_issuer = uri
+        .split('?')
+        .nth(1)
+        .and_then(|query| {
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("issuer="))
+        })
+        .map(percent_decode)
+        .unwrap_or_default();
+    let issuer = if query_issuer.is_empty() {
+        label_issuer
+    } else {
+        query_issuer
+    };
+    (issuer, account)
+}
+
+async fn totp_parse(Json(body): Json<TotpParseBody>) -> impl IntoResponse {
+    let raw = body.uri.trim();
+    if raw.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "missing uri"})),
+        )
+            .into_response();
+    }
+    let params = if raw.starts_with("otpauth://") {
+        glyx_crypto::totp::params_from_uri(raw)
+    } else {
+        let step = body.period.unwrap_or(30);
+        let digits = body.digits.unwrap_or(6);
+        glyx_crypto::totp::seed_from_b32(raw).map(|seed| glyx_crypto::TotpParams {
+            seed,
+            step,
+            digits,
+        })
+    };
+    match params {
+        Ok(params) => {
+            let (issuer, account) = totp_label(raw);
+            Json(serde_json::json!({
+                "ok": true,
+                "issuer": issuer,
+                "account": account,
+                "digits": params.digits,
+                "period": params.step,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ListTotpBody {
+    #[serde(default)]
+    origin: String,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct TotpMatch {
+    id: String,
+    name: String,
+    url: String,
+}
+
+fn totp_matches(
+    uv: &glyx_store::UnlockedVault,
+    rows: &[glyx_store::IndexRow],
+    origin: &str,
+    limit: usize,
+) -> Vec<TotpMatch> {
+    let Some(page_host) = url_host(origin) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        if row.item_type != "totp" {
+            continue;
+        }
+        let Ok(Some(item)) = uv.get_item(&row.id) else {
+            continue;
+        };
+        if item
+            .fields
+            .get("login_id")
+            .is_some_and(|field| !field.value.expose().trim().is_empty())
+        {
+            continue;
+        }
+        let Some(item_host) = item
+            .fields
+            .get("url")
+            .and_then(|field| url_host(field.value.expose()))
+        else {
+            continue;
+        };
+        if !host_matches(&item_host, &page_host) {
+            continue;
+        }
+        out.push(TotpMatch {
+            id: item.id.to_string(),
+            name: item.name.clone(),
+            url: item
+                .fields
+                .get("url")
+                .map_or("", |field| field.value.expose())
+                .to_owned(),
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+async fn list_totp(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ListTotpBody>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let rows = match uv.list(false) {
+        Ok(rows) => rows,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    let limit = body.limit.unwrap_or(10).clamp(1, 50);
+    let matches = totp_matches(uv, &rows, &body.origin, limit);
     Json(serde_json::json!({"matches": matches})).into_response()
 }
 
@@ -5402,6 +5593,23 @@ mod tests {
         let (status, body) = call(
             state.clone(),
             "POST",
+            "/v1/items",
+            Some(serde_json::json!({
+                "type": "totp",
+                "name": "standalone",
+                "fields": {
+                    "seed": "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+                    "url": "https://example.com"
+                }
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
             "/v1/logins/list",
             Some(serde_json::json!({"origin": "https://login.example.com"})),
             "test-token",
@@ -5440,6 +5648,19 @@ mod tests {
         let (status, body) = call(
             state.clone(),
             "POST",
+            "/v1/totp/list",
+            Some(serde_json::json!({"origin": "https://login.example.com"})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let totp_matches = body["matches"].as_array().expect("totp matches");
+        assert_eq!(totp_matches.len(), 1);
+        assert_eq!(totp_matches[0]["name"], "standalone");
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
             "/v1/logins/match",
             Some(serde_json::json!({
                 "origin": "https://example.com",
@@ -5461,6 +5682,52 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["match"]["username"], "alice");
+    }
+
+    #[tokio::test]
+    async fn parses_totp_uris_and_setup_keys() {
+        let (_d, state) = test_state();
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/totp/parse",
+            Some(serde_json::json!({
+                "uri": "otpauth://totp/Example:alice%40example.com?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=Example&period=30&digits=6"
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["issuer"], "Example");
+        assert_eq!(body["account"], "alice@example.com");
+        assert_eq!(body["digits"], 6);
+        assert_eq!(body["period"], 30);
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/totp/parse",
+            Some(serde_json::json!({
+                "uri": "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP",
+                "digits": 8,
+                "period": 60
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["digits"], 8);
+        assert_eq!(body["period"], 60);
+
+        let (status, _) = call(
+            state,
+            "POST",
+            "/v1/totp/parse",
+            Some(serde_json::json!({"uri": "!!!!"})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

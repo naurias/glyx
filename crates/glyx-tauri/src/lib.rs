@@ -285,12 +285,21 @@ fn ensure_mobile_daemon(data_dir: &std::path::Path) -> Result<MobileSession, Str
 fn mobile_script(app: &tauri::AppHandle) -> String {
     let data_dir = mobile_data_dir(app);
     match ensure_mobile_daemon(&data_dir) {
-        Ok(session) => format!(
-            "window.__GLYX__={{url:{},token:{},mobile:true,dataDir:{}}};",
-            serde_json::to_string(&session.url).unwrap_or_else(|_| "''".into()),
-            serde_json::to_string(&session.token).unwrap_or_else(|_| "''".into()),
-            serde_json::to_string(&data_dir.to_string_lossy()).unwrap_or_else(|_| "''".into())
-        ),
+        Ok(session) => {
+            let mut script = format!(
+                "window.__GLYX__={{url:{},token:{},mobile:true,dataDir:{}}};",
+                serde_json::to_string(&session.url).unwrap_or_else(|_| "''".into()),
+                serde_json::to_string(&session.token).unwrap_or_else(|_| "''".into()),
+                serde_json::to_string(&data_dir.to_string_lossy()).unwrap_or_else(|_| "''".into())
+            );
+            #[cfg(all(mobile, target_os = "android"))]
+            if let Some(uri) = crate::mobile::take_pending_link() {
+                if let Ok(encoded) = serde_json::to_string(&uri) {
+                    script.push_str(&format!("window.__GLYX_OTPAUTH__={encoded};"));
+                }
+            }
+            script
+        }
         Err(error) => format!(
             "window.__GLYX_MOBILE__=true;{}",
             bootstrap_error_script(&error)
@@ -344,6 +353,11 @@ pub fn run() {
             }
             #[cfg(mobile)]
             {
+                #[cfg(target_os = "android")]
+                {
+                    mobile::install_link_listener(app.handle());
+                    mobile::capture_initial_link(app.handle());
+                }
                 let script = mobile_script(app.handle());
                 tauri::WebviewWindowBuilder::new(
                     app,

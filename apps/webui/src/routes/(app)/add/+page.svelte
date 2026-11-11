@@ -5,6 +5,8 @@
   import ItemForm from '$lib/ItemForm.svelte';
   import PointerEditor from '$lib/components/PointerEditor.svelte';
   import PageHeader from '$lib/components/PageHeader.svelte';
+  import { parseOtpauth } from '$lib/totp.js';
+  import { totpCapture } from '$lib/totp-capture.js';
 
   let templates = [];
   let item_type = 'login';
@@ -16,6 +18,7 @@
   let pointerFields = {};
   let pointerTags = '';
   let pointerEditor = null;
+  let totpSeed = '';
 
   const labels = {
     login: ['Login', 'Username, password, URL, and notes'],
@@ -30,19 +33,44 @@
     pointer: ['Pointer', 'Named aliases to other item fields']
   };
 
-  onMount(async () => {
+  onMount(() => {
+    const stop = totpCapture.subscribe((uri) => {
+      if (!uri) return;
+      item_type = 'totp';
+      totpSeed = uri;
+      totpCapture.set('');
+    });
+    load();
+    return stop;
+  });
+
+  async function load() {
     try {
       [templates, allItems] = await Promise.all([api.templates(), api.items()]);
     } catch (e) {
       error = e.message;
     }
-  });
+  }
+
+  async function autoLinkTotp(id, seed) {
+    const parsed = parseOtpauth(seed || '');
+    const query = (parsed?.issuer || parsed?.account || '').trim();
+    if (!query) return;
+    try {
+      const rows = await api.items({ q: query, type: 'login' });
+      const logins = rows.filter((row) => row.type === 'login');
+      if (logins.length === 1) await api.link(logins[0].id, id);
+    } catch {
+      // Linking is best-effort; the TOTP is already saved.
+    }
+  }
 
   async function save(payload) {
     error = '';
     busy = true;
     try {
       const res = await api.create(payload);
+      if (payload.type === 'totp') await autoLinkTotp(res.id, payload.fields?.seed);
       goto(`/items/${res.id}`);
     } catch (e) {
       error = e.message;
@@ -130,15 +158,18 @@
         <button class="primary" on:click={savePointer} disabled={busy}>Create pointer item</button>
       </div>
     {:else}
-      <ItemForm
-        {templates}
-        bind:item_type
-        bind:name
-        bind:folder
-        submitLabel="Create item"
-        {busy}
-        onsubmit={save}
-      />
+      {#key totpSeed}
+        <ItemForm
+          {templates}
+          bind:item_type
+          bind:name
+          bind:folder
+          values={totpSeed ? { seed: totpSeed } : {}}
+          submitLabel="Create item"
+          {busy}
+          onsubmit={save}
+        />
+      {/key}
       {#if item_type === 'ssh_key'}
         <div class="row" style="margin-top: 12px">
           <button on:click={genSsh} disabled={busy}>Generate SSH key pair instead</button>

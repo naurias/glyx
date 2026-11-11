@@ -449,6 +449,7 @@ native.runtime.onMessage.addListener((msg, sender, reply) => {
         glyxLib.hostFromUrl(msg.url) || glyxLib.hostFromUrl(msg.origin);
       const candidate = msg.candidate || {};
       const fields = { seed: candidate.uri || candidate.secret || '' };
+      if (msg.url || msg.origin) fields.url = msg.url || msg.origin;
       if (!fields.seed) {
         reply({ ok: false, error: 'no TOTP secret found' });
         return;

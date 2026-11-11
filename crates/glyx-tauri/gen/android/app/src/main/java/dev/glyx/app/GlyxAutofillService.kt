@@ -23,9 +23,16 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 class GlyxAutofillService : AutofillService() {
+  companion object {
+    private val OTP_PATTERN =
+      Regex("otp|totp|2fa|one.?time|verification|authenticator|security.?code")
+  }
+
   private data class Fields(
     var username: AutofillId? = null,
     var password: AutofillId? = null,
+    var otp: AutofillId? = null,
+    val otpDigits: MutableMap<Int, AutofillId> = mutableMapOf(),
     var webDomain: String? = null,
     var usernameValue: String = "",
     var passwordValue: String = "",
@@ -36,6 +43,12 @@ class GlyxAutofillService : AutofillService() {
     val name: String,
     val username: String,
     val password: String,
+    val totpItemId: String?,
+  )
+
+  private data class TotpItem(
+    val id: String,
+    val name: String,
   )
 
   private data class Session(
@@ -57,7 +70,11 @@ class GlyxAutofillService : AutofillService() {
     if (structure.windowNodeCount > 0) {
       walk(structure.getWindowNodeAt(0).rootViewNode, fields)
     }
-    if (fields.username == null && fields.password == null) {
+    if (fields.username == null &&
+      fields.password == null &&
+      fields.otp == null &&
+      fields.otpDigits.isEmpty()
+    ) {
       callback.onSuccess(null)
       return
     }
@@ -72,11 +89,16 @@ class GlyxAutofillService : AutofillService() {
       return
     }
     Thread {
-      val matches = queryLogins(session, fields.webDomain, targetPackage)
+      val domain = fields.webDomain
+      val logins = queryLogins(session, domain, targetPackage)
+      val totps = if (domain != null) {
+        queryTotpItems(session, domain)
+      } else {
+        emptyList()
+      }
       val response = when {
-        matches == null -> unlockResponse(fields)
-        matches.isEmpty() -> saveOnlyResponse(fields)
-        else -> buildResponse(fields, matches)
+        logins == null -> unlockResponse(fields)
+        else -> buildResponse(session, fields, logins, totps)
       }
       callback.onSuccess(response)
     }.start()
@@ -135,11 +157,32 @@ class GlyxAutofillService : AutofillService() {
           InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS ||
         (inputType and InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS) ==
           InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS
+    val otpField = isOtpField(node, hints, inputType)
     if (passwordField && fields.password == null) {
       fields.password = node.autofillId
     }
     if (!passwordField && usernameField && fields.username == null) {
       fields.username = node.autofillId
+    }
+    if (otpField && !passwordField) {
+      val positions = hints.mapNotNull { hint ->
+        if (hint.startsWith("smsOTPCode")) {
+          val suffix = hint.removePrefix("smsOTPCode")
+          if (suffix.isEmpty()) 0 else suffix.toIntOrNull()
+        } else {
+          null
+        }
+      }
+      val id = node.autofillId
+      if (id != null) {
+        if (positions.any { it > 0 }) {
+          for (position in positions) {
+            if (position > 0) fields.otpDigits.putIfAbsent(position, id)
+          }
+        } else if (fields.otp == null) {
+          fields.otp = id
+        }
+      }
     }
     for (index in 0 until node.childCount) {
       walk(node.getChildAt(index), fields)
@@ -179,36 +222,116 @@ class GlyxAutofillService : AutofillService() {
     }
   }
 
-  private fun buildResponse(fields: Fields, items: List<Login>): FillResponse? {
+  private fun isOtpField(
+    node: android.app.assist.AssistStructure.ViewNode,
+    hints: Array<out String>,
+    inputType: Int,
+  ): Boolean {
+    if (hints.any {
+        it == "smsOTPCode" ||
+          it == "2faAppOTPCode" ||
+          it.startsWith("smsOTPCode")
+      }
+    ) {
+      return true
+    }
+    val numeric = (inputType and InputType.TYPE_CLASS_NUMBER) == InputType.TYPE_CLASS_NUMBER
+    if (!numeric) return false
+    val text = listOfNotNull(node.idEntry, node.hint?.toString()).joinToString(" ").lowercase()
+    return OTP_PATTERN.containsMatchIn(text)
+  }
+
+  private fun buildResponse(
+    session: Session,
+    fields: Fields,
+    logins: List<Login>,
+    totps: List<TotpItem>,
+  ): FillResponse? {
+    val wantsOtp = fields.otp != null || fields.otpDigits.isNotEmpty()
     val response = FillResponse.Builder()
     var added = 0
-    for (item in items) {
-      val presentation = RemoteViews(packageName, R.layout.autofill_item).apply {
-        setTextViewText(R.id.autofill_label, item.name)
-        setTextViewText(R.id.autofill_detail, item.username.ifEmpty { "glyx" })
+    for (login in logins) {
+      val code = if (wantsOtp && login.totpItemId != null) {
+        fetchCode(session, login.totpItemId)
+      } else {
+        null
       }
-      val dataset = Dataset.Builder(presentation)
-      var hasValue = false
-      fields.username?.let { id ->
-        if (item.username.isNotEmpty()) {
-          dataset.setValue(id, AutofillValue.forText(item.username))
-          hasValue = true
-        }
-      }
-      fields.password?.let { id ->
-        if (item.password.isNotEmpty()) {
-          dataset.setValue(id, AutofillValue.forText(item.password))
-          hasValue = true
-        }
-      }
-      if (hasValue) {
-        response.addDataset(dataset.build())
+      val dataset = buildDataset(
+        fields = fields,
+        label = login.name,
+        detail = login.username.ifEmpty { "glyx" },
+        username = login.username,
+        password = login.password,
+        code = code,
+      )
+      if (dataset != null) {
+        response.addDataset(dataset)
         added++
+      }
+    }
+    if (wantsOtp) {
+      for (totp in totps) {
+        if (logins.any { it.totpItemId == totp.id }) continue
+        val code = fetchCode(session, totp.id) ?: continue
+        val dataset = buildDataset(
+          fields = fields,
+          label = totp.name,
+          detail = "TOTP",
+          username = "",
+          password = "",
+          code = code,
+        )
+        if (dataset != null) {
+          response.addDataset(dataset)
+          added++
+        }
       }
     }
     if (added == 0) return saveOnlyResponse(fields)
     saveInfo(fields)?.let { response.setSaveInfo(it) }
     return runCatching { response.build() }.getOrNull()
+  }
+
+  private fun buildDataset(
+    fields: Fields,
+    label: String,
+    detail: String,
+    username: String,
+    password: String,
+    code: String?,
+  ): Dataset? {
+    val presentation = RemoteViews(packageName, R.layout.autofill_item).apply {
+      setTextViewText(R.id.autofill_label, label)
+      setTextViewText(R.id.autofill_detail, detail)
+    }
+    val dataset = Dataset.Builder(presentation)
+    var hasValue = false
+    fields.username?.let { id ->
+      if (username.isNotEmpty()) {
+        dataset.setValue(id, AutofillValue.forText(username))
+        hasValue = true
+      }
+    }
+    fields.password?.let { id ->
+      if (password.isNotEmpty()) {
+        dataset.setValue(id, AutofillValue.forText(password))
+        hasValue = true
+      }
+    }
+    if (code != null) {
+      fields.otp?.let { id ->
+        dataset.setValue(id, AutofillValue.forText(code))
+        hasValue = true
+      }
+      for ((position, id) in fields.otpDigits) {
+        val digit = code.getOrNull(position - 1)?.toString()
+        if (digit != null) {
+          dataset.setValue(id, AutofillValue.forText(digit))
+          hasValue = true
+        }
+      }
+    }
+    return if (hasValue) dataset.build() else null
   }
 
   private fun saveOnlyResponse(fields: Fields): FillResponse? {
@@ -230,7 +353,13 @@ class GlyxAutofillService : AutofillService() {
 
   private fun unlockResponse(fields: Fields): FillResponse? {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
-    if (fields.username == null && fields.password == null) return null
+    if (fields.username == null &&
+      fields.password == null &&
+      fields.otp == null &&
+      fields.otpDigits.isEmpty()
+    ) {
+      return null
+    }
     val intent = Intent(this, MainActivity::class.java)
       .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
     val pending = PendingIntent.getActivity(
@@ -287,11 +416,34 @@ class GlyxAutofillService : AutofillService() {
           name = row.optString("name", "glyx"),
           username = row.optString("username"),
           password = row.optString("password"),
+          totpItemId = row.optString("totp_item_id").ifEmpty { null },
         )
       )
       if (out.size >= 10) break
     }
     return out
+  }
+
+  private fun queryTotpItems(session: Session, webDomain: String): List<TotpItem> {
+    val body = JSONObject()
+      .put("origin", "https://$webDomain")
+      .put("limit", 10)
+    val response = requestJson(session, "POST", "/v1/totp/list", body) ?: return emptyList()
+    val matches = response.optJSONArray("matches") ?: return emptyList()
+    val out = ArrayList<TotpItem>()
+    for (index in 0 until matches.length()) {
+      val row = matches.optJSONObject(index) ?: continue
+      val id = row.optString("id")
+      if (id.isBlank()) continue
+      out.add(TotpItem(id, row.optString("name", "TOTP")))
+      if (out.size >= 10) break
+    }
+    return out
+  }
+
+  private fun fetchCode(session: Session, itemId: String): String? {
+    val response = requestJson(session, "GET", "/v1/items/$itemId/totp") ?: return null
+    return response.optString("code").ifEmpty { null }
   }
 
   private fun saveLogin(session: Session, fields: Fields, targetPackage: String): Boolean {

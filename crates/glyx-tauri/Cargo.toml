@@ -38,3 +38,6 @@ glyx-core = { path = "../glyx-core" }
 glyx-crypto = { path = "../glyx-crypto" }
 glyx-store = { path = "../glyx-store" }
 glyx-daemon = { path = "../glyx-daemon" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+tauri-plugin-barcode-scanner = "2.5"

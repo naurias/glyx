@@ -20,7 +20,13 @@
     "deep-link": {
       "desktop": {
         "schemes": ["glyx"]
-      }
+      },
+      "mobile": [
+        {
+          "scheme": ["otpauth"],
+          "appLink": false
+        }
+      ]
     }
   },
   "bundle": {

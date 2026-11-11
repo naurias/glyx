@@ -145,6 +145,11 @@ const TOTP: &[FieldSpec] = &[
         required: true,
     },
     FieldSpec {
+        name: "url",
+        secret: false,
+        required: false,
+    },
+    FieldSpec {
         name: "digits",
         secret: false,
         required: false,

@@ -1,6 +1,8 @@
 <script>
   import { renderMarkdown } from './markdown.js';
   import { generatePassword } from './pass.js';
+  import { parseOtpauth } from './totp.js';
+  import { canScanQr, pasteTotp, scanTotp } from './totp-capture.js';
 
   export let templates = [];
   export let item_type = 'login';
@@ -16,15 +18,59 @@
 
   let form = { ...values };
   let tagText = (tags || []).join(', ');
+  let captureError = '';
+  let scanning = false;
 
   $: fieldSpecs = (templates.find((t) => t.type === item_type)?.fields ?? []).filter(
     (f) => f.name !== 'login_id'
   );
   $: preview = renderMarkdown(form.body ?? '');
+  $: scanner = canScanQr();
 
   function generate(field) {
     form[field] = generatePassword(field === 'password' ? 24 : 32);
     form = { ...form };
+  }
+
+  function applyTotp(raw) {
+    captureError = '';
+    const text = String(raw || '').trim();
+    if (!text) return;
+    const parsed = parseOtpauth(text);
+    form.seed = text;
+    if (parsed) {
+      if (parsed.digits) form.digits = String(parsed.digits);
+      if (parsed.period) form.period = String(parsed.period);
+      if (!name.trim()) {
+        name = parsed.issuer
+          ? parsed.account
+            ? `${parsed.issuer} (${parsed.account})`
+            : parsed.issuer
+          : parsed.account || '';
+      }
+    }
+    form = { ...form };
+  }
+
+  async function scan() {
+    captureError = '';
+    scanning = true;
+    try {
+      applyTotp(await scanTotp());
+    } catch (e) {
+      captureError = e.message || String(e);
+    } finally {
+      scanning = false;
+    }
+  }
+
+  async function paste() {
+    captureError = '';
+    try {
+      applyTotp(await pasteTotp());
+    } catch (e) {
+      captureError = e.message || String(e);
+    }
   }
 
   function submit() {
@@ -73,8 +119,19 @@
         {#if f.secret}
           <button type="button" on:click={() => generate(f.name)}>Generate</button>
         {/if}
+        {#if f.name === 'seed' && item_type === 'totp'}
+          {#if scanner}
+            <button type="button" on:click={scan} disabled={scanning}>
+              {scanning ? 'Scanning…' : 'Scan QR'}
+            </button>
+          {/if}
+          <button type="button" on:click={paste}>Paste</button>
+        {/if}
       </div>
     </label>
+    {#if f.name === 'seed' && item_type === 'totp' && captureError}
+      <p class="dim" style="color: var(--danger); margin: 0 0 8px">{captureError}</p>
+    {/if}
   {/each}
 {/if}
 <div class="row" style="margin-top: 8px">
