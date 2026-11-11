@@ -6,6 +6,18 @@ use tauri_plugin_deep_link::DeepLinkExt as _;
 
 struct BiometricState(PluginHandle<Wry>);
 
+struct SettingsState(PluginHandle<Wry>);
+
+fn settings_plugin() -> TauriPlugin<Wry> {
+    Builder::new("glyx-settings")
+        .setup(|app, api| {
+            let handle = api.register_android_plugin("dev.glyx.app", "GlyxSettingsPlugin")?;
+            app.manage(SettingsState(handle));
+            Ok(())
+        })
+        .build()
+}
+
 static PENDING_OTPAUTH: Mutex<Option<String>> = Mutex::new(None);
 
 fn otpauth_script(raw: &str) -> Option<String> {
@@ -73,13 +85,17 @@ fn biometric_plugin() -> TauriPlugin<Wry> {
 pub fn configure(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> {
     builder
         .plugin(biometric_plugin())
+        .plugin(settings_plugin())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_barcode_scanner::init())
         .invoke_handler(tauri::generate_handler![
             mobile_biometric_status,
             mobile_biometric_enable,
             mobile_biometric_unlock,
-            mobile_biometric_disable
+            mobile_biometric_disable,
+            mobile_android_info,
+            mobile_open_autofill_settings,
+            mobile_open_credential_settings
         ])
 }
 
@@ -130,6 +146,33 @@ async fn mobile_biometric_disable(app: AppHandle) -> Result<serde_json::Value, S
     let handle = app.state::<BiometricState>().0.clone();
     handle
         .run_mobile_plugin_async("disable", ())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn mobile_android_info(app: AppHandle) -> Result<serde_json::Value, String> {
+    let handle = app.state::<SettingsState>().0.clone();
+    handle
+        .run_mobile_plugin_async("info", ())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn mobile_open_autofill_settings(app: AppHandle) -> Result<serde_json::Value, String> {
+    let handle = app.state::<SettingsState>().0.clone();
+    handle
+        .run_mobile_plugin_async("openAutofillSettings", ())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn mobile_open_credential_settings(app: AppHandle) -> Result<serde_json::Value, String> {
+    let handle = app.state::<SettingsState>().0.clone();
+    handle
+        .run_mobile_plugin_async("openCredentialSettings", ())
         .await
         .map_err(|e| e.to_string())
 }

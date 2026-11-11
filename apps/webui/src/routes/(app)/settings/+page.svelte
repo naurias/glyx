@@ -30,6 +30,8 @@
   let biometric = null;
   let bioBusy = false;
   let bioNotice = '';
+  let androidInfo = null;
+  let androidNotice = '';
 
   async function load() {
     try {
@@ -40,6 +42,7 @@
         desktopSettings = await window.__TAURI__.core.invoke('desktop_settings_get');
       }
       if (mobile) await loadBiometric();
+      if (mobile) await loadAndroid();
     } catch (e) {
       error = e.message;
     }
@@ -52,6 +55,33 @@
       biometric = await window.__TAURI__.core.invoke('mobile_biometric_status');
     } catch {
       biometric = null;
+    }
+  }
+
+  async function loadAndroid() {
+    if (!mobile || !window.__TAURI__?.core?.invoke) return;
+    try {
+      androidInfo = await window.__TAURI__.core.invoke('mobile_android_info');
+    } catch {
+      androidInfo = null;
+    }
+  }
+
+  async function openAutofillSettings() {
+    androidNotice = '';
+    try {
+      await window.__TAURI__.core.invoke('mobile_open_autofill_settings');
+    } catch (e) {
+      androidNotice = e.message || String(e);
+    }
+  }
+
+  async function openCredentialSettings() {
+    androidNotice = '';
+    try {
+      await window.__TAURI__.core.invoke('mobile_open_credential_settings');
+    } catch (e) {
+      androidNotice = e.message || String(e);
     }
   }
 
@@ -414,6 +444,22 @@
         <button on:click={enableBiometric} disabled={bioBusy}>Enable biometric unlock</button>
       {/if}
       {#if bioNotice}<p class="dim">{bioNotice}</p>{/if}
+    </div>
+  {/if}
+  {#if mobile}
+    <div class="card">
+      <div>Android integration</div>
+      <p class="dim">
+        Autofill fills logins and one-time codes. On Android 14+, glyx also provides passkeys through
+        Credential Manager.
+      </p>
+      <div class="row">
+        <button on:click={openAutofillSettings}>Autofill settings</button>
+        {#if androidInfo?.passkeys}
+          <button on:click={openCredentialSettings}>Passkey settings</button>
+        {/if}
+      </div>
+      {#if androidNotice}<p class="dim">{androidNotice}</p>{/if}
     </div>
   {/if}
   {#if desktopSettings}

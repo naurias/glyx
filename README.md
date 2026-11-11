@@ -4,7 +4,7 @@ Local-first password manager for Linux, Windows, and Android. CLI, full-screen T
 
 Full feature guide for every frontend, with examples: **[docs.md](docs.md)**. The frontend capability summary is under **[Frontends at a glance](docs.md#frontends-at-a-glance)**.
 
-> Status: M6e.1 passkeys (committed at `293caf1`). CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, encrypted attachments, item history reveal/compare/restore, safe backups, favorites/recents, tag and folder management, sorting/pagination, bulk actions, duplicate detection, device labels, password health, a local audit log, a standalone generator, and a polished Linux desktop with no-vault onboarding. M6c Android includes the Tauri-mobile shell, AutofillService, and Android Keystore-backed biometric unlock; APK build is verified, device smoke testing remains. M6e.1 adds synced passkey storage, a Chromium extension WebAuthn provider, and passkey management in the WebUI/CLI/desktop (Chrome manual matrix pending); Android passkeys are M6e.2. The current development host is NixOS; see [Build from source](#build-from-source-linux-without-nix).
+> Status: M6e.1 passkeys (committed at `293caf1`). CLI, TUI, WebUI, and desktop share one core with consistent features, notes and external Markdown injection, encrypted attachments, item history reveal/compare/restore, safe backups, favorites/recents, tag and folder management, sorting/pagination, bulk actions, duplicate detection, device labels, password health, a local audit log, a standalone generator, and a polished Linux desktop with no-vault onboarding. Android includes the Tauri-mobile shell, login and TOTP autofill with system save prompts, QR/paste/deep-link TOTP capture, Android Keystore-backed biometric unlock, and Android 14+ passkeys through Credential Manager; APK build is verified, device smoke testing remains. M6e.1 adds synced passkey storage, a Chromium extension WebAuthn provider, and passkey management in the WebUI/CLI/desktop (Chrome manual matrix pending). The current development host is NixOS; see [Build from source](#build-from-source-linux-without-nix).
 
 ## What glyx will do
 
@@ -22,7 +22,7 @@ Full feature guide for every frontend, with examples: **[docs.md](docs.md)**. Th
 | TUI | `glyx tui`: focused item browser/editor (add/edit, notes, TOTP, first-secret copy) |
 | WebUI | Browser pages served by the local daemon on loopback |
 | Desktop | `glyx-tauri`: the WebUI plus daemon autostart, tray, deep links, notifications, and a configurable quick palette |
-| Android | `glyx-tauri` mobile: in-process daemon, WebUI, AutofillService, and biometric unlock |
+| Android | `glyx-tauri` mobile: in-process daemon, WebUI, autofill (logins + TOTP), Android 14+ passkeys, and biometric unlock |
 | Extension | Chrome/Firefox search, login/TOTP fill, and lock; Chromium also provides synced passkeys. Requires an unlocked daemon. |
 | Git | `git-credential-glyx`: HTTPS credential `get/store/erase` |
 

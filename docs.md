@@ -7,7 +7,7 @@ This guide covers the user-facing frontends:
 - **CLI** (`glyx`), including a full-screen TUI (`glyx tui`)
 - **WebUI** (pages served by the local daemon)
 - **Desktop** (`glyx-tauri`, the WebUI plus tray, deep links, notifications, autostart, and a global quick-copy shortcut)
-- **Android** (`glyx-tauri` mobile, M6c autofill + biometrics)
+- **Android** (`glyx-tauri` mobile, autofill, TOTP, and Android 14+ passkeys)
 - **Browser extension** (search, login/TOTP fill, and lock; requires an unlocked daemon)
 - **Git credential helper** (`git-credential-glyx`)
 
@@ -22,7 +22,7 @@ This guide covers the user-facing frontends:
 | Clipboard copy | Yes | Partial | Partial | Inherited | No | No | No |
 | Web form fill | No | No | No | No | Autofill | Yes | No |
 | Passkey storage/management | Yes | Partial | Yes | Inherited | Inherited | No | No |
-| Passkey WebAuthn | No | No | Manage | Inherited | No | Chromium | No |
+| Passkey WebAuthn | No | No | Manage | Inherited | Android 14+ | Chromium | No |
 | SSH keys/agent | Yes | No | Yes | Inherited | Partial | No | No |
 | Favorites/recents/library/bulk/duplicates | Yes | No | Yes | Inherited | Inherited | No | No |
 | Devices/health/audit/generator | Yes | No | Yes | Inherited | Inherited | No | No |
@@ -33,7 +33,7 @@ This guide covers the user-facing frontends:
 | Extension/Git setup | Yes | No | No | No | No | No | No |
 
 `Inherited` means Desktop and Android reuse the WebUI pages (Android currently
-lacks clipboard and a native file picker; AutofillService and biometric unlock
+lacks clipboard and a native file picker; autofill, TOTP capture, and passkeys
 are Android-specific). `Partial` details, known gaps, and
 code anchors live in `local/feature-parity.md` (local only).
 
@@ -1073,7 +1073,7 @@ Runtime directory: `GLYX_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/glyx`, else a temp
 
 ---
 
-## 21. Android (M6c: autofill + biometrics)
+## 21. Android (autofill, TOTP, and passkeys)
 
 The Android app is the Tauri-mobile shell from `crates/glyx-tauri` plus the same
 WebUI. It starts an in-process daemon on loopback, stores the URL/token in the
@@ -1083,9 +1083,22 @@ What works today:
 
 - vault onboarding, item browsing/editing, notes, TOTP display, exports,
   injection, sync, conflicts, GC, and doctor through the WebUI
-- an Android `AutofillService` that maps a web domain or package query to login
-  items and fills username/password fields; when the vault is locked or the
-  daemon is not running, the autofill UI offers **Unlock glyx**
+- login autofill for web pages and native apps, matched by registrable domain
+  or the login's optional `package` field, with the username shown in the
+  picker
+- login capture through Android's system save prompt: the service only writes
+  after you confirm the prompt, and it updates an existing match or creates a
+  new login
+- one-time-code autofill on login and second-step OTP screens, from a login's
+  inline seed or a linked/standalone TOTP item
+- TOTP capture in the WebUI: scan a QR code with the camera, paste a setup key
+  or `otpauth://` URI, or open an `otpauth://` link; a scanned code is linked to
+  a login when exactly one login matches
+- passkeys on Android 14+ through `CredentialProviderService`: create and sign
+  in with synced passkeys in a browser or app, with a biometric or screen-lock
+  prompt for user verification
+- when the vault is locked or the daemon is not running, autofill offers
+  **Unlock glyx** and the passkey picker offers **Unlock glyx**
 - biometric unlock using an Android Keystore key: enabling it adds a dedicated
   random keyslot, encrypts the keyslot secret with a non-exportable,
   biometric-bound AES key, and unlocks by decrypting that secret and calling the
@@ -1099,8 +1112,13 @@ Known limitations:
 - no lock-on-background yet
 - biometric unlock is not offered for keyfile-required vaults (the biometric
   secret cannot satisfy the keyfile requirement)
-- no Android passkey provider yet; `CredentialProviderService` is planned for
-  M6e.2 (Android 14+) and will stay separate from the password `AutofillService`
+- passkeys need Android 14+; login and TOTP autofill work on older versions
+- native-app passkeys rely on the RP server accepting the
+  `android:apk-key-hash:` origin; Digital Asset Links verification is a
+  follow-up
+- the privileged-app origin allowlist is a bundled snapshot of Google's list;
+  browsers not in the snapshot fall back to the APK origin, and the RP server
+  remains the authority
 - the browser extension and Git helper are desktop-only
 
 Build from the repository.
@@ -1138,14 +1156,22 @@ Omitting `-t aarch64` builds all four ABIs and needs several GB of disk space.
 The Android scaffold lives in `crates/glyx-tauri/gen/android`; do not re-run
 `cargo tauri android init` or the pinned Build-Tools/Gradle settings are lost.
 
-After installing, enable glyx under **Settings -> System -> Languages & input ->
-Autofill service** (wording varies by vendor). Unlock the vault once, open
-**Settings**, and enable biometric unlock; the next unlock page and the autofill
-unlock flow offer the biometric prompt.
+After installing:
+
+1. Enable glyx under **Settings -> System -> Languages & input -> Autofill
+   service** (wording varies by vendor).
+2. On Android 14+, enable glyx under **Settings -> Passwords & accounts ->
+   Passwords, passkeys & autofill**. The glyx Settings page has an **Android
+   integration** card with shortcuts to both screens.
+3. Unlock the vault once, open **Settings**, and enable biometric unlock; the
+   next unlock page and the autofill unlock flow offer the biometric prompt.
+4. To capture a TOTP, open **Add item -> TOTP** and use **Scan QR** or
+   **Paste**. Opening an `otpauth://` link also opens the TOTP form.
 
 Runtime device verification is still pending because the build host has no
-attached emulator/device. The APK, Kotlin compilation, merged manifest, and Rust
-cross-check are verified.
+attached device. The APK, Kotlin compilation, merged manifest, and Rust
+cross-check are verified. The device checklist lives in
+`local/android-development.md` §7.
 
-Next milestones: Android passkeys (`CredentialProviderService`, M6e.2), lock on
-background, SAF picker, safe areas/icons, and device smoke testing.
+Next milestones: device smoke testing, lock on background, SAF picker, safe
+areas/icons, and Digital Asset Links for native-app passkeys.
