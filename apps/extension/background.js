@@ -1,61 +1,86 @@
+if (typeof importScripts === 'function' && !globalThis.glyxCompat) {
+  importScripts('compat.js', 'lib.js');
+}
+
 const HOST = 'dev.glyx.bridge';
+const compat = globalThis.glyxCompat;
+const native = compat.native;
+const proxy = compat.proxy;
 let seq = 0;
 const pending = new Map();
 const passkeyRequests = new Map();
 let passkeyAttached = false;
 let passkeyError = '';
+let lastSite = null;
 
-chrome.storage.local.get('passkeyError').then((stored) => {
-  if (stored.passkeyError) passkeyError = stored.passkeyError;
+compat.storageGet('passkeyError').then((stored) => {
+  if (stored && stored.passkeyError) passkeyError = stored.passkeyError;
 });
+
+function rememberTab(tab) {
+  const site = glyxLib.hostFromUrl(tab && tab.url);
+  if (site) lastSite = site;
+}
+
+compat
+  .tabsQuery({ active: true, currentWindow: true })
+  .then((tabs) => rememberTab(tabs && tabs[0]))
+  .catch(() => {});
+
+if (native.tabs && native.tabs.onActivated) {
+  native.tabs.onActivated.addListener(async ({ tabId }) => {
+    try {
+      rememberTab(await compat.tabsGet(tabId));
+    } catch {
+      /* tab closed */
+    }
+  });
+}
+if (native.tabs && native.tabs.onUpdated) {
+  native.tabs.onUpdated.addListener((_tabId, info, tab) => {
+    if (info && (info.url || info.status === 'complete')) rememberTab(tab);
+  });
+}
 
 function send(op, args = {}) {
   return new Promise((resolve, reject) => {
     const request_id = ++seq;
     pending.set(request_id, { resolve, reject });
-    chrome.runtime.sendNativeMessage(HOST, { op, request_id, args }, (res) => {
-      pending.delete(request_id);
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-        return;
-      }
-      if (!res || !res.ok) {
-        reject(new Error((res && res.error) || 'bridge failed'));
-        return;
-      }
-      resolve(res.data);
-    });
+    compat
+      .sendNative(HOST, { op, request_id, args })
+      .then((res) => {
+        pending.delete(request_id);
+        if (!res || !res.ok) {
+          reject(new Error((res && res.error) || 'bridge failed'));
+          return;
+        }
+        resolve(res.data);
+      })
+      .catch((error) => {
+        pending.delete(request_id);
+        reject(error);
+      });
   });
 }
 
-function registrable(host) {
-  const parts = host.split('.').filter(Boolean);
-  if (parts.length < 2) return host;
-  return parts.slice(-2).join('.');
-}
-
 function proxyAvailable() {
-  return (
-    typeof chrome !== 'undefined' &&
-    chrome.webAuthenticationProxy &&
-    typeof chrome.webAuthenticationProxy.attach === 'function'
-  );
+  return !!proxy && typeof proxy.attach === 'function';
 }
 
 async function passkeysEnabled() {
-  const stored = await chrome.storage.local.get('passkeysEnabled');
-  return stored.passkeysEnabled === true;
+  const stored = await compat.storageGet('passkeysEnabled');
+  return !!stored && stored.passkeysEnabled === true;
 }
 
 async function setPasskeyError(message) {
   passkeyError = message || '';
-  await chrome.storage.local.set({ passkeyError });
+  await compat.storageSet({ passkeyError });
 }
 
 async function attachPasskeys() {
   if (!proxyAvailable() || passkeyAttached) return;
   try {
-    const error = await chrome.webAuthenticationProxy.attach();
+    const error = await proxy.attach();
     if (error) {
       await setPasskeyError(error);
       return;
@@ -70,7 +95,7 @@ async function attachPasskeys() {
 async function detachPasskeys() {
   if (!proxyAvailable() || !passkeyAttached) return;
   try {
-    await chrome.webAuthenticationProxy.detach();
+    await proxy.detach();
   } catch {
     /* already detached */
   }
@@ -104,17 +129,17 @@ function parseNativeError(e) {
 }
 
 async function activeOrigin() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab || !tab.url) return null;
-  let parsed;
   try {
-    parsed = new URL(tab.url);
+    const tabs = await compat.tabsQuery({ active: true, currentWindow: true });
+    const site = glyxLib.hostFromUrl(tabs && tabs[0] && tabs[0].url);
+    if (site) {
+      lastSite = site;
+      return site;
+    }
   } catch {
-    return null;
+    /* fall through to the last site tab */
   }
-  const local = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
-  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && local)) return null;
-  return { origin: parsed.origin, host: parsed.hostname.toLowerCase() };
+  return lastSite;
 }
 
 function rpAllowed(host, rpId) {
@@ -123,18 +148,23 @@ function rpAllowed(host, rpId) {
   return host === rp || host.endsWith(`.${rp}`);
 }
 
-function completePasskey(kind, requestId, responseJson) {
-  if (kind === 'create') {
-    return chrome.webAuthenticationProxy.completeCreateRequest({ requestId, responseJson });
+async function completePasskey(kind, requestId, responseJson) {
+  try {
+    if (kind === 'create') {
+      return await proxy.completeCreateRequest({ requestId, responseJson });
+    }
+    return await proxy.completeGetRequest({ requestId, responseJson });
+  } catch (e) {
+    await setPasskeyError(String((e && e.message) || e));
+    throw e;
   }
-  return chrome.webAuthenticationProxy.completeGetRequest({ requestId, responseJson });
 }
 
 function completePasskeyError(kind, requestId, error) {
   if (kind === 'create') {
-    return chrome.webAuthenticationProxy.completeCreateRequest({ requestId, error });
+    return proxy.completeCreateRequest({ requestId, error });
   }
-  return chrome.webAuthenticationProxy.completeGetRequest({ requestId, error });
+  return proxy.completeGetRequest({ requestId, error });
 }
 
 async function safeCompletePasskeyError(kind, requestId, error) {
@@ -146,12 +176,17 @@ async function safeCompletePasskeyError(kind, requestId, error) {
 }
 
 function sendToPasskeyWindow(rid, message) {
-  chrome.runtime.sendMessage({ ...message, rid }).catch(() => {});
+  compat.sendMessage({ ...message, rid }).catch(() => {});
 }
 
 async function openPasskeyWindow(state) {
-  const url = chrome.runtime.getURL(`passkey.html?rid=${state.requestId}`);
-  const win = await chrome.windows.create({
+  const url = compat.getURL(`passkey.html?rid=${state.requestId}`);
+  if (compat.isFirefox) {
+    const tab = await compat.tabsCreate({ url });
+    state.tabId = tab.id;
+    return;
+  }
+  const win = await compat.windowsCreate({
     url,
     type: 'popup',
     width: 430,
@@ -164,6 +199,9 @@ async function openPasskeyWindow(state) {
 async function handlePasskeyRequest(kind, info) {
   const requestId = info.requestId;
   try {
+    if (!proxyAvailable()) {
+      throw { name: 'NotAllowedError', message: 'passkeys need a Chromium browser' };
+    }
     if (!(await passkeysEnabled())) {
       throw { name: 'NotAllowedError', message: 'glyx passkeys are disabled' };
     }
@@ -178,9 +216,7 @@ async function handlePasskeyRequest(kind, info) {
       throw { name: 'TypeError', message: 'invalid WebAuthn request' };
     }
     const rpId =
-      kind === 'create'
-        ? request?.rp?.id || tab.host
-        : request?.rpId || tab.host;
+      kind === 'create' ? request?.rp?.id || tab.host : request?.rpId || tab.host;
     if (!rpAllowed(tab.host, rpId)) {
       throw {
         name: 'NotAllowedError',
@@ -209,6 +245,7 @@ async function handlePasskeyRequest(kind, info) {
       request,
       items,
       windowId: null,
+      tabId: null,
       done: false
     };
     const decision = new Promise((resolve) => {
@@ -267,7 +304,7 @@ async function handlePasskeyRequest(kind, info) {
     });
     const state = passkeyRequests.get(requestId);
     if (state && state.windowId != null) {
-      setTimeout(() => chrome.windows.remove(state.windowId).catch(() => {}), 2500);
+      setTimeout(() => compat.windowsRemove(state.windowId).catch(() => {}), 2500);
     }
     setTimeout(() => passkeyRequests.delete(requestId), 10000);
   } finally {
@@ -277,39 +314,41 @@ async function handlePasskeyRequest(kind, info) {
 }
 
 if (proxyAvailable()) {
-  chrome.webAuthenticationProxy.onCreateRequest.addListener((info) => {
+  proxy.onCreateRequest.addListener((info) => {
     void handlePasskeyRequest('create', info);
   });
-  chrome.webAuthenticationProxy.onGetRequest.addListener((info) => {
+  proxy.onGetRequest.addListener((info) => {
     void handlePasskeyRequest('get', info);
   });
-  chrome.webAuthenticationProxy.onIsUvpaaRequest.addListener((info) => {
-    chrome.webAuthenticationProxy
-      .completeIsUvpaaRequest({
-        requestId: info.requestId,
-        isUvpaa: true
-      })
+  proxy.onIsUvpaaRequest.addListener((info) => {
+    passkeysEnabled()
+      .then((enabled) =>
+        proxy.completeIsUvpaaRequest({
+          requestId: info.requestId,
+          isUvpaa: enabled
+        })
+      )
       .catch(() => {});
   });
-  chrome.webAuthenticationProxy.onRequestCanceled.addListener((requestId) => {
+  proxy.onRequestCanceled.addListener((requestId) => {
     const state = passkeyRequests.get(requestId);
     if (!state) return;
     state.resolve({ action: 'cancel' });
     if (state.windowId != null) {
-      chrome.windows.remove(state.windowId).catch(() => {});
+      compat.windowsRemove(state.windowId).catch(() => {});
     }
     passkeyRequests.delete(requestId);
   });
   void reconcilePasskeys();
 }
 
-chrome.storage.onChanged.addListener((changes, area) => {
+native.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.passkeysEnabled) {
     void reconcilePasskeys();
   }
 });
 
-chrome.windows.onRemoved.addListener((windowId) => {
+native.windows.onRemoved.addListener((windowId) => {
   for (const [rid, state] of passkeyRequests) {
     if (state.windowId === windowId) {
       if (!state.done) state.resolve({ action: 'cancel' });
@@ -318,13 +357,16 @@ chrome.windows.onRemoved.addListener((windowId) => {
   }
 });
 
-chrome.runtime.onMessage.addListener((msg, sender, reply) => {
+native.runtime.onMessage.addListener((msg, sender, reply) => {
   (async () => {
     if (msg.kind === 'search') {
       const items = await send('search', { query: msg.query || '' });
-      const domain = registrable(new URL(sender.url).hostname);
+      const domain = glyxLib.registrable(new URL(sender.url).hostname);
       const scored = (Array.isArray(items) ? items : [])
-        .map((item) => ({ item, hit: domain && JSON.stringify(item).includes(domain) }))
+        .map((item) => ({
+          item,
+          hit: domain && JSON.stringify(item).includes(domain)
+        }))
         .sort((a, b) => Number(b.hit) - Number(a.hit))
         .map(({ item }) => item);
       reply({ ok: true, items: scored });
@@ -342,20 +384,31 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       reply({
         ok: true,
         available: proxyAvailable(),
+        firefox: compat.isFirefox,
+        browser: compat.isFirefox ? 'firefox' : 'chromium',
         enabled: await passkeysEnabled(),
         attached: passkeyAttached,
         error: passkeyError
       });
     } else if (msg.kind === 'set-passkeys-enabled') {
-      await chrome.storage.local.set({ passkeysEnabled: msg.enabled === true });
+      await compat.storageSet({ passkeysEnabled: msg.enabled === true });
       await reconcilePasskeys();
       reply({
         ok: true,
         available: proxyAvailable(),
+        firefox: compat.isFirefox,
+        browser: compat.isFirefox ? 'firefox' : 'chromium',
         enabled: await passkeysEnabled(),
         attached: passkeyAttached,
         error: passkeyError
       });
+    } else if (msg.kind === 'passkey-spike') {
+      const site = await activeOrigin();
+      const query = site
+        ? `?origin=${encodeURIComponent(site.origin)}&host=${encodeURIComponent(site.host)}`
+        : '';
+      await compat.tabsCreate({ url: compat.getURL(`firefox-passkey.html${query}`) });
+      reply({ ok: true });
     } else if (msg.kind === 'passkey-state') {
       const state = passkeyRequests.get(Number(msg.rid));
       if (!state) {
@@ -383,10 +436,10 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       if (state) state.resolve({ action: 'cancel' });
       reply({ ok: true });
     } else if (msg.kind === 'passkey-open-glyx') {
-      await chrome.tabs.create({ url: msg.url || 'glyx://quick' });
+      await compat.tabsCreate({ url: msg.url || 'glyx://quick' });
       reply({ ok: true });
     } else if (msg.kind === 'passkey-manage') {
-      await chrome.tabs.create({ url: `glyx://items/${msg.itemId}` });
+      await compat.tabsCreate({ url: `glyx://items/${msg.itemId}` });
       reply({ ok: true });
     } else if (msg.kind === 'passkey-result') {
       reply({ ok: true });

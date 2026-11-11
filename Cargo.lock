@@ -2277,6 +2277,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "crossterm 0.28.1",
@@ -2291,6 +2292,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "toml 0.8.2",
  "uuid",
 ]

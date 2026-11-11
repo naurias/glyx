@@ -780,23 +780,50 @@ GUI: Conflicts lists races, shows mine versus theirs, and resolves. Settings has
 The extension needs a running daemon with an unlocked vault. It has no unlock screen of its own.
 
 ```sh
-glyx extension install              # Chrome manifests
-glyx extension install --firefox    # Firefox manifest
-glyx extension allow <extension-id> # Chrome id from chrome://extensions
+# stage the per-browser extension directories
+node apps/extension/build.mjs all
+
+# native messaging manifests (detected browsers by default)
+glyx extension install
+glyx extension install --all
+glyx extension install --browser brave --browser firefox
+glyx extension id
 glyx extension status
 ```
 
-Load `apps/extension` in the browser. The popup searches items (ranking
-candidates by registrable domain), has a Fill button for username/password, a
-TOTP button, a Passkeys toggle, and a Lock button. Filling sets input values and
-dispatches `input`/`change` events; it never auto-submits a form. Passkeys need
-Chromium 115+ because the manifest declares `webAuthenticationProxy`; use a
-Chromium build for the passkey provider.
+Load `apps/extension/dist/chromium` in Chrome, Chromium, Brave, Edge, Vivaldi,
+or Opera, and `apps/extension/dist/firefox` in Firefox
+(`about:debugging` → **Load Temporary Add-on**). The Chromium build pins a fixed
+manifest key, so its id is
+`pghflpdollfefhhgbpmdpakgmemflmpn` in every Chromium-based browser;
+`glyx extension install` pre-authorizes it. Use `glyx extension allow <id>` only
+for a development build loaded without that key.
+
+The popup searches items (ranking candidates by registrable domain), has a Fill
+button for username/password, a TOTP button, a Passkeys toggle, and a Lock
+button. Filling sets input values and dispatches `input`/`change` events; it
+never auto-submits a form. Passkeys need Chromium 115+ because the manifest
+declares `webAuthenticationProxy`; Firefox gets fill and capture but not a
+passkey provider.
 
 The native host exposes `status`, `search`, `fill`, `totp`, `lock`, and the
-passkey operations described below. The extension cannot unlock the vault,
-create/edit/delete/reveal regular items, or manage vaults, exports, sync, or
-SSH.
+passkey operations described below. The extension cannot unlock the vault or
+manage vaults, exports, sync, or SSH.
+
+### Browsers
+
+| Browser | Fill and capture | Passkeys |
+| --- | --- | --- |
+| Chrome, Chromium, Brave, Edge, Vivaldi, Opera | yes | Chromium 115+ |
+| Firefox 128+ | yes | no (see below) |
+
+Firefox has no `webAuthenticationProxy`. Firefox 150's extension WebAuthn API
+makes the extension a WebAuthn *client* for a host-permission domain: the
+browser/OS authenticator still holds the key, and `clientDataJSON.origin` is the
+extension origin, so an RP must explicitly allowlist it. That API cannot make
+glyx the authenticator. The popup links to a diagnostic spike page
+(`firefox-passkey.html`) that demonstrates the behavior; passkeys remain
+Chromium-only.
 
 ### Passkeys
 
@@ -821,7 +848,8 @@ daemon; the extension receives only the WebAuthn response.
 
 Known limits:
 
-- Chromium/Chrome only; Firefox and Safari passkeys are unsupported.
+- Chromium 115+ only; Firefox and Safari passkeys are unsupported. Firefox's
+  extension WebAuthn API is a client API, not an authenticator provider.
 - Cross-origin iframe requests fall back to the browser because Chrome does not
   expose the iframe origin to the proxy.
 - Existing passkeys in Chrome, Google Password Manager, or Apple cannot be
@@ -839,9 +867,11 @@ glyx passkey show example.com
 glyx passkey rm example.com
 ```
 
-A quick Chromium smoke test: load `apps/extension`, run `glyx extension install`,
-allow the extension ID, enable **Passkeys** in the popup, then register and sign
-in on a WebAuthn test RP. The passkey appears under **Passkeys** in the WebUI.
+A quick Chromium smoke test: run `node apps/extension/build.mjs all`, load
+`apps/extension/dist/chromium`, run `glyx extension install`, enable
+**Passkeys** in the popup, then register and sign in on a WebAuthn test RP. The
+passkey appears under **Passkeys** in the WebUI. No `glyx extension allow` step
+is needed with the pinned key.
 
 ---
 

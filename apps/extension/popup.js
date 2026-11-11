@@ -1,21 +1,24 @@
+const compat = globalThis.glyxCompat;
 const q = document.getElementById('q');
 const list = document.getElementById('list');
 const err = document.getElementById('err');
 const passkeys = document.getElementById('passkeys');
 const passkeyStatus = document.getElementById('passkey-status');
+const spike = document.getElementById('spike');
 
 function fail(e) {
   err.innerHTML = `<div class="err">${String((e && e.message) || e)}</div>`;
 }
 
 async function bg(msg) {
-  return chrome.runtime.sendMessage(msg);
+  return compat.sendMessage(msg);
 }
 
 async function refresh() {
   err.innerHTML = '';
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tabs = await compat.tabsQuery({ active: true, currentWindow: true });
+    const tab = tabs && tabs[0];
     const host = tab && tab.url ? new URL(tab.url).hostname : '';
     const res = await bg({ kind: 'search', query: q.value || host });
     render(res.items || [], tab);
@@ -39,7 +42,7 @@ function render(items, tab) {
       try {
         const res = await bg({ kind: 'fill', id: item.id });
         const fields = (res.item && res.item.fields) || {};
-        await chrome.tabs.sendMessage(tab.id, {
+        await compat.tabsSendMessage(tab.id, {
           kind: 'do-fill',
           username: fields.username || fields.email || '',
           password: fields.password || ''
@@ -55,7 +58,7 @@ function render(items, tab) {
       try {
         const res = await bg({ kind: 'totp', id: item.id });
         const val = (res.item && (res.item.code || (res.item.fields && res.item.fields.code))) || '';
-        await chrome.tabs.sendMessage(tab.id, { kind: 'do-fill', totp: val });
+        await compat.tabsSendMessage(tab.id, { kind: 'do-fill', totp: val });
         window.close();
       } catch (e) {
         fail(e);
@@ -79,8 +82,11 @@ document.getElementById('lock').onclick = async () => {
 function passkeyState(res) {
   passkeys.checked = !!res.enabled;
   passkeys.disabled = !res.available;
+  if (spike) spike.hidden = !res.firefox;
   if (!res.available) {
-    passkeyStatus.textContent = 'Chromium only';
+    passkeyStatus.textContent = res.firefox
+      ? 'Chromium only; use the spike to test Firefox'
+      : 'Chromium only';
   } else if (res.error) {
     passkeyStatus.textContent = res.error;
   } else if (res.enabled) {
@@ -106,6 +112,17 @@ passkeys.onchange = async () => {
     passkeyStatus.textContent = String((e && e.message) || e);
   }
 };
+
+if (spike) {
+  spike.onclick = async () => {
+    try {
+      await bg({ kind: 'passkey-spike' });
+      window.close();
+    } catch (e) {
+      fail(e);
+    }
+  };
+}
 
 q.oninput = () => refresh();
 loadPasskeys();

@@ -475,16 +475,32 @@ enum DaemonCmd {
 enum ExtensionCmd {
     #[command(about = "Install native host manifests")]
     Install {
-        #[arg(long, help = "Install Chrome manifest")]
+        #[arg(
+            long,
+            value_enum,
+            num_args = 1..,
+            value_delimiter = ',',
+            help = "Browser(s): chrome, chromium, brave, edge, vivaldi, opera, firefox"
+        )]
+        browser: Vec<extension::Browser>,
+        #[arg(long, help = "Install for every supported browser")]
+        all: bool,
+        #[arg(long, hide = true)]
         chrome: bool,
-        #[arg(long, help = "Install Firefox manifest")]
+        #[arg(long, hide = true)]
         firefox: bool,
     },
-    #[command(about = "Allow a Chrome extension id")]
+    #[command(about = "Allow a Chromium extension id")]
     Allow {
         #[arg(help = "Extension id from chrome://extensions")]
         id: String,
+        #[arg(long, value_enum, num_args = 1.., value_delimiter = ',')]
+        browser: Vec<extension::Browser>,
+        #[arg(long, help = "Update every installed Chromium manifest")]
+        all: bool,
     },
+    #[command(about = "Print the stable Chromium extension id")]
+    Id,
     #[command(about = "Extension wiring status")]
     Status,
 }
@@ -1610,10 +1626,42 @@ fn dispatch_daemon(ctx: &Ctx, cmd: DaemonCmd) -> Result<()> {
 
 fn dispatch_extension(ctx: &Ctx, cmd: ExtensionCmd) -> Result<()> {
     match cmd {
-        ExtensionCmd::Install { chrome, firefox } => {
-            extension::cmd_install(&ctx.vault_path()?, chrome, firefox, ctx.json)
+        ExtensionCmd::Install {
+            browser,
+            all,
+            chrome,
+            firefox,
+        } => {
+            let mut browsers = if all {
+                extension::ALL_BROWSERS.to_vec()
+            } else if browser.is_empty() && !chrome && !firefox {
+                extension::detected_browsers()
+            } else {
+                browser
+            };
+            if chrome && !browsers.contains(&extension::Browser::Chrome) {
+                browsers.push(extension::Browser::Chrome);
+            }
+            if firefox && !browsers.contains(&extension::Browser::Firefox) {
+                browsers.push(extension::Browser::Firefox);
+            }
+            extension::cmd_install(&ctx.vault_path()?, &browsers, ctx.json)
         }
-        ExtensionCmd::Allow { id } => extension::cmd_allow(&id, ctx.json),
+        ExtensionCmd::Allow { id, browser, all } => {
+            let browsers = if all {
+                extension::ALL_BROWSERS
+                    .into_iter()
+                    .filter(|b| !b.is_firefox())
+                    .collect()
+            } else {
+                browser
+            };
+            extension::cmd_allow(&id, &browsers, ctx.json)
+        }
+        ExtensionCmd::Id => {
+            extension::cmd_id(ctx.json);
+            Ok(())
+        }
         ExtensionCmd::Status => {
             extension::cmd_status(&ctx.vault_path()?, ctx.json);
             Ok(())

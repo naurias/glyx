@@ -1,0 +1,50 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root { color-scheme: dark; }
+      body { margin: 0; font-family: system-ui, sans-serif; background: #14161a; color: #e8eaf0; }
+      header { padding: 14px 16px; border-bottom: 1px solid #2c313a; }
+      header strong { display: block; font-size: 16px; }
+      main { padding: 16px; max-width: 760px; }
+      p { line-height: 1.45; }
+      .dim { color: #9aa1b2; font-size: 13px; }
+      textarea { width: 100%; min-height: 220px; box-sizing: border-box; background: #1c1f25; color: inherit; border: 1px solid #2c313a; border-radius: 6px; padding: 10px; font: 12px/1.5 ui-monospace, monospace; }
+      input { background: #1c1f25; color: inherit; border: 1px solid #2c313a; border-radius: 6px; padding: 6px 8px; }
+      button { background: #1c1f25; color: inherit; border: 1px solid #2c313a; border-radius: 6px; padding: 8px 10px; cursor: pointer; }
+      button.primary { background: #2b5cff; border-color: #2b5cff; }
+      .row { display: flex; gap: 8px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+      pre { white-space: pre-wrap; word-break: break-word; background: #1c1f25; border: 1px solid #2c313a; border-radius: 6px; padding: 10px; font-size: 12px; }
+      .error { color: #ff7a7a; }
+      .ok { color: #7ee2a8; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <strong>Firefox passkey spike</strong>
+      <span id="origin" class="dim"></span>
+    </header>
+    <main>
+      <p class="dim">
+        This page exercises Firefox's extension WebAuthn API. It is a diagnostic, not the
+        normal glyx passkey flow: Firefox uses the browser's authenticator here, not a key
+        stored in glyx, and the credential origin is the extension origin. A relying party
+        must allowlist that origin before it can verify the response.
+      </p>
+      <div class="row">
+        <label>RP host <input id="host" placeholder="example.com" /></label>
+        <button id="sample">Load sample options</button>
+      </div>
+      <textarea id="options" spellcheck="false"></textarea>
+      <div class="row">
+        <button id="create" class="primary">Create</button>
+        <button id="get">Get</button>
+      </div>
+      <pre id="output" class="dim">No result yet.</pre>
+    </main>
+    <script src="compat.js"></script>
+    <script src="lib.js"></script>
+    <script src="firefox-passkey.js"></script>
+  </body>
+</html>

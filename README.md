@@ -365,11 +365,11 @@ nix profile install .#bundle   # NixOS: CLI, daemon, and desktop in one profile
 Desktop secret storage stays with gnome-keyring; glyx covers browsers, Git, and the terminal:
 
 ```sh
-# Browser extension (Chrome + Firefox, needs a running daemon)
-glyx --vault ~/vaults/main.glyx extension install --firefox
-glyx --vault ~/vaults/main.glyx extension install   # Chrome manifests
-# load apps/extension in the browser, then for Chrome:
-glyx extension allow <id-from-chrome://extensions>
+# Browser extension (Chromium + Firefox, needs a running daemon)
+node apps/extension/build.mjs all
+glyx --vault ~/vaults/main.glyx extension install --all
+# load apps/extension/dist/chromium or apps/extension/dist/firefox
+# passkeys: Chromium 115+; Firefox gets fill and capture only
 
 # Git HTTPS credentials (no prompts after one unlock)
 glyx git setup

@@ -4,27 +4,20 @@
   "version": "0.1.0",
   "minimum_chrome_version": "115",
   "description": "Fill logins, TOTP codes, and passkeys from your local glyx vault.",
+  "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEpo36+vi93LtsO0/fdp1gqnbYI2ChhrS0OsH1Z+rYcaC2X8+sZg8YlFLF9BeydaSK9RLqdYABAAi+QFhW0CO12w==",
   "permissions": ["activeTab", "nativeMessaging", "storage", "tabs", "webAuthenticationProxy"],
-  "host_permissions": ["http://127.0.0.1/*"],
   "background": {
-    "service_worker": "background.js",
-    "scripts": ["background.js"]
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["content.js"],
+      "js": ["compat.js", "lib.js", "content.js"],
       "run_at": "document_idle"
     }
   ],
   "action": {
     "default_popup": "popup.html",
     "default_title": "glyx"
-  },
-  "browser_specific_settings": {
-    "gecko": {
-      "id": "glyx@local",
-      "strict_min_version": "109.0"
-    }
   }
 }

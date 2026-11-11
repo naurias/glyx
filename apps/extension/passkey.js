@@ -1,3 +1,4 @@
+const compat = globalThis.glyxCompat;
 const rid = new URLSearchParams(location.search).get('rid');
 const main = document.getElementById('main');
 const origin = document.getElementById('origin');
@@ -24,7 +25,7 @@ function showError(message) {
   if (/lock/i.test(message || '')) {
     row.append(
       button('Open glyx', true, async () => {
-        await chrome.runtime.sendMessage({ kind: 'passkey-open-glyx', url: 'glyx://quick' });
+        await compat.sendMessage({ kind: 'passkey-open-glyx', url: 'glyx://quick' });
         window.close();
       })
     );
@@ -41,7 +42,7 @@ function showSuccess(result) {
   if (result.mode === 'create' && result.itemId) {
     row.append(
       button('Manage in glyx', true, async () => {
-        await chrome.runtime.sendMessage({ kind: 'passkey-manage', itemId: result.itemId });
+        await compat.sendMessage({ kind: 'passkey-manage', itemId: result.itemId });
         window.close();
       })
     );
@@ -59,7 +60,7 @@ async function submit(itemId) {
   });
   const notice = el('p', 'dim', 'Waiting for glyx…');
   main.append(notice);
-  const res = await chrome.runtime.sendMessage({
+  const res = await compat.sendMessage({
     kind: 'passkey-submit',
     rid,
     itemId: itemId || null
@@ -115,11 +116,11 @@ function render(state) {
 }
 
 async function cancel() {
-  await chrome.runtime.sendMessage({ kind: 'passkey-cancel', rid });
+  await compat.sendMessage({ kind: 'passkey-cancel', rid });
   window.close();
 }
 
-chrome.runtime.onMessage.addListener((msg) => {
+compat.native.runtime.onMessage.addListener((msg) => {
   if (msg.kind !== 'passkey-result' || String(msg.rid) !== String(rid)) return false;
   if (msg.ok) showSuccess(msg);
   else showError(msg.error?.message || 'passkey request failed');
@@ -128,7 +129,7 @@ chrome.runtime.onMessage.addListener((msg) => {
 
 (async () => {
   try {
-    const state = await chrome.runtime.sendMessage({ kind: 'passkey-state', rid });
+    const state = await compat.sendMessage({ kind: 'passkey-state', rid });
     if (!state || !state.ok) {
       showError((state && state.error) || 'this passkey request is no longer active');
       return;
