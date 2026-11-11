@@ -4,6 +4,7 @@ use ciborium::value::Value as CborValue;
 use p256::ecdsa::signature::Signer as _;
 use p256::ecdsa::{Signature, SigningKey};
 use p256::elliptic_curve::sec1::ToEncodedPoint as _;
+use p256::pkcs8::EncodePublicKey as _;
 use p256::SecretKey;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -290,6 +291,9 @@ pub fn create_credential(
         .y()
         .ok_or_else(|| PasskeyError::BadRequest("bad public key".into()))?;
     let cose = cose_key(x.as_slice(), y.as_slice())?;
+    let public_key_der = public
+        .to_public_key_der()
+        .map_err(|e| PasskeyError::BadRequest(e.to_string()))?;
     let client_data = client_data("webauthn.create", &options.challenge, &options.origin)?;
     let mut flags = 0x01 | 0x08 | 0x10 | 0x40;
     if user_verified {
@@ -305,6 +309,8 @@ pub fn create_credential(
         "response": {
             "clientDataJSON": encode_b64(&client_data),
             "attestationObject": encode_b64(&attestation),
+            "authenticatorData": encode_b64(&auth_data),
+            "publicKey": encode_b64(public_key_der.as_bytes()),
             "transports": ["internal"],
             "publicKeyAlgorithm": -7
         },
@@ -388,7 +394,11 @@ pub fn assert_credential(
             "clientDataJSON": encode_b64(&client_data),
             "authenticatorData": encode_b64(&auth_data),
             "signature": encode_b64(der.as_bytes()),
-            "userHandle": user_handle
+            "userHandle": if user_handle.is_empty() {
+                Value::Null
+            } else {
+                Value::String(user_handle.to_owned())
+            }
         },
         "clientExtensionResults": {}
     });
@@ -465,7 +475,11 @@ pub fn lookup(items: &[Item], rp_id: &str, allow_credentials: &[String]) -> Vec<
         if meta.rp_id != rp_id {
             continue;
         }
-        if !allow_credentials.is_empty() && !allow_credentials.contains(&meta.credential_id) {
+        if !allow_credentials.is_empty()
+            && !allow_credentials
+                .iter()
+                .any(|id| credential_id_eq(id, &meta.credential_id))
+        {
             continue;
         }
         if allow_credentials.is_empty() && !meta.discoverable {
@@ -479,6 +493,16 @@ pub fn lookup(items: &[Item], rp_id: &str, allow_credentials: &[String]) -> Vec<
             .then_with(|| a.name.cmp(&b.name))
     });
     out
+}
+
+/// Compare two base64url credential ids by their decoded bytes so that
+/// padded and unpadded encodings of the same id match.
+#[must_use]
+pub fn credential_id_eq(left: &str, right: &str) -> bool {
+    match (decode_b64(left), decode_b64(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 pub fn validate_origin_rp(origin: &str, rp_id: &str) -> Result<String, PasskeyError> {
@@ -631,6 +655,7 @@ mod tests {
     use super::*;
     use p256::ecdsa::signature::Verifier as _;
     use p256::ecdsa::VerifyingKey;
+    use p256::pkcs8::DecodePublicKey as _;
 
     fn creation_options() -> Value {
         json!({
@@ -648,6 +673,57 @@ mod tests {
             },
             "extensions": {"credProps": true}
         })
+    }
+
+    #[test]
+    fn create_response_has_chromium_required_fields() {
+        let parsed = parse_creation(&creation_options(), "https://example.com").expect("parse");
+        let created = create_credential(&parsed, true).expect("create");
+        let response = &created.response["response"];
+        let auth_data = decode_b64(
+            response["authenticatorData"]
+                .as_str()
+                .expect("authenticatorData"),
+        )
+        .expect("auth data");
+        let attestation = decode_b64(
+            response["attestationObject"]
+                .as_str()
+                .expect("attestationObject"),
+        )
+        .expect("attestation");
+        let cbor: CborValue = ciborium::de::from_reader(attestation.as_slice()).expect("cbor");
+        let CborValue::Map(fields) = cbor else {
+            panic!("attestation object must be a map");
+        };
+        let embedded = fields
+            .iter()
+            .find_map(|(key, value)| (key == &CborValue::Text("authData".into())).then_some(value))
+            .expect("authData in attestation");
+        let CborValue::Bytes(embedded) = embedded else {
+            panic!("authData must be bytes");
+        };
+        assert_eq!(embedded, &auth_data);
+
+        let public_key =
+            decode_b64(response["publicKey"].as_str().expect("publicKey")).expect("public key der");
+        let parsed_key =
+            p256::PublicKey::from_public_key_der(&public_key).expect("parse public key der");
+        let secret =
+            SecretKey::from_slice(&decode_b64(&created.private_key).expect("key")).expect("secret");
+        assert_eq!(
+            parsed_key.to_encoded_point(false),
+            secret.public_key().to_encoded_point(false)
+        );
+        assert_eq!(response["publicKeyAlgorithm"], -7);
+        assert_eq!(response["transports"][0], "internal");
+        assert!(created.response["clientExtensionResults"].is_object());
+    }
+
+    #[test]
+    fn credential_ids_match_across_padding() {
+        assert!(credential_id_eq("AQI", "AQI="));
+        assert!(!credential_id_eq("AQI", "AQM"));
     }
 
     #[test]
@@ -728,6 +804,12 @@ mod tests {
         let mut signed = decode_b64(auth_data).expect("auth");
         signed.extend_from_slice(&Sha256::digest(decode_b64(client_data).expect("client")));
         verifying.verify(&signed, &signature).expect("verify");
+
+        if let Some(handle) = item.fields.get_mut("user_handle") {
+            handle.value = glyx_core::SecretString::new(String::new());
+        }
+        let assertion = assert_credential(&options, &item, true).expect("assert empty handle");
+        assert!(assertion.response["response"]["userHandle"].is_null());
     }
 
     #[test]

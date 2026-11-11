@@ -502,7 +502,10 @@ async fn passkey_create(
             Ok(Some(item)) => {
                 if let Some(meta) = passkey::metadata(&item) {
                     if meta.rp_id == options.rp_id
-                        && options.exclude_credentials.contains(&meta.credential_id)
+                        && options
+                            .exclude_credentials
+                            .iter()
+                            .any(|id| passkey::credential_id_eq(id, &meta.credential_id))
                     {
                         return passkey_error(passkey::PasskeyError::InvalidState(
                             "a matching passkey already exists".into(),
@@ -624,7 +627,10 @@ async fn passkey_get(
                         let allowed = if options.allow_credentials.is_empty() {
                             meta.discoverable
                         } else {
-                            options.allow_credentials.contains(&meta.credential_id)
+                            options
+                                .allow_credentials
+                                .iter()
+                                .any(|id| passkey::credential_id_eq(id, &meta.credential_id))
                         };
                         if meta.rp_id == options.rp_id && allowed {
                             found.push(candidate);
@@ -660,7 +666,10 @@ async fn passkey_get(
         ));
     }
     if !options.allow_credentials.is_empty()
-        && !options.allow_credentials.contains(&meta.credential_id)
+        && !options
+            .allow_credentials
+            .iter()
+            .any(|id| passkey::credential_id_eq(id, &meta.credential_id))
     {
         return passkey_error(passkey::PasskeyError::NotAllowed(
             "passkey is not in allowCredentials".into(),
@@ -4975,6 +4984,10 @@ mod tests {
             .expect("credential id")
             .to_owned();
         assert_eq!(body["response"]["response"]["publicKeyAlgorithm"], -7);
+        assert!(body["response"]["response"]["authenticatorData"]
+            .as_str()
+            .is_some());
+        assert!(body["response"]["response"]["publicKey"].as_str().is_some());
 
         let (status, body) = call(state.clone(), "GET", "/v1/passkeys", None, "test-token").await;
         assert_eq!(status, StatusCode::OK, "{body}");
