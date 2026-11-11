@@ -94,7 +94,7 @@ class PasskeyCreateActivity : FragmentActivity() {
       runOnUiThread {
         val credential = response?.optJSONObject("response")
         if (credential == null) {
-          Toast.makeText(this, "Unlock glyx and try again.", Toast.LENGTH_LONG).show()
+          Toast.makeText(this, "Could not create the passkey. Unlock glyx and try again.", Toast.LENGTH_LONG).show()
           finishCanceled()
           return@runOnUiThread
         }

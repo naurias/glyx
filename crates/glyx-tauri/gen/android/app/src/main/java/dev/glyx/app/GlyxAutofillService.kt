@@ -135,20 +135,8 @@ class GlyxAutofillService : AutofillService() {
     node.webDomain?.let { fields.webDomain = it }
     val hints = node.autofillHints.orEmpty()
     val inputType = node.inputType
-    val passwordField =
-      hints.any { it == View.AUTOFILL_HINT_PASSWORD || it == "newPassword" } ||
-        (inputType and InputType.TYPE_TEXT_VARIATION_PASSWORD) ==
-          InputType.TYPE_TEXT_VARIATION_PASSWORD ||
-        (inputType and InputType.TYPE_NUMBER_VARIATION_PASSWORD) ==
-          InputType.TYPE_NUMBER_VARIATION_PASSWORD
-    val usernameField =
-      hints.any {
-        it == View.AUTOFILL_HINT_USERNAME || it == View.AUTOFILL_HINT_EMAIL_ADDRESS
-      } ||
-        (inputType and InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS) ==
-          InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS ||
-        (inputType and InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS) ==
-          InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS
+    val passwordField = isPasswordField(node, hints, inputType)
+    val usernameField = !passwordField && isUsernameField(node, hints, inputType)
     val otpField = isOtpField(node, hints, inputType)
     if (passwordField && fields.password == null) {
       fields.password = node.autofillId
@@ -187,20 +175,8 @@ class GlyxAutofillService : AutofillService() {
     node.webDomain?.let { fields.webDomain = it }
     val hints = node.autofillHints.orEmpty()
     val inputType = node.inputType
-    val passwordField =
-      hints.any { it == View.AUTOFILL_HINT_PASSWORD || it == "newPassword" } ||
-        (inputType and InputType.TYPE_TEXT_VARIATION_PASSWORD) ==
-          InputType.TYPE_TEXT_VARIATION_PASSWORD ||
-        (inputType and InputType.TYPE_NUMBER_VARIATION_PASSWORD) ==
-          InputType.TYPE_NUMBER_VARIATION_PASSWORD
-    val usernameField =
-      hints.any {
-        it == View.AUTOFILL_HINT_USERNAME || it == View.AUTOFILL_HINT_EMAIL_ADDRESS
-      } ||
-        (inputType and InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS) ==
-          InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS ||
-        (inputType and InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS) ==
-          InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS
+    val passwordField = isPasswordField(node, hints, inputType)
+    val usernameField = !passwordField && isUsernameField(node, hints, inputType)
     if (passwordField && fields.password == null) {
       fields.password = node.autofillId
       fields.passwordValue = node.autofillValue?.textValue?.toString().orEmpty()
@@ -212,6 +188,54 @@ class GlyxAutofillService : AutofillService() {
     for (index in 0 until node.childCount) {
       walkValues(node.getChildAt(index), fields)
     }
+  }
+
+  private fun fieldText(node: android.app.assist.AssistStructure.ViewNode): String =
+    listOfNotNull(node.idEntry, node.hint?.toString()).joinToString(" ").lowercase()
+
+  private fun isPasswordField(
+    node: android.app.assist.AssistStructure.ViewNode,
+    hints: Array<out String>,
+    inputType: Int,
+  ): Boolean {
+    if (hints.any { it == View.AUTOFILL_HINT_PASSWORD || it == "newPassword" }) return true
+    if ((inputType and InputType.TYPE_TEXT_VARIATION_PASSWORD) ==
+      InputType.TYPE_TEXT_VARIATION_PASSWORD
+    ) {
+      return true
+    }
+    if ((inputType and InputType.TYPE_NUMBER_VARIATION_PASSWORD) ==
+      InputType.TYPE_NUMBER_VARIATION_PASSWORD
+    ) {
+      return true
+    }
+    return node.autofillId != null && fieldText(node).contains("pass")
+  }
+
+  private fun isUsernameField(
+    node: android.app.assist.AssistStructure.ViewNode,
+    hints: Array<out String>,
+    inputType: Int,
+  ): Boolean {
+    if (hints.any {
+        it == View.AUTOFILL_HINT_USERNAME || it == View.AUTOFILL_HINT_EMAIL_ADDRESS
+      }
+    ) {
+      return true
+    }
+    if ((inputType and InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS) ==
+      InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+    ) {
+      return true
+    }
+    if ((inputType and InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS) ==
+      InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS
+    ) {
+      return true
+    }
+    if (node.autofillId == null) return false
+    val text = fieldText(node)
+    return listOf("user", "email", "login", "account", "identifier").any { text.contains(it) }
   }
 
   private fun isOtpField(
@@ -229,8 +253,7 @@ class GlyxAutofillService : AutofillService() {
     }
     val numeric = (inputType and InputType.TYPE_CLASS_NUMBER) == InputType.TYPE_CLASS_NUMBER
     if (!numeric) return false
-    val text = listOfNotNull(node.idEntry, node.hint?.toString()).joinToString(" ").lowercase()
-    return OTP_PATTERN.containsMatchIn(text)
+    return OTP_PATTERN.containsMatchIn(fieldText(node))
   }
 
   private fun buildResponse(

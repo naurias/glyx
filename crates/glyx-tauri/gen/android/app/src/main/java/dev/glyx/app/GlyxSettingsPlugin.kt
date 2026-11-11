@@ -22,8 +22,11 @@ class GlyxSettingsPlugin(private val host: Activity) : Plugin(host) {
 
   @Command
   fun openAutofillSettings(invoke: Invoke) {
-    open(Settings.ACTION_REQUEST_SET_AUTOFILL_SERVICE)
-    invoke.resolve(JSObject().put("ok", true))
+    if (open(Settings.ACTION_REQUEST_SET_AUTOFILL_SERVICE)) {
+      invoke.resolve(JSObject().put("ok", true))
+    } else {
+      invoke.reject("This device has no autofill settings screen")
+    }
   }
 
   @Command
@@ -32,11 +35,14 @@ class GlyxSettingsPlugin(private val host: Activity) : Plugin(host) {
       invoke.reject("Passkey settings require Android 14 or newer")
       return
     }
-    open(Settings.ACTION_CREDENTIAL_PROVIDER)
-    invoke.resolve(JSObject().put("ok", true))
+    if (open(Settings.ACTION_CREDENTIAL_PROVIDER)) {
+      invoke.resolve(JSObject().put("ok", true))
+    } else {
+      invoke.reject("This device has no passkey settings screen")
+    }
   }
 
-  private fun open(action: String) {
+  private fun open(action: String): Boolean = runCatching {
     host.startActivity(Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-  }
+  }.isSuccess
 }
