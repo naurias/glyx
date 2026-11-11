@@ -1,0 +1,7 @@
+<credential-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:settingsSubtitle="Autofill and passkeys from your glyx vault"
+    android:settingsActivity="dev.glyx.app.MainActivity">
+    <capabilities>
+        <capability name="androidx.credentials.TYPE_PUBLIC_KEY_CREDENTIAL" />
+    </capabilities>
+</credential-provider>

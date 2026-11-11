@@ -480,8 +480,11 @@ struct PasskeyCreateBody {
     request: serde_json::Value,
     #[serde(default)]
     user_verified: bool,
+    #[serde(default)]
+    client_data_hash: Option<String>,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn passkey_create(
     State(state): State<Arc<AppState>>,
     Json(body): Json<PasskeyCreateBody>,
@@ -489,6 +492,13 @@ async fn passkey_create(
     let options = match passkey::parse_creation(&body.request, &body.origin) {
         Ok(options) => options,
         Err(e) => return passkey_error(e),
+    };
+    let client_data_hash = match body.client_data_hash.as_deref() {
+        Some(value) => match passkey::decode_client_data_hash(value) {
+            Ok(hash) => Some(hash),
+            Err(e) => return passkey_error(e),
+        },
+        None => None,
     };
     let mut guard = state
         .vault
@@ -521,10 +531,12 @@ async fn passkey_create(
             Err(e) => return store_error(&e).into_response(),
         }
     }
-    let created = match passkey::create_credential(&options, body.user_verified) {
-        Ok(created) => created,
-        Err(e) => return passkey_error(e),
-    };
+    let created =
+        match passkey::create_credential(&options, body.user_verified, client_data_hash.as_deref())
+        {
+            Ok(created) => created,
+            Err(e) => return passkey_error(e),
+        };
     let now = now_ms();
     let name = if created.user_name.is_empty() {
         created.rp_name.clone()
@@ -591,6 +603,8 @@ struct PasskeyGetBody {
     item_id: Option<String>,
     #[serde(default)]
     user_verified: bool,
+    #[serde(default)]
+    client_data_hash: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -601,6 +615,13 @@ async fn passkey_get(
     let options = match passkey::parse_assertion(&body.request, &body.origin) {
         Ok(options) => options,
         Err(e) => return passkey_error(e),
+    };
+    let client_data_hash = match body.client_data_hash.as_deref() {
+        Some(value) => match passkey::decode_client_data_hash(value) {
+            Ok(hash) => Some(hash),
+            Err(e) => return passkey_error(e),
+        },
+        None => None,
     };
     let mut guard = state
         .vault
@@ -679,7 +700,12 @@ async fn passkey_get(
             "passkey is not in allowCredentials".into(),
         ));
     }
-    let assertion = match passkey::assert_credential(&options, &item, body.user_verified) {
+    let assertion = match passkey::assert_credential(
+        &options,
+        &item,
+        body.user_verified,
+        client_data_hash.as_deref(),
+    ) {
         Ok(assertion) => assertion,
         Err(e) => return passkey_error(e),
     };
@@ -5425,6 +5451,67 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["response"]["id"], credential_id);
         assert!(body["response"]["response"]["signature"].as_str().is_some());
+
+        let android_origin = "android:apk-key-hash:BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+        let client_data_hash = "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk";
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/passkeys/create",
+            Some(serde_json::json!({
+                "origin": android_origin,
+                "request": creation.clone(),
+                "user_verified": true,
+                "client_data_hash": client_data_hash
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["response"]["response"]["clientDataJSON"], "e30");
+        let android_item = body["item_id"].as_str().expect("android item").to_owned();
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/passkeys/get",
+            Some(serde_json::json!({
+                "origin": android_origin,
+                "item_id": android_item,
+                "user_verified": true,
+                "client_data_hash": client_data_hash,
+                "request": {
+                    "rpId": "example.com",
+                    "challenge": "b3RoZXItY2hhbGxlbmdl",
+                    "userVerification": "required"
+                }
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["response"]["response"]["clientDataJSON"], "e30");
+        assert!(body["response"]["response"]["signature"].as_str().is_some());
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/passkeys/get",
+            Some(serde_json::json!({
+                "origin": android_origin,
+                "item_id": android_item,
+                "user_verified": true,
+                "client_data_hash": "AAAA",
+                "request": {
+                    "rpId": "example.com",
+                    "challenge": "b3RoZXItY2hhbGxlbmdl",
+                    "userVerification": "required"
+                }
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 
         let (status, body) = call(
             state.clone(),

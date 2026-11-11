@@ -2,4 +2,6 @@
     <string name="app_name">"glyx"</string>
     <string name="main_activity_title">"glyx"</string>
     <string name="autofill_service_label">glyx autofill</string>
+    <string name="credential_provider_label">glyx passkeys</string>
+    <string name="unlock_glyx">Unlock glyx</string>
 </resources>

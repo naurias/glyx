@@ -18,9 +18,6 @@ import android.view.autofill.AutofillId
 import android.view.autofill.AutofillValue
 import android.widget.RemoteViews
 import org.json.JSONObject
-import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 
 class GlyxAutofillService : AutofillService() {
   companion object {
@@ -51,11 +48,6 @@ class GlyxAutofillService : AutofillService() {
     val name: String,
   )
 
-  private data class Session(
-    val url: String,
-    val token: String,
-  )
-
   override fun onFillRequest(
     request: FillRequest,
     cancellationSignal: CancellationSignal,
@@ -83,7 +75,7 @@ class GlyxAutofillService : AutofillService() {
       callback.onSuccess(null)
       return
     }
-    val session = readSession()
+    val session = GlyxClient.readSession(this)
     if (session == null) {
       callback.onSuccess(unlockResponse(fields))
       return
@@ -123,7 +115,7 @@ class GlyxAutofillService : AutofillService() {
       callback.onSuccess()
       return
     }
-    val session = readSession()
+    val session = GlyxClient.readSession(this)
     if (session == null) {
       callback.onFailure("glyx is locked; unlock and try again")
       return
@@ -242,7 +234,7 @@ class GlyxAutofillService : AutofillService() {
   }
 
   private fun buildResponse(
-    session: Session,
+    session: GlyxSession,
     fields: Fields,
     logins: List<Login>,
     totps: List<TotpItem>,
@@ -379,19 +371,8 @@ class GlyxAutofillService : AutofillService() {
     }.getOrNull()
   }
 
-  private fun readSession(): Session? {
-    val file = File(dataDir, "glyx-mobile.json")
-    if (!file.isFile) return null
-    return runCatching {
-      val json = JSONObject(file.readText())
-      val url = json.optString("url")
-      val token = json.optString("token")
-      if (url.isBlank() || token.isBlank()) null else Session(url, token)
-    }.getOrNull()
-  }
-
   private fun queryLogins(
-    session: Session,
+    session: GlyxSession,
     webDomain: String?,
     targetPackage: String,
   ): List<Login>? {
@@ -403,7 +384,7 @@ class GlyxAutofillService : AutofillService() {
       }
       put("limit", 10)
     }
-    val response = requestJson(session, "POST", "/v1/logins/list", body) ?: return null
+    val response = GlyxClient.request(session, "POST", "/v1/logins/list", body) ?: return null
     val matches = response.optJSONArray("matches") ?: return emptyList()
     val out = ArrayList<Login>()
     for (index in 0 until matches.length()) {
@@ -424,11 +405,11 @@ class GlyxAutofillService : AutofillService() {
     return out
   }
 
-  private fun queryTotpItems(session: Session, webDomain: String): List<TotpItem> {
+  private fun queryTotpItems(session: GlyxSession, webDomain: String): List<TotpItem> {
     val body = JSONObject()
       .put("origin", "https://$webDomain")
       .put("limit", 10)
-    val response = requestJson(session, "POST", "/v1/totp/list", body) ?: return emptyList()
+    val response = GlyxClient.request(session, "POST", "/v1/totp/list", body) ?: return emptyList()
     val matches = response.optJSONArray("matches") ?: return emptyList()
     val out = ArrayList<TotpItem>()
     for (index in 0 until matches.length()) {
@@ -441,12 +422,12 @@ class GlyxAutofillService : AutofillService() {
     return out
   }
 
-  private fun fetchCode(session: Session, itemId: String): String? {
-    val response = requestJson(session, "GET", "/v1/items/$itemId/totp") ?: return null
+  private fun fetchCode(session: GlyxSession, itemId: String): String? {
+    val response = GlyxClient.request(session, "GET", "/v1/items/$itemId/totp") ?: return null
     return response.optString("code").ifEmpty { null }
   }
 
-  private fun saveLogin(session: Session, fields: Fields, targetPackage: String): Boolean {
+  private fun saveLogin(session: GlyxSession, fields: Fields, targetPackage: String): Boolean {
     val host = fields.webDomain?.trim()?.lowercase()
     val packageName = if (host == null) targetPackage else ""
     val url = if (host != null) "https://$host" else ""
@@ -458,7 +439,7 @@ class GlyxAutofillService : AutofillService() {
       if (packageName.isNotEmpty()) put("package", packageName)
       put("username", username)
     }
-    val match = requestJson(session, "POST", "/v1/logins/match", matchBody)
+    val match = GlyxClient.request(session, "POST", "/v1/logins/match", matchBody)
       ?.optJSONObject("match")
     if (match != null) {
       val id = match.optString("id")
@@ -473,7 +454,7 @@ class GlyxAutofillService : AutofillService() {
           if (packageName.isNotEmpty()) put("package", packageName)
         },
       )
-      return requestJson(session, "PATCH", "/v1/items/$id", body) != null
+      return GlyxClient.request(session, "PATCH", "/v1/items/$id", body) != null
     }
     if (username.isEmpty()) return true
     val name = host ?: appLabel(targetPackage) ?: targetPackage
@@ -489,47 +470,11 @@ class GlyxAutofillService : AutofillService() {
           if (packageName.isNotEmpty()) put("package", packageName)
         },
       )
-    return requestJson(session, "POST", "/v1/items", body) != null
+    return GlyxClient.request(session, "POST", "/v1/items", body) != null
   }
 
   private fun appLabel(packageName: String): String? = runCatching {
     val info = packageManager.getApplicationInfo(packageName, 0)
     packageManager.getApplicationLabel(info).toString()
   }.getOrNull()
-
-  private fun requestJson(
-    session: Session,
-    method: String,
-    path: String,
-    body: JSONObject? = null,
-  ): JSONObject? {
-    var connection: HttpURLConnection? = null
-    return try {
-      val conn = (URL(session.url + path).openConnection() as HttpURLConnection).apply {
-        requestMethod = method
-        setRequestProperty("Authorization", "Bearer ${session.token}")
-        setRequestProperty("Accept", "application/json")
-        connectTimeout = 1500
-        readTimeout = 2500
-        if (body != null) {
-          doOutput = true
-          setRequestProperty("Content-Type", "application/json")
-        }
-      }
-      connection = conn
-      if (body != null) {
-        conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-      }
-      if (conn.responseCode !in 200..299) {
-        null
-      } else {
-        val text = conn.inputStream.bufferedReader().use { it.readText() }
-        if (text.isBlank()) JSONObject() else JSONObject(text)
-      }
-    } catch (_: Exception) {
-      null
-    } finally {
-      connection?.disconnect()
-    }
-  }
 }

@@ -113,8 +113,10 @@ pub struct PasskeyMetadata {
 #[derive(Debug)]
 struct OriginInfo {
     origin: String,
-    host: String,
+    host: Option<String>,
 }
+
+const ANDROID_ORIGIN_PREFIX: &str = "android:apk-key-hash:";
 
 #[allow(clippy::too_many_lines)]
 pub fn parse_creation(options: &Value, origin: &str) -> Result<CreationOptions, PasskeyError> {
@@ -124,7 +126,13 @@ pub fn parse_creation(options: &Value, origin: &str) -> Result<CreationOptions, 
         .and_then(Value::as_object)
         .ok_or_else(|| PasskeyError::BadRequest("missing rp".into()))?;
     let rp_id_raw = rp.get("id").and_then(Value::as_str);
-    let rp_id = validate_rp_id(&info.host, rp_id_raw.unwrap_or(&info.host))?;
+    let rp_id = match info.host.as_deref() {
+        Some(host) => validate_rp_id(Some(host), rp_id_raw.unwrap_or(host))?,
+        None => validate_rp_id(
+            None,
+            rp_id_raw.ok_or_else(|| PasskeyError::BadRequest("missing rp.id".into()))?,
+        )?,
+    };
     let rp_name = rp
         .get("name")
         .and_then(Value::as_str)
@@ -229,7 +237,13 @@ pub fn parse_creation(options: &Value, origin: &str) -> Result<CreationOptions, 
 pub fn parse_assertion(options: &Value, origin: &str) -> Result<AssertionOptions, PasskeyError> {
     let info = parse_origin(origin)?;
     let rp_id_raw = options.get("rpId").and_then(Value::as_str);
-    let rp_id = validate_rp_id(&info.host, rp_id_raw.unwrap_or(&info.host))?;
+    let rp_id = match info.host.as_deref() {
+        Some(host) => validate_rp_id(Some(host), rp_id_raw.unwrap_or(host))?,
+        None => validate_rp_id(
+            None,
+            rp_id_raw.ok_or_else(|| PasskeyError::BadRequest("missing rpId".into()))?,
+        )?,
+    };
     let challenge = options
         .get("challenge")
         .and_then(Value::as_str)
@@ -263,10 +277,16 @@ pub fn parse_assertion(options: &Value, origin: &str) -> Result<AssertionOptions
 pub fn create_credential(
     options: &CreationOptions,
     user_verified: bool,
+    client_data_hash: Option<&[u8]>,
 ) -> Result<CreatedPasskey, PasskeyError> {
     if options.user_verification == "required" && !user_verified {
         return Err(PasskeyError::NotAllowed(
             "user verification is required".into(),
+        ));
+    }
+    if client_data_hash.is_some_and(|hash| hash.len() != 32) {
+        return Err(PasskeyError::BadRequest(
+            "client data hash must be 32 bytes".into(),
         ));
     }
     let mut secret_bytes = [0u8; 32];
@@ -294,7 +314,11 @@ pub fn create_credential(
     let public_key_der = public
         .to_public_key_der()
         .map_err(|e| PasskeyError::BadRequest(e.to_string()))?;
-    let client_data = client_data("webauthn.create", &options.challenge, &options.origin)?;
+    let client_data = if client_data_hash.is_some() {
+        placeholder_client_data()
+    } else {
+        client_data("webauthn.create", &options.challenge, &options.origin)?
+    };
     let mut flags = 0x01 | 0x08 | 0x10 | 0x40;
     if user_verified {
         flags |= 0x04;
@@ -339,10 +363,16 @@ pub fn assert_credential(
     options: &AssertionOptions,
     item: &Item,
     user_verified: bool,
+    client_data_hash: Option<&[u8]>,
 ) -> Result<Assertion, PasskeyError> {
     if options.user_verification == "required" && !user_verified {
         return Err(PasskeyError::NotAllowed(
             "user verification is required".into(),
+        ));
+    }
+    if client_data_hash.is_some_and(|hash| hash.len() != 32) {
+        return Err(PasskeyError::BadRequest(
+            "client data hash must be 32 bytes".into(),
         ));
     }
     let field = |name: &str| item.fields.get(name).map(|f| f.value.expose());
@@ -364,8 +394,14 @@ pub fn assert_credential(
         .map_err(|_| PasskeyError::NotAllowed("passkey private key is invalid".into()))?;
     secret_bytes.zeroize();
     let signing_key = SigningKey::from(&secret);
-    let client_data = client_data("webauthn.get", &options.challenge, &options.origin)?;
-    let client_hash = Sha256::digest(&client_data);
+    let client_data = client_data_hash.map_or_else(
+        || client_data("webauthn.get", &options.challenge, &options.origin),
+        |_| Ok(placeholder_client_data()),
+    )?;
+    let client_hash = match client_data_hash {
+        Some(hash) => hash.to_vec(),
+        None => Sha256::digest(&client_data).to_vec(),
+    };
     let backup_eligible = field("backup_eligible")
         .and_then(parse_bool)
         .unwrap_or(true);
@@ -507,10 +543,37 @@ pub fn credential_id_eq(left: &str, right: &str) -> bool {
 
 pub fn validate_origin_rp(origin: &str, rp_id: &str) -> Result<String, PasskeyError> {
     let info = parse_origin(origin)?;
-    validate_rp_id(&info.host, rp_id)
+    validate_rp_id(info.host.as_deref(), rp_id)
+}
+
+pub fn decode_client_data_hash(value: &str) -> Result<Vec<u8>, PasskeyError> {
+    let bytes = decode_b64(value)?;
+    if bytes.len() != 32 {
+        return Err(PasskeyError::BadRequest(
+            "client data hash must be 32 bytes".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn placeholder_client_data() -> Vec<u8> {
+    b"{}".to_vec()
 }
 
 fn parse_origin(origin: &str) -> Result<OriginInfo, PasskeyError> {
+    if let Some(encoded) = origin.strip_prefix(ANDROID_ORIGIN_PREFIX) {
+        let hash = decode_b64(encoded)
+            .map_err(|_| PasskeyError::Security("invalid Android origin hash".into()))?;
+        if hash.len() != 32 {
+            return Err(PasskeyError::Security(
+                "Android origin hash must be 32 bytes".into(),
+            ));
+        }
+        return Ok(OriginInfo {
+            origin: format!("{ANDROID_ORIGIN_PREFIX}{encoded}"),
+            host: None,
+        });
+    }
     let parsed = Url::parse(origin).map_err(|_| PasskeyError::Security("invalid origin".into()))?;
     let host = parsed
         .host_str()
@@ -525,19 +588,21 @@ fn parse_origin(origin: &str) -> Result<OriginInfo, PasskeyError> {
     }
     Ok(OriginInfo {
         origin: parsed.origin().ascii_serialization(),
-        host,
+        host: Some(host),
     })
 }
 
-fn validate_rp_id(origin_host: &str, rp_id: &str) -> Result<String, PasskeyError> {
+fn validate_rp_id(origin_host: Option<&str>, rp_id: &str) -> Result<String, PasskeyError> {
     let rp_id = rp_id.trim_end_matches('.').to_ascii_lowercase();
     if rp_id.is_empty() {
         return Err(PasskeyError::Security("empty rp id".into()));
     }
-    if rp_id != origin_host && !origin_host.ends_with(&format!(".{rp_id}")) {
-        return Err(PasskeyError::Security(
-            "rp id is not a suffix of the origin host".into(),
-        ));
+    if let Some(host) = origin_host {
+        if rp_id != host && !host.ends_with(&format!(".{rp_id}")) {
+            return Err(PasskeyError::Security(
+                "rp id is not a suffix of the origin host".into(),
+            ));
+        }
     }
     let local = rp_id == "localhost" || rp_id.parse::<std::net::IpAddr>().is_ok();
     if !local && psl::domain_str(&rp_id).is_none() {
@@ -678,7 +743,7 @@ mod tests {
     #[test]
     fn create_response_has_chromium_required_fields() {
         let parsed = parse_creation(&creation_options(), "https://example.com").expect("parse");
-        let created = create_credential(&parsed, true).expect("create");
+        let created = create_credential(&parsed, true, None).expect("create");
         let response = &created.response["response"];
         let auth_data = decode_b64(
             response["authenticatorData"]
@@ -729,7 +794,7 @@ mod tests {
     #[test]
     fn create_and_assert_roundtrip() {
         let parsed = parse_creation(&creation_options(), "https://example.com").expect("parse");
-        let created = create_credential(&parsed, true).expect("create");
+        let created = create_credential(&parsed, true, None).expect("create");
         let attestation = decode_b64(
             created.response["response"]["attestationObject"]
                 .as_str()
@@ -786,7 +851,7 @@ mod tests {
             "https://example.com",
         )
         .expect("parse assertion");
-        let assertion = assert_credential(&options, &item, true).expect("assert");
+        let assertion = assert_credential(&options, &item, true, None).expect("assert");
         assert_eq!(assertion.response["id"], created.credential_id);
         let signature = assertion.response["response"]["signature"]
             .as_str()
@@ -808,8 +873,103 @@ mod tests {
         if let Some(handle) = item.fields.get_mut("user_handle") {
             handle.value = glyx_core::SecretString::new(String::new());
         }
-        let assertion = assert_credential(&options, &item, true).expect("assert empty handle");
+        let assertion =
+            assert_credential(&options, &item, true, None).expect("assert empty handle");
         assert!(assertion.response["response"]["userHandle"].is_null());
+    }
+
+    #[test]
+    fn android_origin_uses_client_data_hash() {
+        let origin = format!("android:apk-key-hash:{}", encode_b64(&[7u8; 32]));
+        let parsed = parse_creation(&creation_options(), &origin).expect("parse android");
+        assert_eq!(parsed.rp_id, "example.com");
+        let hash = [9u8; 32];
+        let created = create_credential(&parsed, true, Some(&hash)).expect("create");
+        let placeholder = decode_b64(
+            created.response["response"]["clientDataJSON"]
+                .as_str()
+                .expect("clientDataJSON"),
+        )
+        .expect("placeholder");
+        assert_eq!(placeholder, b"{}");
+
+        let hlc = glyx_core::Hlc {
+            wall_ms: 1,
+            seq: 0,
+            node: glyx_core::DeviceId::zero(),
+        };
+        let mut item = Item {
+            id: uuid::Uuid::now_v7(),
+            item_type: ItemType::Passkey,
+            name: "example".into(),
+            folder: String::new(),
+            tags: Vec::new(),
+            favorite: false,
+            fields: std::collections::BTreeMap::new(),
+            hlc,
+            rev: 1,
+            deleted: false,
+            updated_by: glyx_core::DeviceId::zero(),
+        };
+        for (key, value) in [
+            ("relying_party", created.rp_id.clone()),
+            ("user_handle", created.user_handle.clone()),
+            ("credential_id", created.credential_id.clone()),
+            ("private_key", created.private_key.clone()),
+        ] {
+            item.fields.insert(
+                key.to_owned(),
+                glyx_core::Field {
+                    value: glyx_core::SecretString::new(value),
+                    field_hlc: hlc,
+                },
+            );
+        }
+        let options = parse_assertion(
+            &json!({
+                "rpId": "example.com",
+                "challenge": "b3RoZXItY2hhbGxlbmdl",
+                "userVerification": "required",
+                "allowCredentials": [{"type": "public-key", "id": created.credential_id}]
+            }),
+            &origin,
+        )
+        .expect("parse assertion");
+        let assertion = assert_credential(&options, &item, true, Some(&hash)).expect("assert");
+        let signature = assertion.response["response"]["signature"]
+            .as_str()
+            .expect("signature");
+        let auth_data = assertion.response["response"]["authenticatorData"]
+            .as_str()
+            .expect("auth data");
+        let secret =
+            SecretKey::from_slice(&decode_b64(&created.private_key).expect("key")).expect("secret");
+        let verifying = VerifyingKey::from(secret.public_key());
+        let signature = Signature::from_der(&decode_b64(signature).expect("der")).expect("sig");
+        let mut signed = decode_b64(auth_data).expect("auth");
+        signed.extend_from_slice(&hash);
+        verifying.verify(&signed, &signature).expect("verify");
+
+        let short = format!("android:apk-key-hash:{}", encode_b64(&[1u8; 3]));
+        assert!(matches!(
+            parse_creation(&creation_options(), &short),
+            Err(PasskeyError::Security(_))
+        ));
+        let missing = json!({
+            "user": {"id": "dXNlcg", "name": "alice"},
+            "challenge": "Y2hhbGxlbmdl",
+            "pubKeyCredParams": [{"type": "public-key", "alg": -7}]
+        });
+        assert!(matches!(
+            parse_creation(&missing, &origin),
+            Err(PasskeyError::BadRequest(_))
+        ));
+        let mut bad_rp = creation_options();
+        bad_rp["rp"]["id"] = json!("not-a-domain");
+        assert!(matches!(
+            parse_creation(&bad_rp, &origin),
+            Err(PasskeyError::Security(_))
+        ));
     }
 
     #[test]
@@ -822,7 +982,7 @@ mod tests {
     #[test]
     fn metadata_and_lookup() {
         let parsed = parse_creation(&creation_options(), "https://example.com").expect("parse");
-        let created = create_credential(&parsed, true).expect("create");
+        let created = create_credential(&parsed, true, None).expect("create");
         let item = Item {
             id: uuid::Uuid::now_v7(),
             item_type: ItemType::Passkey,
