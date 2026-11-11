@@ -359,14 +359,23 @@ pub fn run() {
                     mobile::capture_initial_link(app.handle());
                 }
                 let script = mobile_script(app.handle());
-                tauri::WebviewWindowBuilder::new(
+                let builder = tauri::WebviewWindowBuilder::new(
                     app,
                     "main",
                     tauri::WebviewUrl::App("index.html".into()),
                 )
                 .title("glyx")
-                .initialization_script(&script)
-                .build()?;
+                .initialization_script(&script);
+                #[cfg(target_os = "android")]
+                let builder = {
+                    let handle = app.handle().clone();
+                    builder.on_page_load(move |_window, payload| {
+                        if payload.event() == tauri::webview::PageLoadEvent::Finished {
+                            mobile::flush_pending(&handle);
+                        }
+                    })
+                };
+                builder.build()?;
             }
             Ok(())
         })

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use tauri::plugin::{Builder, PluginHandle, TauriPlugin};
@@ -19,6 +20,8 @@ fn settings_plugin() -> TauriPlugin<Wry> {
 }
 
 static PENDING_OTPAUTH: Mutex<Option<String>> = Mutex::new(None);
+
+static PAGE_LOADED: AtomicBool = AtomicBool::new(false);
 
 fn otpauth_script(raw: &str) -> Option<String> {
     if raw.len() > 8192 || !raw.to_ascii_lowercase().starts_with("otpauth://totp/") {
@@ -54,12 +57,13 @@ pub fn install_link_listener(app: &AppHandle) {
             let Some(script) = otpauth_script(url.as_str()) else {
                 continue;
             };
-            match handle.get_webview_window("main") {
-                Some(window) => {
+            if PAGE_LOADED.load(Ordering::Relaxed) {
+                if let Some(window) = handle.get_webview_window("main") {
                     let _ = window.eval(&script);
+                    continue;
                 }
-                None => remember(url.as_str()),
             }
+            remember(url.as_str());
         }
     });
 }
@@ -69,6 +73,22 @@ pub fn capture_initial_link(app: &AppHandle) {
         for url in urls {
             remember(url.as_str());
         }
+    }
+}
+
+pub fn flush_pending(app: &AppHandle) {
+    PAGE_LOADED.store(true, Ordering::Relaxed);
+    let Some(uri) = take_pending_link() else {
+        return;
+    };
+    let Some(script) = otpauth_script(&uri) else {
+        return;
+    };
+    match app.get_webview_window("main") {
+        Some(window) => {
+            let _ = window.eval(&script);
+        }
+        None => remember(&uri),
     }
 }
 
