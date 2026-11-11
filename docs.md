@@ -137,9 +137,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo audit
 pnpm --dir apps/webui build
+node --test apps/extension/test.mjs
+node apps/extension/build.mjs all --check
 ```
 
-Current expected count: **126/126 nextest** on `refine-ui-files`. The detailed Arch
+Current expected count: **133/133 nextest** on `refine-ui-files`. The detailed Arch
 component-by-component guide is `local/build-without-nix.md` in the development
 checkout; the public summary is in `README.md`.
 
@@ -800,15 +802,17 @@ manifest key, so its id is
 for a development build loaded without that key.
 
 The popup searches items (ranking candidates by registrable domain), has a Fill
-button for username/password, a TOTP button, a Passkeys toggle, and a Lock
-button. Filling sets input values and dispatches `input`/`change` events; it
-never auto-submits a form. Passkeys need Chromium 115+ because the manifest
-declares `webAuthenticationProxy`; Firefox gets fill and capture but not a
-passkey provider.
+button for username/password, a TOTP button, **Save logins** and **Save TOTP**
+toggles, a **Save TOTP from page** scan, a Passkeys toggle, a Lock button, and a
+diagnostics block. Filling sets input values and dispatches `input`/`change`
+events; it never auto-submits a form. Passkeys need Chromium 115+ because the
+manifest declares `webAuthenticationProxy`; Firefox gets fill and capture but
+not a passkey provider.
 
-The native host exposes `status`, `search`, `fill`, `totp`, `lock`, and the
-passkey operations described below. The extension cannot unlock the vault or
-manage vaults, exports, sync, or SSH.
+The native host exposes `status`, `search`, `fill`, `totp`, `lock`,
+`login_match`, `login_save`, `login_update`, `totp_save`, and the passkey
+operations described below. The extension cannot unlock the vault, delete items,
+or manage vaults, exports, sync, or SSH.
 
 ### Browsers
 
@@ -824,6 +828,24 @@ extension origin, so an RP must explicitly allowlist it. That API cannot make
 glyx the authenticator. The popup links to a diagnostic spike page
 (`firefox-passkey.html`) that demonstrates the behavior; passkeys remain
 Chromium-only.
+
+### Capture
+
+On form submission the content script offers to save or update a login. It
+never auto-saves or auto-submits. If an existing login matches the origin host
+and username, the prompt offers **Update**; if the stored password already
+matches, no prompt appears. Signup forms (`autocomplete="new-password"`) are
+skipped, and multi-step logins remember the username for the password step.
+
+TOTP capture finds `otpauth://` links and text, setup-key inputs, and (where
+`BarcodeDetector` is available) QR codes. **Save TOTP from page** in the popup
+runs the same scan, including QR decoding where supported. Saved TOTP items link
+to a matching login through `login_id`.
+
+Both capture toggles default on. Credentials only travel from the content script
+to the extension background to the local native host; nothing is posted to a
+remote server. The popup's diagnostics block shows the daemon state, vault path,
+browser, and passkey attach state.
 
 ### Passkeys
 
@@ -852,6 +874,8 @@ Known limits:
   extension WebAuthn API is a client API, not an authenticator provider.
 - Cross-origin iframe requests fall back to the browser because Chrome does not
   expose the iframe origin to the proxy.
+- Capture runs in the top frame; login forms inside cross-origin iframes are not
+  captured.
 - Existing passkeys in Chrome, Google Password Manager, or Apple cannot be
   imported; passkeys are non-exportable. glyx can only capture passkeys created
   while it is the selected provider.

@@ -160,6 +160,7 @@ pub fn http(
     Ok((status, json))
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle(req: &Call) -> Response {
     let rid = req.request_id;
     let fail = |e: anyhow::Error| Response {
@@ -225,6 +226,35 @@ fn handle(req: &Call) -> Response {
             "/v1/passkeys/get",
             Some(&req.args),
         ),
+        "login_match" => http(
+            record.port,
+            &record.token,
+            "POST",
+            "/v1/logins/match",
+            Some(&req.args),
+        ),
+        "login_save" | "totp_save" => http(
+            record.port,
+            &record.token,
+            "POST",
+            "/v1/items",
+            Some(&req.args),
+        ),
+        "login_update" => {
+            let id = req.args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let fields = req
+                .args
+                .get("fields")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            http(
+                record.port,
+                &record.token,
+                "PATCH",
+                &format!("/v1/items/{}", percent_encode(id)),
+                Some(&serde_json::json!({"fields": fields})),
+            )
+        }
         other => return fail(anyhow::anyhow!("unknown op {other}")),
     };
     match out {

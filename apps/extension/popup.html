@@ -3,12 +3,14 @@
   <head>
     <meta charset="utf-8" />
     <style>
-      body { width: 320px; font-family: system-ui, sans-serif; background: #14161a; color: #e8eaf0; margin: 0; }
+      body { width: 340px; font-family: system-ui, sans-serif; background: #14161a; color: #e8eaf0; margin: 0; }
       header { padding: 10px 12px; border-bottom: 1px solid #2c313a; display: flex; gap: 8px; }
       input { flex: 1; background: #1c1f25; color: inherit; border: 1px solid #2c313a; border-radius: 6px; padding: 6px; }
+      input[type="checkbox"] { flex: none; }
       button { background: #1c1f25; color: inherit; border: 1px solid #2c313a; border-radius: 6px; padding: 6px 8px; cursor: pointer; }
       .item { padding: 8px 12px; border-bottom: 1px solid #2c313a; }
       .item .row { display: flex; gap: 6px; margin-top: 6px; }
+      .settings { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
       .dim { color: #9aa1b2; font-size: 12px; }
       .err { padding: 8px 12px; color: #ff7a7a; }
     </style>
@@ -18,11 +20,19 @@
       <input id="q" placeholder="Search vault" />
       <button id="lock">Lock</button>
     </header>
-    <div class="item dim">
+    <div class="item dim settings">
+      <label><input id="capture-logins" type="checkbox" /> Save logins</label>
+      <label><input id="capture-totp" type="checkbox" /> Save TOTP</label>
+    </div>
+    <div class="item dim settings">
       <label><input id="passkeys" type="checkbox" /> Passkeys</label>
       <span id="passkey-status"></span>
       <button id="spike" hidden>Firefox passkey spike</button>
     </div>
+    <div class="item dim">
+      <button id="scan-totp">Save TOTP from page</button>
+    </div>
+    <div id="diag" class="item dim"></div>
     <div id="err"></div>
     <div id="list"></div>
     <script src="compat.js"></script>

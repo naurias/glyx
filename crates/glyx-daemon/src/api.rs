@@ -221,6 +221,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/passkeys/lookup", post(passkey_lookup))
         .route("/v1/passkeys/create", post(passkey_create))
         .route("/v1/passkeys/get", post(passkey_get))
+        .route("/v1/logins/match", post(match_login))
         .route("/v1/status", get(status))
         .route(
             "/v1/vaults",
@@ -1732,6 +1733,77 @@ async fn totp_code(
         )
             .into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct MatchLoginBody {
+    origin: String,
+    #[serde(default)]
+    username: String,
+}
+
+fn host_matches(left: &str, right: &str) -> bool {
+    left == right || left.ends_with(&format!(".{right}")) || right.ends_with(&format!(".{left}"))
+}
+
+async fn match_login(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<MatchLoginBody>,
+) -> impl IntoResponse {
+    let guard = state
+        .vault
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(uv) = guard.as_ref() else {
+        return locked_error().into_response();
+    };
+    let Some(host) = url_host(&body.origin) else {
+        return Json(serde_json::json!({"match": null})).into_response();
+    };
+    let rows = match uv.list(false) {
+        Ok(rows) => rows,
+        Err(e) => return store_error(&e).into_response(),
+    };
+    for row in rows {
+        if row.item_type != "login" {
+            continue;
+        }
+        let Ok(Some(item)) = uv.get_item(&row.id) else {
+            continue;
+        };
+        let Some(item_host) = item
+            .fields
+            .get("url")
+            .and_then(|field| url_host(field.value.expose()))
+        else {
+            continue;
+        };
+        if !host_matches(&item_host, &host) {
+            continue;
+        }
+        let username = item
+            .fields
+            .get("username")
+            .map_or("", |field| field.value.expose());
+        if !body.username.is_empty() && username != body.username.as_str() {
+            continue;
+        }
+        let password = item
+            .fields
+            .get("password")
+            .map_or("", |field| field.value.expose());
+        return Json(serde_json::json!({
+            "match": {
+                "id": item.id,
+                "name": item.name,
+                "username": username,
+                "url": item.fields.get("url").map_or("", |field| field.value.expose()),
+                "password": password,
+            }
+        }))
+        .into_response();
+    }
+    Json(serde_json::json!({"match": null})).into_response()
 }
 
 fn url_host(url: &str) -> Option<String> {
@@ -5062,6 +5134,84 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert_eq!(body["name"], "NotAllowedError");
+    }
+
+    #[tokio::test]
+    async fn match_login_by_host_and_username() {
+        let cfg = tempfile::tempdir().expect("config dir");
+        std::env::set_var("GLYX_CONFIG", cfg.path().join("config.toml"));
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": "pw", "keyfile": kf_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/items",
+            Some(serde_json::json!({
+                "type": "login",
+                "name": "example.com",
+                "fields": {
+                    "username": "alice",
+                    "password": "secret",
+                    "url": "https://example.com"
+                }
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/logins/match",
+            Some(serde_json::json!({
+                "origin": "https://login.example.com",
+                "username": "alice"
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["match"]["username"], "alice");
+        assert_eq!(body["match"]["password"], "secret");
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/logins/match",
+            Some(serde_json::json!({
+                "origin": "https://example.com",
+                "username": "bob"
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["match"].is_null());
+
+        let (status, body) = call(
+            state,
+            "POST",
+            "/v1/logins/match",
+            Some(serde_json::json!({
+                "origin": "https://other.example",
+                "username": "alice"
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["match"].is_null());
     }
 
     #[tokio::test]

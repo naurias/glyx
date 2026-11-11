@@ -370,6 +370,7 @@ node apps/extension/build.mjs all
 glyx --vault ~/vaults/main.glyx extension install --all
 # load apps/extension/dist/chromium or apps/extension/dist/firefox
 # passkeys: Chromium 115+; Firefox gets fill and capture only
+# capture: prompts to save/update logins and TOTP from page forms
 
 # Git HTTPS credentials (no prompts after one unlock)
 glyx git setup

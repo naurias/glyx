@@ -72,6 +72,14 @@ async function passkeysEnabled() {
   return !!stored && stored.passkeysEnabled === true;
 }
 
+async function captureSettings() {
+  const stored = await compat.storageGet(['captureLogins', 'captureTotp']);
+  return {
+    captureLogins: !stored || stored.captureLogins !== false,
+    captureTotp: !stored || stored.captureTotp !== false
+  };
+}
+
 async function setPasskeyError(message) {
   passkeyError = message || '';
   await compat.storageSet({ passkeyError });
@@ -93,7 +101,7 @@ async function attachPasskeys() {
 }
 
 async function detachPasskeys() {
-  if (!proxyAvailable() || !passkeyAttached) return;
+  if (!proxyAvailable()) return;
   try {
     await proxy.detach();
   } catch {
@@ -150,10 +158,12 @@ function rpAllowed(host, rpId) {
 
 async function completePasskey(kind, requestId, responseJson) {
   try {
-    if (kind === 'create') {
-      return await proxy.completeCreateRequest({ requestId, responseJson });
-    }
-    return await proxy.completeGetRequest({ requestId, responseJson });
+    const result =
+      kind === 'create'
+        ? await proxy.completeCreateRequest({ requestId, responseJson })
+        : await proxy.completeGetRequest({ requestId, responseJson });
+    await setPasskeyError('');
+    return result;
   } catch (e) {
     await setPasskeyError(String((e && e.message) || e));
     throw e;
@@ -322,6 +332,7 @@ if (proxyAvailable()) {
   });
   proxy.onIsUvpaaRequest.addListener((info) => {
     passkeysEnabled()
+      .catch(() => false)
       .then((enabled) =>
         proxy.completeIsUvpaaRequest({
           requestId: info.requestId,
@@ -361,7 +372,9 @@ native.runtime.onMessage.addListener((msg, sender, reply) => {
   (async () => {
     if (msg.kind === 'search') {
       const items = await send('search', { query: msg.query || '' });
-      const domain = glyxLib.registrable(new URL(sender.url).hostname);
+      const senderUrl =
+        sender.url || (sender.tab && sender.tab.url) || 'https://localhost/';
+      const domain = glyxLib.registrable(new URL(senderUrl).hostname);
       const scored = (Array.isArray(items) ? items : [])
         .map((item) => ({
           item,
@@ -380,6 +393,75 @@ native.runtime.onMessage.addListener((msg, sender, reply) => {
       reply(await send('status'));
     } else if (msg.kind === 'lock') {
       reply(await send('lock'));
+    } else if (msg.kind === 'capture-settings') {
+      reply({ ok: true, settings: await captureSettings() });
+    } else if (msg.kind === 'set-capture-settings') {
+      const settings = {
+        captureLogins: msg.settings?.captureLogins !== false,
+        captureTotp: msg.settings?.captureTotp !== false
+      };
+      await compat.storageSet(settings);
+      reply({ ok: true, settings });
+    } else if (msg.kind === 'capture-login') {
+      const settings = await captureSettings();
+      if (!settings.captureLogins) {
+        reply({ ok: true, action: 'none' });
+        return;
+      }
+      const result = await send('login_match', {
+        origin: msg.origin,
+        username: msg.username
+      });
+      const match = result && result.match;
+      if (match && match.password === msg.password) {
+        reply({ ok: true, action: 'none' });
+        return;
+      }
+      reply({ ok: true, action: match ? 'update' : 'create', match: match || null });
+    } else if (msg.kind === 'capture-save-login') {
+      const site =
+        glyxLib.hostFromUrl(msg.url) || glyxLib.hostFromUrl(msg.origin);
+      const fields = {
+        username: msg.username || '',
+        password: msg.password || '',
+        url: msg.url || msg.origin || ''
+      };
+      if (msg.action === 'update' && msg.itemId) {
+        await send('login_update', {
+          id: msg.itemId,
+          fields: {
+            username: fields.username,
+            password: fields.password,
+            url: fields.url
+          }
+        });
+        reply({ ok: true, id: msg.itemId });
+      } else {
+        const saved = await send('login_save', {
+          type: 'login',
+          name: site ? site.host : msg.origin || 'login',
+          fields
+        });
+        reply({ ok: true, id: saved && saved.id });
+      }
+    } else if (msg.kind === 'capture-save-totp') {
+      const site =
+        glyxLib.hostFromUrl(msg.url) || glyxLib.hostFromUrl(msg.origin);
+      const candidate = msg.candidate || {};
+      const fields = { seed: candidate.uri || candidate.secret || '' };
+      if (!fields.seed) {
+        reply({ ok: false, error: 'no TOTP secret found' });
+        return;
+      }
+      if (candidate.digits) fields.digits = String(candidate.digits);
+      if (candidate.period) fields.period = String(candidate.period);
+      if (msg.loginId) fields.login_id = msg.loginId;
+      const saved = await send('totp_save', {
+        type: 'totp',
+        name: candidate.issuer || candidate.account || (site ? site.host : 'totp'),
+        fields
+      });
+      reply({ ok: true, id: saved && saved.id });
     } else if (msg.kind === 'passkey-settings') {
       reply({
         ok: true,
