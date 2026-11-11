@@ -1,6 +1,7 @@
 <script>
   import { renderMarkdown } from './markdown.js';
   import { generatePassword } from './pass.js';
+  import { api } from './api.js';
   import { parseOtpauth } from './totp.js';
   import { canScanQr, pasteTotp, scanTotp } from './totp-capture.js';
 
@@ -32,12 +33,27 @@
     form = { ...form };
   }
 
-  function applyTotp(raw) {
+  async function applyTotp(raw) {
     captureError = '';
     const text = String(raw || '').trim();
     if (!text) return;
-    const parsed = parseOtpauth(text);
     form.seed = text;
+    let parsed = parseOtpauth(text);
+    if (text.toLowerCase().startsWith('otpauth://')) {
+      try {
+        const info = await api.parseTotp({ uri: text });
+        if (info?.ok) {
+          parsed = {
+            issuer: info.issuer || '',
+            account: info.account || '',
+            digits: info.digits,
+            period: info.period
+          };
+        }
+      } catch {
+        // Keep the local parse when the daemon is unavailable.
+      }
+    }
     if (parsed) {
       if (parsed.digits) form.digits = String(parsed.digits);
       if (parsed.period) form.period = String(parsed.period);

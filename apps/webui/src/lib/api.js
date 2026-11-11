@@ -194,6 +194,7 @@ export const api = {
   edit: (id, body) => req('PATCH', `/v1/items/${id}`, body),
   remove: (id) => req('DELETE', `/v1/items/${id}`),
   totp: (id) => req('GET', `/v1/items/${id}/totp`),
+  parseTotp: (body) => req('POST', '/v1/totp/parse', body),
   related: (id) => req('GET', `/v1/items/${id}/related`),
   link: (id, child) => req('POST', `/v1/items/${id}/link`, { child }),
   unlink: (id, child) => req('POST', `/v1/items/${id}/unlink`, { child }),

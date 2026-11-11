@@ -38,6 +38,14 @@
       if (!uri) return;
       item_type = 'totp';
       totpSeed = uri;
+      const parsed = parseOtpauth(uri);
+      if (parsed && !name.trim()) {
+        name = parsed.issuer
+          ? parsed.account
+            ? `${parsed.issuer} (${parsed.account})`
+            : parsed.issuer
+          : parsed.account || '';
+      }
       totpCapture.set('');
     });
     load();
