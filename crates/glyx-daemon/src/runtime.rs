@@ -95,6 +95,7 @@ pub fn read_record() -> Option<DaemonRecord> {
 }
 
 pub fn write_record(record: &DaemonRecord) -> std::io::Result<()> {
+    glyx_store::session::ensure_session_dir()?;
     let path = record_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
