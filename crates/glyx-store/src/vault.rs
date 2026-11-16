@@ -55,6 +55,7 @@ impl Vault {
     }
     pub fn try_lock(&self) -> Result<fs::File, StoreError> {
         let dir = crate::session::session_dir().join("locks");
+        crate::session::ensure_session_dir()?;
         fs::create_dir_all(&dir)?;
         harden_dir(&dir);
         let canonical =

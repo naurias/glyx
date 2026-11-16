@@ -32,14 +32,35 @@ pub fn session_dir() -> PathBuf {
     std::env::temp_dir().join("glyx-sessions")
 }
 
+/// Create the runtime directory and tighten it to owner-only access.
+///
+/// Session tickets, the daemon record (token), the agent ledger and the
+/// SSH-agent socket all live here, so the directory itself must never be
+/// world-readable or world-writable. Callers that only *read* the path can use
+/// [`session_dir`] without paying for the filesystem call.
+pub fn ensure_session_dir() -> std::io::Result<()> {
+    let dir = session_dir();
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if std::fs::symlink_metadata(&dir)?.file_type().is_dir() {
+            let current = std::fs::metadata(&dir)?.permissions().mode() & 0o777;
+            if current & 0o077 != 0 {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[must_use]
 pub fn session_path(vault_id: &Uuid) -> PathBuf {
     session_dir().join(format!("{SESSION_PREFIX}{}.json", vault_id.as_simple()))
 }
 
 fn write_file(ticket: &TicketFile) -> Result<(), StoreError> {
-    let dir = session_dir();
-    std::fs::create_dir_all(&dir)?;
+    ensure_session_dir()?;
     let path = session_path(&ticket.vault_id);
     std::fs::write(
         &path,
