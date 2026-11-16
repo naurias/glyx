@@ -210,6 +210,28 @@ pub fn load_identities(
     Ok(out)
 }
 
+/// Bind the agent socket and restrict it to the owning user.
+///
+/// Without an explicit mode the socket inherits the process umask, which is
+/// frequently permissive enough for another local user to connect and ask for
+/// signatures. The runtime directory is tightened by
+/// [`glyx_store::session::ensure_session_dir`].
+fn bind_socket(path: &Path) -> Result<UnixListener, SshAgentError> {
+    if path.exists() {
+        std::fs::remove_file(path).ok();
+    }
+    let listener = UnixListener::bind(path)?;
+    glyx_store::session::ensure_session_dir().ok();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket()) {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    Ok(listener)
+}
+
 fn read_u32(data: &[u8], pos: &mut usize) -> Option<u32> {
     let bytes: [u8; 4] = data.get(*pos..*pos + 4)?.try_into().ok()?;
     *pos += 4;
@@ -328,10 +350,7 @@ fn serve_conn_state(state: &AgentState, stream: &mut UnixStream) {
 }
 
 pub fn serve_until_state(path: &Path, state: &Arc<AgentState>) -> Result<(), SshAgentError> {
-    if path.exists() {
-        std::fs::remove_file(path).ok();
-    }
-    let listener = UnixListener::bind(path)?;
+    let listener = bind_socket(path)?;
     listener.set_nonblocking(true)?;
     while !state.stop.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -350,10 +369,7 @@ pub fn serve_until_state(path: &Path, state: &Arc<AgentState>) -> Result<(), Ssh
 }
 
 pub fn serve(path: &Path, identities: &[AgentIdentity]) -> Result<(), SshAgentError> {
-    if path.exists() {
-        std::fs::remove_file(path).ok();
-    }
-    let listener = UnixListener::bind(path)?;
+    let listener = bind_socket(path)?;
     for stream in listener.incoming().flatten() {
         let mut stream = stream;
         serve_conn(identities, &mut stream);
@@ -366,10 +382,7 @@ pub fn serve_until(
     identities: &[AgentIdentity],
     stop: &std::sync::atomic::AtomicBool,
 ) -> Result<(), SshAgentError> {
-    if path.exists() {
-        std::fs::remove_file(path).ok();
-    }
-    let listener = UnixListener::bind(path)?;
+    let listener = bind_socket(path)?;
     listener.set_nonblocking(true)?;
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         match listener.accept() {

@@ -4399,6 +4399,29 @@ struct SshExportBody {
     perm: Option<u32>,
 }
 
+/// Reduce an item name to a safe single path component.
+///
+/// Item names are user data and may contain separators or traversal sequences,
+/// so they are never used verbatim in a default output path.
+fn safe_target_component(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(|c| c == '.' || c == '_');
+    if trimmed.is_empty() {
+        "key".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 async fn ssh_export(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SshExportBody>,
@@ -4418,7 +4441,7 @@ async fn ssh_export(
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
         PathBuf::from(home)
             .join(".ssh")
-            .join(format!("glyx_{}", item.name))
+            .join(format!("glyx_{}", safe_target_component(&item.name)))
     });
     let conn = match glyx_agent::ledger::open_db() {
         Ok(conn) => conn,
@@ -6193,6 +6216,55 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(target.exists());
+    }
+
+    #[test]
+    fn derived_export_names_stay_in_the_ssh_folder() {
+        assert_eq!(safe_target_component("work@key"), "work_key");
+        assert_eq!(safe_target_component("../../etc/passwd"), "etc_passwd");
+        assert_eq!(safe_target_component(".."), "key");
+        assert_eq!(safe_target_component(""), "key");
+        assert_eq!(safe_target_component("id_ed25519"), "id_ed25519");
+    }
+
+    #[tokio::test]
+    async fn export_rejects_world_readable_modes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("GLYX_CONFIG", dir.path().join("config.toml"));
+        let (_d, state) = test_state();
+        let kf_path = test_kf();
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/v1/unlock",
+            Some(serde_json::json!({"password": "pw", "keyfile": kf_path})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/ssh-gen",
+            Some(serde_json::json!({"name": "key"})),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/v1/ssh/export",
+            Some(serde_json::json!({
+                "item": "key",
+                "to": dir.path().join("id_ed25519"),
+                "perm": 420
+            })),
+            "test-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body["error"].as_str().is_some_and(|e| !e.is_empty()));
     }
 
     fn test_kf() -> String {
