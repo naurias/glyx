@@ -20,6 +20,22 @@ pub enum AgentError {
     NotUtf8(String),
     #[error("tamper detected, refusing: {0}")]
     Tamper(String),
+    #[error("unsafe file mode: {0}")]
+    Permission(String),
+}
+
+/// Validate the requested mode for a file that holds secret material.
+///
+/// Exports write plaintext passwords, keys and attachments to disk, so the mode
+/// must stay owner-only. Client-supplied values are never trusted.
+pub fn normalize_perm(perm: u32) -> Result<u32, AgentError> {
+    let masked = perm & 0o777;
+    if masked & 0o077 != 0 {
+        return Err(AgentError::Permission(format!(
+            "{masked:o} grants group or other access; use 0600 or stricter"
+        )));
+    }
+    Ok(masked)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +86,7 @@ pub fn db_path() -> PathBuf {
 }
 
 pub fn open_db() -> Result<Connection, AgentError> {
+    glyx_store::session::ensure_session_dir()?;
     let path = db_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -215,6 +232,7 @@ pub struct ExportSpec<'a> {
 }
 
 pub fn register_export(conn: &Connection, spec: &ExportSpec) -> Result<String, AgentError> {
+    let perm = normalize_perm(spec.perm)?;
     let id = Uuid::now_v7().as_simple().to_string();
     conn.execute(
         "INSERT INTO exports(id, target, kind, item_id, field, blob_addr, keep_on_lock, perm)
@@ -230,7 +248,7 @@ pub fn register_export(conn: &Connection, spec: &ExportSpec) -> Result<String, A
             spec.field,
             spec.blob_addr,
             i64::from(spec.keep_on_lock),
-            i64::from(spec.perm),
+            i64::from(perm),
         ],
     )?;
     Ok(id)
@@ -242,6 +260,7 @@ pub fn update_export(
     keep_on_lock: Option<bool>,
     perm: Option<u32>,
 ) -> Result<bool, AgentError> {
+    let perm = perm.map(normalize_perm).transpose()?;
     let changed = conn.execute(
         "UPDATE exports SET keep_on_lock = COALESCE(?1, keep_on_lock),
            perm = COALESCE(?2, perm) WHERE target = ?3",
@@ -549,6 +568,19 @@ mod tests {
         assert!(!glob_match("note.md", "notes.md"));
         assert!(glob_match("*.sync-conflict-*", "a.sync-conflict-1.md"));
         assert!(glob_match("*.md", "a.md") && !glob_match("*.md", "a.MD"));
+    }
+
+    #[test]
+    fn export_modes_stay_owner_only() {
+        assert_eq!(normalize_perm(0o600).expect("600"), 0o600);
+        assert_eq!(normalize_perm(0o400).expect("400"), 0o400);
+        assert_eq!(normalize_perm(0).expect("zero"), 0);
+        // Permission bits above 0o777 are ignored rather than merged in.
+        assert_eq!(normalize_perm(0o600 | 0o1000).expect("sticky+600"), 0o600);
+        assert!(normalize_perm(0o644).is_err());
+        assert!(normalize_perm(0o604).is_err());
+        assert!(normalize_perm(0o777).is_err());
+        assert!(normalize_perm(0o444).is_err());
     }
 
     #[test]
