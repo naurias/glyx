@@ -16,13 +16,13 @@ import java.io.File
 
 @InvokeArg
 class PickTitleArgs {
-  var title: String = "Choose a file"
+  var title: String? = null
 }
 
 @InvokeArg
 class PickSaveArgs {
-  var title: String = "Choose a file"
-  var fileName: String = ""
+  var title: String? = null
+  var fileName: String? = null
 }
 
 /**
@@ -52,7 +52,7 @@ class GlyxPickerPlugin(private val host: Activity) : Plugin(host) {
     val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
       addCategory(Intent.CATEGORY_OPENABLE)
       type = "*/*"
-      putExtra(Intent.EXTRA_TITLE, args.title)
+      putExtra(Intent.EXTRA_TITLE, args.title ?: "Choose a file")
     }
     launch(invoke, intent, "onPickedFile")
   }
@@ -61,7 +61,7 @@ class GlyxPickerPlugin(private val host: Activity) : Plugin(host) {
   fun pickFolder(invoke: Invoke) {
     val args = invoke.parseArgs(PickTitleArgs::class.java)
     val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-      putExtra(Intent.EXTRA_TITLE, args.title)
+      putExtra(Intent.EXTRA_TITLE, args.title ?: "Choose a file")
     }
     launch(invoke, intent, "onPickedFolder")
   }
@@ -74,7 +74,7 @@ class GlyxPickerPlugin(private val host: Activity) : Plugin(host) {
       invoke.reject("cannot create the glyx output directory")
       return
     }
-    val name = safeComponent(args.fileName).ifEmpty { "glyx-file" }
+    val name = safeComponent(args.fileName ?: "")
     invoke.resolve(JSObject().put("path", File(dir, name).absolutePath))
   }
 
