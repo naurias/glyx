@@ -159,7 +159,10 @@ or the pinned Build-Tools/Gradle settings and manifest entries are lost.
 
 After installing, enable glyx as the autofill service and, on Android 14+, as a
 passkey provider; the glyx **Settings** page has an **Android integration** card
-with shortcuts. See `docs.md` §21 for runtime behavior and known limitations.
+with shortcuts. File, folder and save-name fields use a native picker that
+imports the chosen document into app-private storage (scoped storage cannot give
+the daemon a writable path), so vault files, keyfiles and exports stay inside the
+app sandbox. See `docs.md` §21 for runtime behavior and known limitations.
 
 ## Developer shells
 
