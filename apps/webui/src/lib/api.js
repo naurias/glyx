@@ -57,59 +57,66 @@ export async function retryDesktopBootstrap() {
   return false;
 }
 
-export async function pickFolder(title = 'Choose folder') {
-  if (isMobile()) return prompt(title) || '';
+function tauriInvoke() {
   if (typeof window !== 'undefined' && window.__TAURI__?.core?.invoke) {
-    try {
-      return (await window.__TAURI__.core.invoke('desktop_pick_folder', { title })) || '';
-    } catch {
-      // Fall through to the daemon host picker.
-    }
+    return window.__TAURI__.core.invoke;
   }
+  return null;
+}
+
+async function systemPick(command, title, fileName) {
+  const invoke = tauriInvoke();
+  if (!invoke) return null;
+  try {
+    const args = { title };
+    if (fileName !== undefined) args.fileName = fileName || undefined;
+    return (await invoke(command, args)) || '';
+  } catch {
+    return null;
+  }
+}
+
+export async function pickFolder(title = 'Choose folder') {
+  if (isMobile()) return (await systemPick('mobile_pick_folder', title)) ?? '';
+  const desktop = await systemPick('desktop_pick_folder', title);
+  if (desktop !== null) return desktop;
   const picked = await hostPick('folder', title);
   if (picked !== null) return picked;
   return prompt(title) || '';
 }
 
 export async function pickFile(title = 'Choose file') {
-  if (isMobile()) return prompt(title) || '';
-  if (typeof window !== 'undefined' && window.__TAURI__?.core?.invoke) {
-    try {
-      return (await window.__TAURI__.core.invoke('desktop_pick_file', { title })) || '';
-    } catch {
-      // Fall through to the daemon host picker.
-    }
-  }
+  if (isMobile()) return (await systemPick('mobile_pick_file', title)) ?? '';
+  const desktop = await systemPick('desktop_pick_file', title);
+  if (desktop !== null) return desktop;
   const picked = await hostPick('file', title);
   if (picked !== null) return picked;
   return prompt(title) || '';
 }
 
 export async function pickSave(title = 'Choose file', fileName = '') {
-  if (isMobile()) return prompt(title) || '';
-  if (typeof window !== 'undefined' && window.__TAURI__?.core?.invoke) {
-    try {
-      return (
-        (await window.__TAURI__.core.invoke('desktop_pick_save', {
-          title,
-          fileName: fileName || undefined
-        })) || ''
-      );
-    } catch {
-      // Fall through to the daemon host picker.
-    }
-  }
+  if (isMobile()) return (await systemPick('mobile_pick_save', title, fileName)) ?? '';
+  const desktop = await systemPick('desktop_pick_save', title, fileName);
+  if (desktop !== null) return desktop;
   const picked = await hostPick('save', title, fileName);
   if (picked !== null) return picked;
   return prompt(title) || '';
 }
 
+/**
+ * Ask the daemon to open a native dialog on its host.
+ *
+ * Returns `null` when the daemon has no picker (or the request fails) so the
+ * caller can fall back to a typed path, and `''` when the user cancels the
+ * dialog itself.
+ */
 async function hostPick(kind, title, fileName = '') {
   try {
     const res = await req('POST', `/v1/pick/${kind}`, {
       title,
       file_name: fileName || null
     });
+    if (res.cancelled === true) return '';
     return res.path || '';
   } catch {
     return null;

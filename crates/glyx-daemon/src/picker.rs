@@ -14,7 +14,7 @@ pub fn pick(
 ) -> Result<Option<PathBuf>, String> {
     #[cfg(target_os = "linux")]
     {
-        Ok(linux_pick(kind, title, file_name))
+        linux_pick(kind, title, file_name)
     }
     #[cfg(target_os = "macos")]
     {
@@ -34,10 +34,10 @@ pub fn pick(
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod host {
     use super::PickKind;
+    use std::io::Read as _;
     use std::path::PathBuf;
-    use std::process::Command;
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
     /// Environment variables used to hand caller-supplied strings to the native
     /// dialog helper. Values are passed out-of-band instead of being
@@ -54,7 +54,14 @@ mod host {
     pub const PICK_TIMEOUT: Duration = Duration::from_secs(120);
 
     #[cfg(target_os = "linux")]
-    pub fn linux_pick(kind: PickKind, title: &str, file_name: Option<&str>) -> Option<PathBuf> {
+    pub fn linux_pick(
+        kind: PickKind,
+        title: &str,
+        file_name: Option<&str>,
+    ) -> Result<Option<PathBuf>, String> {
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return Err("the daemon has no graphical session to show a dialog in".to_owned());
+        }
         let zenity = match kind {
             PickKind::File => vec!["--file-selection".to_owned()],
             PickKind::Folder => vec!["--file-selection".to_owned(), "--directory".to_owned()],
@@ -69,8 +76,10 @@ mod host {
         if let Some(name) = file_name {
             zenity_args.push(format!("--filename={name}"));
         }
-        if let Some(path) = run_until("zenity", &zenity_args, title, file_name) {
-            return Some(path);
+        match run_until("zenity", &zenity_args, title, file_name) {
+            Outcome::Picked(path) => return Ok(Some(path)),
+            Outcome::Cancelled => return Ok(None),
+            Outcome::Unavailable => {}
         }
         let kdialog = match kind {
             PickKind::File => vec!["--getopenfilename".to_owned(), ".".to_owned()],
@@ -79,7 +88,13 @@ mod host {
         };
         let mut kdialog_args = kdialog;
         kdialog_args.push(format!("--title={title}"));
-        run_until("kdialog", &kdialog_args, title, None)
+        match run_until("kdialog", &kdialog_args, title, None) {
+            Outcome::Picked(path) => Ok(Some(path)),
+            Outcome::Cancelled => Ok(None),
+            Outcome::Unavailable => {
+                Err("no native file dialog is available; install zenity or kdialog".to_owned())
+            }
+        }
     }
 
     /// The AppleScript chooser. The prompt is read from the environment so
@@ -99,7 +114,11 @@ mod host {
     #[cfg(target_os = "macos")]
     pub fn macos_pick(kind: PickKind, title: &str) -> Result<Option<PathBuf>, String> {
         let args = ["-e".to_owned(), macos_script(kind)];
-        Ok(run_until("osascript", &args, title, None))
+        match run_until("osascript", &args, title, None) {
+            Outcome::Picked(path) => Ok(Some(path)),
+            Outcome::Cancelled => Ok(None),
+            Outcome::Unavailable => Err("osascript is unavailable".to_owned()),
+        }
     }
 
     /// The PowerShell dialog script. Every caller-supplied value is read from
@@ -143,38 +162,67 @@ mod host {
             "-Command".to_owned(),
             windows_script(kind, file_name),
         ];
-        Ok(run_until("powershell", &args, title, file_name))
+        match run_until("powershell", &args, title, file_name) {
+            Outcome::Picked(path) => Ok(Some(path)),
+            Outcome::Cancelled => Ok(None),
+            Outcome::Unavailable => Err("powershell is unavailable".to_owned()),
+        }
+    }
+
+    /// What a native dialog helper did.
+    enum Outcome {
+        /// The user picked a path.
+        Picked(PathBuf),
+        /// The dialog opened and the user dismissed it.
+        Cancelled,
+        /// The helper could not run at all: missing binary, no display, or a
+        /// dialog that outlived [`PICK_TIMEOUT`].
+        Unavailable,
     }
 
     /// Run a helper and wait for it with a hard timeout.
-    fn run_until(
-        bin: &str,
-        args: &[String],
-        title: &str,
-        file_name: Option<&str>,
-    ) -> Option<PathBuf> {
-        let args = args.to_vec();
-        let title = title.to_owned();
-        let file_name = file_name.map(str::to_owned);
-        let bin = bin.to_owned();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let spawned = Command::new(&bin)
-                .args(&args)
-                .env(TITLE_ENV, &title)
-                .env(NAME_ENV, file_name.as_deref().unwrap_or_default())
-                .output();
-            let _ = tx.send(spawned);
-        });
-        let spawned = rx.recv_timeout(PICK_TIMEOUT).ok()?.ok()?;
-        if !spawned.status.success() {
-            return None;
+    ///
+    /// A helper that never returns (no display, a frozen session, a binary that
+    /// is not installed) would otherwise block the requesting HTTP call. The
+    /// child is killed on timeout so no stray dialog survives the request.
+    fn run_until(bin: &str, args: &[String], title: &str, file_name: Option<&str>) -> Outcome {
+        let Ok(mut child) = Command::new(bin)
+            .args(args)
+            .env(TITLE_ENV, title)
+            .env(NAME_ENV, file_name.unwrap_or_default())
+            .stdout(Stdio::piped())
+            .spawn()
+        else {
+            return Outcome::Unavailable;
+        };
+        let deadline = Instant::now() + PICK_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        return Outcome::Cancelled;
+                    }
+                    let mut text = String::new();
+                    if let Some(mut stdout) = child.stdout.take() {
+                        let _ = stdout.read_to_string(&mut text);
+                    }
+                    let text = text.trim();
+                    if text.is_empty() {
+                        return Outcome::Cancelled;
+                    }
+                    return Outcome::Picked(PathBuf::from(text));
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Outcome::Unavailable;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => return Outcome::Unavailable,
+            }
         }
-        let text = String::from_utf8_lossy(&spawned.stdout).trim().to_owned();
-        if text.is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(text))
     }
 }
 

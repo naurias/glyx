@@ -9,11 +9,23 @@ struct BiometricState(PluginHandle<Wry>);
 
 struct SettingsState(PluginHandle<Wry>);
 
+struct PickerState(PluginHandle<Wry>);
+
 fn settings_plugin() -> TauriPlugin<Wry> {
     Builder::new("glyx-settings")
         .setup(|app, api| {
             let handle = api.register_android_plugin("dev.glyx.app", "GlyxSettingsPlugin")?;
             app.manage(SettingsState(handle));
+            Ok(())
+        })
+        .build()
+}
+
+fn picker_plugin() -> TauriPlugin<Wry> {
+    Builder::new("glyx-picker")
+        .setup(|app, api| {
+            let handle = api.register_android_plugin("dev.glyx.app", "GlyxPickerPlugin")?;
+            app.manage(PickerState(handle));
             Ok(())
         })
         .build()
@@ -106,6 +118,7 @@ pub fn configure(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> {
     builder
         .plugin(biometric_plugin())
         .plugin(settings_plugin())
+        .plugin(picker_plugin())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_barcode_scanner::init())
         .invoke_handler(tauri::generate_handler![
@@ -115,7 +128,10 @@ pub fn configure(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> {
             mobile_biometric_disable,
             mobile_android_info,
             mobile_open_autofill_settings,
-            mobile_open_credential_settings
+            mobile_open_credential_settings,
+            mobile_pick_file,
+            mobile_pick_folder,
+            mobile_pick_save
         ])
 }
 
@@ -195,4 +211,48 @@ async fn mobile_open_credential_settings(app: AppHandle) -> Result<serde_json::V
         .run_mobile_plugin_async("openCredentialSettings", ())
         .await
         .map_err(|e| e.to_string())
+}
+
+macro_rules! picker_call {
+    ($app:expr, $op:expr, $args:expr) => {{
+        let handle = $app.state::<PickerState>().0.clone();
+        handle
+            .run_mobile_plugin_async($op, $args)
+            .await
+            .map_err(|e| e.to_string())
+    }};
+}
+
+#[tauri::command]
+async fn mobile_pick_file(app: AppHandle, title: Option<String>) -> Result<String, String> {
+    let value = picker_call!(app, "pickFile", serde_json::json!({ "title": title }))?;
+    Ok(picked_path(&value))
+}
+
+#[tauri::command]
+async fn mobile_pick_folder(app: AppHandle, title: Option<String>) -> Result<String, String> {
+    let value = picker_call!(app, "pickFolder", serde_json::json!({ "title": title }))?;
+    Ok(picked_path(&value))
+}
+
+#[tauri::command]
+async fn mobile_pick_save(
+    app: AppHandle,
+    title: Option<String>,
+    file_name: Option<String>,
+) -> Result<String, String> {
+    let value = picker_call!(
+        app,
+        "pickSave",
+        serde_json::json!({ "title": title, "fileName": file_name })
+    )?;
+    Ok(picked_path(&value))
+}
+
+fn picked_path(value: &serde_json::Value) -> String {
+    value
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
 }

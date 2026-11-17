@@ -33,7 +33,7 @@ This guide covers the user-facing frontends:
 | Extension/Git setup | Yes | No | No | No | No | No | No |
 
 `Inherited` means Desktop and Android reuse the WebUI pages (Android currently
-lacks clipboard and a native file picker; autofill, TOTP capture, and passkeys
+lacks clipboard; autofill, TOTP capture, passkeys and the native file picker
 are Android-specific). `Partial` details, known gaps, and
 code anchors live in `local/feature-parity.md` (local only).
 
@@ -967,7 +967,7 @@ Secrets are kept in memory only and never written to `localStorage`.
 
 `glyx-tauri` (the installed binary, or `nix run .#glyx-desktop` on NixOS) starts the daemon for the selected vault, injects the URL and token into the WebView, and opens the GUI. It closes the daemon on exit by default.
 
-With no vault selected, the desktop opens onboarding instead of failing to connect: it lists known vaults and offers **Open existing vault**, **Create new vault**, and **Restore from backup**. File/keyfile selection uses native dialogs on desktop and text paths in the browser WebUI; the native picker runs asynchronously so the Linux desktop no longer freezes while a dialog is open. Creating a vault auto-unlocks it and opens the item list. If the external daemon cannot be started, the desktop falls back to an in-process daemon and shows a retryable error card instead of a blank connection error.
+With no vault selected, the desktop opens onboarding instead of failing to connect: it lists known vaults and offers **Open existing vault**, **Create new vault**, and **Restore from backup**. File/keyfile selection uses native dialogs on desktop; the browser WebUI asks the daemon for a host dialog and falls back to a typed path when the daemon has no GUI (or when the dialog is dismissed, which is reported as a cancellation). The native picker runs asynchronously with a timeout, so the Linux desktop no longer freezes while a dialog is open and a headless daemon answers immediately. Creating a vault auto-unlocks it and opens the item list. If the external daemon cannot be started, the desktop falls back to an in-process daemon and shows a retryable error card instead of a blank connection error.
 
 On Hyprland, the desktop starts through XWayland (`GDK_BACKEND=x11`) because WebKitGTK/GTK3 can compute a corrupted viewport after a Wayland tile resize. Set `GDK_BACKEND=wayland` explicitly to opt out. The Nix package embeds the production WebUI; `cargo build -p glyx-tauri --features glyx-tauri/custom-protocol` does the same for local Arch/Nix builds after `pnpm --dir apps/webui build`.
 
@@ -1103,12 +1103,19 @@ What works today:
   random keyslot, encrypts the keyslot secret with a non-exportable,
   biometric-bound AES key, and unlocks by decrypting that secret and calling the
   normal `/v1/unlock` endpoint
+- native file picking: **Choose file** imports the document into app-private
+  storage, **Choose folder** returns the app-private vault folder, and
+  **Choose file name** returns a path under app storage, so onboarding,
+  keyfiles, tracked files and exports all work without typing paths
 - an arm64 debug APK builds successfully
 
 Known limitations:
 
 - clipboard Copy/Fill buttons are unavailable; use system autofill
-- no storage-access-framework picker; vault and export paths are typed text
+- picked files are copied into app-private storage (`filesDir/glyx-in/`) because
+  Android scoped storage cannot hand a writable filesystem path to the daemon;
+  re-picking a vault file replaces the copy, and exports land in
+  `filesDir/glyx-out/` until a share-sheet export is added
 - no lock-on-background yet
 - biometric unlock is not offered for keyfile-required vaults (the biometric
   secret cannot satisfy the keyfile requirement)
@@ -1173,5 +1180,6 @@ attached device. The APK, Kotlin compilation, merged manifest, and Rust
 cross-check are verified. The device checklist lives in
 `local/android-development.md` §7.
 
-Next milestones: device smoke testing, lock on background, SAF picker, safe
-areas/icons, and Digital Asset Links for native-app passkeys.
+Next milestones: device smoke testing, lock on background, a share-sheet export for
+files written to app storage, safe areas/icons, and Digital Asset Links for
+native-app passkeys.
