@@ -217,11 +217,16 @@ pub fn load_identities(
 /// signatures. The runtime directory is tightened by
 /// [`glyx_store::session::ensure_session_dir`].
 fn bind_socket(path: &Path) -> Result<UnixListener, SshAgentError> {
+    let session_dir = glyx_store::session::session_dir();
+    if path.parent() == Some(session_dir.as_path()) {
+        glyx_store::session::ensure_session_dir().ok();
+    } else if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
     if path.exists() {
         std::fs::remove_file(path).ok();
     }
     let listener = UnixListener::bind(path)?;
-    glyx_store::session::ensure_session_dir().ok();
     #[cfg(unix)]
     {
         use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
