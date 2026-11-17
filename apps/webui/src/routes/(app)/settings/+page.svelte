@@ -1,5 +1,5 @@
 <script>
-  import { api, isMobile } from '$lib/api.js';
+  import { api, isMobile, pickSave } from '$lib/api.js';
   import { onMount } from 'svelte';
   let status = null;
   let report = null;
@@ -276,6 +276,11 @@
       backupBusy = false;
     }
   }
+  async function chooseRestoreDest() {
+    const path = await pickSave('Choose where to write the restored vault', 'restored.glyx');
+    if (path) restoreDest = path;
+  }
+
   async function restore() {
     if (!restoreFile) {
       error = 'Choose a backup file first.';
@@ -393,6 +398,7 @@
       <div class="row">
         <input type="file" bind:this={restoreInput} on:change={(e) => (restoreFile = e.currentTarget.files?.[0] ?? null)} />
         <input bind:value={restoreDest} placeholder="/path/to/restored.glyx" style="flex: 1" />
+        <button on:click={chooseRestoreDest} disabled={backupBusy}>Browse</button>
         <button on:click={restore} disabled={backupBusy}>Restore</button>
       </div>
     </div>
